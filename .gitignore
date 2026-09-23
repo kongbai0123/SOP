@@ -1,0 +1,46 @@
+# Runtime data and machine-specific settings
+/records/
+/logs/
+/app_settings.json
+*.db
+*.db-*
+*.sqlite*
+*.log
+*.lnk
+
+# Local environments, caches and editor/agent state
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+/.claude/
+/.codex/
+/.idea/
+/.vscode/
+.env
+.env.*
+
+# Model exports, training data and recordings (supply locally)
+/cdc1a84bd72b48bd829c376476f3eaa7/
+/models/
+/demo/
+.extracted/
+*.pt
+*.pth
+*.onnx
+*.zip
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# User SOPs can contain embedded workpiece photos; only ship the clean example
+/sops/*
+!/sops/example_sop.json
+
+/build/
+/dist/
+*.egg-info/

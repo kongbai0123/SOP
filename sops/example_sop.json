@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "name": "範例：版型放置作業",
+  "version": 1,
+  "model_path": "cdc1a84bd72b48bd829c376476f3eaa7/E001/cdc1a84bd72b48bd829c376476f3eaa7-M001-model.zip",
+  "model_version_id": "M001",
+  "rois": [
+    {
+      "name": "工作區",
+      "points": [[0.2, 0.0], [0.8, 0.0], [0.8, 0.9], [0.2, 0.9]]
+    }
+  ],
+  "cycle": {
+    "reset_conditions": [],
+    "reset_hold_sec": 2.0,
+    "auto_restart_sec": 3.0
+  },
+  "steps": [
+    {
+      "name": "放置把手版型",
+      "instruction": "將 handlebar 版型放到工作區中央",
+      "conditions": [
+        {"type": "appear", "label": "handlebar", "roi": "工作區", "min_count": 1, "min_score": 0.7, "roi_overlap": 0.5}
+      ],
+      "forbidden": [
+        {"type": "appear", "label": "mid", "roi": "工作區", "min_count": 1, "min_score": 0.7, "roi_overlap": 0.5}
+      ],
+      "hold_sec": 1.0,
+      "ratio": 0.8,
+      "timeout_sec": 60
+    },
+    {
+      "name": "放置彎角版型",
+      "instruction": "將 cruve 版型放到工作區",
+      "conditions": [
+        {"type": "appear", "label": "cruve", "roi": "工作區", "min_count": 1, "min_score": 0.7, "roi_overlap": 0.5}
+      ],
+      "forbidden": [],
+      "hold_sec": 1.0,
+      "ratio": 0.8,
+      "timeout_sec": 60
+    },
+    {
+      "name": "放置中段版型",
+      "instruction": "將 mid 版型放到工作區",
+      "conditions": [
+        {"type": "appear", "label": "mid", "roi": "工作區", "min_count": 1, "min_score": 0.7, "roi_overlap": 0.5}
+      ],
+      "forbidden": [],
+      "hold_sec": 1.0,
+      "ratio": 0.8,
+      "timeout_sec": 60
+    },
+    {
+      "name": "手部壓合",
+      "instruction": "用手壓住版型（grasp）",
+      "conditions": [
+        {"type": "appear", "label": "grasp", "roi": "工作區", "min_count": 1, "min_score": 0.8, "roi_overlap": 0.5}
+      ],
+      "forbidden": [],
+      "hold_sec": 1.0,
+      "ratio": 0.8,
+      "timeout_sec": 60
+    }
+  ]
+}
