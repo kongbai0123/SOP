@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import copy
 import json
+import time
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QLabel, QMainWindow, QMessageBox,
-                               QPushButton, QTabWidget, QToolBar)
+                               QProgressBar, QPushButton, QTabWidget, QToolBar)
 
 from ..model_bundle import ModelBundleError, ModelInfo, read_model_info
 from ..paths import APP_SETTINGS, PROJECT_ROOT, RECORDS_DIR, SOPS_DIR, resolve
@@ -22,7 +24,7 @@ VIDEO_FILTER = "影片 (*.mp4 *.avi *.mov *.mkv *.wmv);;所有檔案 (*)"
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, defer_initial_sop=False):
         super().__init__()
         self.settings = self._load_settings()
         self.sop_path: Path | None = None
@@ -31,6 +33,8 @@ class MainWindow(QMainWindow):
         self.model_ready = False
         self._requested_model: str | None = None
         self._engine_running = False
+        self._model_started = None
+        self._model_stage = ""
         self.resize(1500, 900)
 
         self.pipeline = VideoPipeline(RECORDS_DIR, self)
@@ -50,6 +54,7 @@ class MainWindow(QMainWindow):
         self.editor = EditorPage()
         self.editor.modified.connect(self._on_modified)
         self.editor.model_selected.connect(self._load_model)
+        self.editor.save_requested.connect(self._save)
         self.records_page = RecordsPage(RECORDS_DIR)
 
         self.tabs = QTabWidget()
@@ -63,12 +68,23 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self.pipeline.camera_available.connect(self.camera_button.setEnabled)
         self.model_status = QLabel("模型：未載入")
+        self.model_progress = QProgressBar()
+        self.model_progress.setRange(0, 0)
+        self.model_progress.setFixedWidth(100)
+        self.model_progress.setTextVisible(False)
+        self.model_progress.hide()
+        self.statusBar().addPermanentWidget(self.model_progress)
+        self.model_timer = QTimer(self)
+        self.model_timer.setInterval(100)
+        self.model_timer.timeout.connect(self._update_model_progress)
+        self.pipeline.model_progress.connect(self._on_model_progress)
         self.fps_status = QLabel("")
         self.statusBar().addPermanentWidget(self.fps_status)
         self.statusBar().addPermanentWidget(self.model_status)
 
         self.pipeline.start()
-        self._open_initial_sop()
+        if not defer_initial_sop:
+            self._open_initial_sop()
 
     # ---- 版面 ------------------------------------------------------------------
     def _build_menu(self):
@@ -175,11 +191,11 @@ class MainWindow(QMainWindow):
             dialog.deleteLater()
 
     def _on_source_changed(self, label: str):
+        self.run_page.clear_video("影像來源已變更，等待影像" if label else "影像來源已中斷")
         self.editor.clear_video("影像來源已變更，等待影像")
         self.source_status.setText(f"  {label}" if label else "  未連線")
         if not label:
             self.fps_status.setText("")
-            self.run_page.clear_video("影像來源已中斷")
             self.editor.clear_video("影像來源已中斷")
 
     # ---- 背景執行緒結果 ----------------------------------------------------------
@@ -224,10 +240,26 @@ class MainWindow(QMainWindow):
         self.editor.set_classes(info.classes)
         self.editor.sop.model_version_id = info.model_version_id
         self._requested_model = str(Path(path).resolve())
-        self.model_status.setText(f"模型：{info.model_version_id} 載入中…")
+        self._model_started = time.monotonic()
+        self._model_stage = "正在準備模型…"
+        self.model_progress.show()
+        self.model_timer.start()
+        self._update_model_progress()
         self.pipeline.load_model(path)
 
+    def _on_model_progress(self, stage):
+        self._model_stage = stage
+        self._update_model_progress()
+
+    def _update_model_progress(self):
+        if self._model_started is not None:
+            elapsed = time.monotonic() - self._model_started
+            self.model_status.setText(f"模型：{self._model_stage} · {elapsed:.1f} 秒")
+
     def _on_model_loaded(self, info: ModelInfo | None, device: str):
+        self.model_timer.stop()
+        self.model_progress.hide()
+        self._model_started = None
         self.model_ready = info is not None
         if info is None:
             self.model_status.setText("模型：未載入")

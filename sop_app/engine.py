@@ -161,7 +161,7 @@ class SOPEngine:
 
         if self.phase == Phase.RUNNING:
             step, runtime = self.sop.steps[self.index], self.runtimes[self.index]
-            met, self._results = evaluate_conditions(step.conditions, frame, self.rois)
+            met, self._results = evaluate_conditions(step.conditions, frame, self.rois, step.completion_mode)
             invalid = any(r.error for r in self._results)
             if invalid or self._completion_invalid:
                 self._window.reset(now)

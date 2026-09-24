@@ -18,6 +18,7 @@ class ConditionResult:
     count: int
     met: bool
     error: str = ""
+    detail: str = ""
 
 
 @lru_cache(maxsize=64)
@@ -28,21 +29,27 @@ def _roi_mask(points: tuple[tuple[float, float], ...], width: int, height: int) 
     return mask.astype(bool)
 
 
-def in_roi(detection: Detection, roi: ROI, width: int, height: int, min_overlap: float) -> bool:
-    """物件落在區域內的比例 ≥ min_overlap。有遮罩用遮罩像素，沒有就用框面積。"""
+def roi_overlap_ratio(detection: Detection, roi: ROI, width: int, height: int) -> float:
+    """回傳物件本身有多少比例落在區域內。"""
     if len(roi.points) < 3:
-        return False
+        return 0.0
     region = _roi_mask(tuple(tuple(p) for p in roi.points), width, height)
     x1, y1, x2, y2 = detection.box
     region_crop = region[y1:y2, x1:x2]
     if region_crop.size == 0:
-        return False
+        return 0.0
     if detection.mask is not None:
-        object_crop = detection.mask[y1:y2, x1:x2]
-        pixels = int(object_crop.sum())
-        if pixels:
-            return (object_crop & region_crop).sum() / pixels >= min_overlap
-    return float(region_crop.mean()) >= min_overlap
+        object_mask = np.asarray(detection.mask, dtype=bool)
+        if object_mask.shape == region.shape:
+            object_pixels = int(object_mask.sum())
+            intersection = int((object_mask & region).sum())
+            return intersection / object_pixels if object_pixels else 0.0
+    return float(region_crop.mean())
+
+
+def in_roi(detection: Detection, roi: ROI, width: int, height: int, min_overlap: float) -> bool:
+    """物件落在區域內的比例 ≥ min_overlap。"""
+    return roi_overlap_ratio(detection, roi, width, height) >= min_overlap
 
 
 def evaluate_condition(cond: Condition, frame: FrameResult, rois: dict[str, ROI]) -> ConditionResult:
@@ -58,17 +65,26 @@ def evaluate_condition(cond: Condition, frame: FrameResult, rois: dict[str, ROI]
         if roi is None:
             return ConditionResult(cond, 0, False, "作業位置暫時無法確認或已超出畫面")
 
-    count = sum(
-        1 for det in frame.detections
-        if det.label == cond.label and det.score >= cond.min_score
-        and (roi is None or in_roi(det, roi, frame.width, frame.height, cond.roi_overlap))
-    )
+    labelled = [det for det in frame.detections if det.label == cond.label]
+    confident = [det for det in labelled if det.score >= cond.min_score]
+    overlaps = [(det, roi_overlap_ratio(det, roi, frame.width, frame.height))
+                for det in confident] if roi is not None else [(det, 1.0) for det in confident]
+    count = sum(overlap >= cond.roi_overlap for _det, overlap in overlaps)
     met = count == 0 if cond.type == "disappear" else count >= cond.min_count
-    return ConditionResult(cond, count, met)
+    if not labelled:
+        detail = f"模型未輸出 {cond.label}"
+    elif not confident:
+        detail = f"最高信心 {max(det.score for det in labelled):.2f}，門檻 {cond.min_score:.2f}"
+    elif roi is not None and not count:
+        detail = f"物件在區域內最高 {max(overlap for _det, overlap in overlaps):.0%}，門檻 {cond.roi_overlap:.0%}"
+    else:
+        detail = f"通過 {count} 個"
+    return ConditionResult(cond, count, met, detail=detail)
 
 
 def evaluate_conditions(conditions: list[Condition], frame: FrameResult,
-                        rois: dict[str, ROI]) -> tuple[bool, list[ConditionResult]]:
+                        rois: dict[str, ROI], mode: str = "all") -> tuple[bool, list[ConditionResult]]:
     """全部成立才回傳 True；沒有條件時回傳 False（需手動確認）。"""
     results = [evaluate_condition(cond, frame, rois) for cond in conditions]
-    return bool(results) and all(r.met for r in results), results
+    met = any(r.met for r in results) if mode == "any" else all(r.met for r in results)
+    return bool(results) and not any(r.error for r in results) and met, results

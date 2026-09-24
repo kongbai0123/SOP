@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,9 @@ class FramePacket:
     fps: float
     inference_ms: float
     camera_fps: float | None = None  # 實際擷取速率；與處理／推論速率分開
+    classes: tuple[str, ...] = ()     # 供監控頁依目前工序重畫相關物件
+    min_score: float = 0.5
+    show_masks: bool = True
 
 
 class CameraSource:
@@ -156,6 +160,7 @@ class VideoPipeline(QThread):
     packet_ready = Signal(object)          # FramePacket
     events_ready = Signal(object)          # list[EngineEvent]
     model_loaded = Signal(object, str)     # ModelInfo | None, 裝置名稱
+    model_progress = Signal(str)
     source_changed = Signal(str)           # 來源名稱，空字串 = 已中斷
     camera_available = Signal(bool)
     camera_controls_ready = Signal(object, object)
@@ -289,7 +294,8 @@ class VideoPipeline(QThread):
             snapshot = self._engine.snapshot() if self._engine is not None else None
             camera_fps = self._source.capture_fps if isinstance(self._source, CameraSource) else None
             self.packet_ready.emit(FramePacket(frame, self._last_display, result, snapshot,
-                                               self._fps, inference_ms, camera_fps))
+                                               self._fps, inference_ms, camera_fps,
+                                               tuple(classes), self._min_score, self._show_masks))
 
     def _emit_events(self, events, recorder: Recorder):
         sop = self._engine.sop
@@ -385,12 +391,19 @@ class VideoPipeline(QThread):
     def _load_model(self, path: str):
         from .detector import create_detector      # 延遲匯入：torch／ultralytics 載入較慢
 
+        started = time.perf_counter()
+        def report(message):
+            self.model_progress.emit(message)
+            logging.getLogger("sop.launcher").info("模型載入 %.2fs · %s", time.perf_counter() - started, message)
+
         self.status.emit("模型載入中…（第一次使用需解壓縮，請稍候）")
         self._detector = None
         try:
+            report("讀取模型資訊")
             info = read_model_info(path)
-            self._detector = create_detector(info)
+            self._detector = create_detector(info, progress=report)
         except Exception as exc:
+            report("載入失敗")
             self.model_loaded.emit(None, "")
             if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 4551:
                 raise RuntimeError(
@@ -400,5 +413,6 @@ class VideoPipeline(QThread):
                     f"詳細資訊：{exc}"
                 ) from exc
             raise RuntimeError(f"模型載入失敗：{exc}") from exc
+        report("載入完成")
         self.model_loaded.emit(info, self._detector.device_name)
         self.status.emit(f"模型 {info.model_version_id} 已載入（{self._detector.device_name}）")

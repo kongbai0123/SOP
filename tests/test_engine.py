@@ -116,6 +116,22 @@ class EngineTests(unittest.TestCase):
         wide = det("a", box=(20, 20, 180, 40), mask=mask)
         self.assertFalse(evaluate_condition(cond, frame(0, wide), rois).met)
 
+    def test_overlap_is_measured_from_object_and_reports_failed_gate(self):
+        roi = ROI("安裝位置", [(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)])
+        cond = appear("a", roi="安裝位置")
+        # 區域大小可能受框選影響，因此維持以「物件有多少位於區域內」為基準。
+        covering = det("a", box=(20, 20, 180, 80))
+        result = evaluate_condition(cond, frame(0, covering), {roi.name: roi})
+        self.assertFalse(result.met)
+        self.assertIn('物件在區域內最高', result.detail)
+
+        partial = det("a", box=(0, 0, 90, 45))
+        self.assertFalse(evaluate_condition(cond, frame(0, partial), {roi.name: roi}).met)
+
+        low_score = evaluate_condition(Condition(label='a', min_score=.8),
+                                       frame(0, det('a', score=.61)), {})
+        self.assertEqual(low_score.detail, '最高信心 0.61，門檻 0.80')
+
     def test_missing_roi_never_met(self):
         result = evaluate_condition(Condition("disappear", "a", roi="不存在"), frame(0), {})
         self.assertFalse(result.met)
@@ -194,7 +210,7 @@ class SchemaTests(unittest.TestCase):
     def test_example_sop_is_valid(self):
         root = Path(__file__).resolve().parent.parent
         sop = load_sop(root / "sops" / "example_sop.json")
-        errors, _ = sop.validate(["handlebar", "cruve", "mid", "bend", "grasp"])
+        errors, _ = sop.validate(["grip", "L_grip", "R_grip", "mid"])
         self.assertEqual(errors, [])
 
 

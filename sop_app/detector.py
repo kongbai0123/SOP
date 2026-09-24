@@ -14,14 +14,14 @@ from .detection import Detection
 from .model_bundle import ModelBundleError, ModelInfo, ensure_checkpoint, ensure_runtime
 
 
-def create_detector(info: ModelInfo, device: str = "auto", score_floor: float = 0.3):
+def create_detector(info: ModelInfo, device: str = "auto", score_floor: float = 0.3, progress=None):
     """依模型包的引擎建立偵測器；所有偵測器都回傳 Detection。"""
     ensure_runtime(info)
     if info.runtime == "ultralytics":
-        return UltralyticsDetector(info, device, score_floor)
+        return UltralyticsDetector(info, device, score_floor, progress)
     if info.engine == "maskrcnn_resnet50_fpn":
-        return MaskRCNNDetector(info, device, score_floor)
-    return FasterRCNNDetector(info, device, score_floor)
+        return MaskRCNNDetector(info, device, score_floor, progress)
+    return FasterRCNNDetector(info, device, score_floor, progress)
 
 
 def _select_device(torch, device: str):
@@ -50,19 +50,25 @@ def _collect(classes, scores, labels, boxes, masks, width: int, height: int) -> 
 class _TorchVisionDetector:
     """TorchVision 偵測模型的共用載入、裝置與輸出流程。"""
 
-    def __init__(self, info: ModelInfo, device: str = "auto", score_floor: float = 0.3):
+    def __init__(self, info: ModelInfo, device: str = "auto", score_floor: float = 0.3, progress=None):
+        report = progress or (lambda message: None)
+        report("載入推論套件")
         import torch
 
         self.info = info
         self.classes = info.classes
         self.score_floor = score_floor
         self._torch = torch
+        report("選擇運算裝置")
         self.device = _select_device(torch, device)
 
+        report("讀取與驗證模型權重")
         checkpoint = torch.load(ensure_checkpoint(info), map_location="cpu", weights_only=True)
         state = checkpoint.get("model_state", checkpoint)
         image_size = int(checkpoint.get("image_size", info.image_size))
+        report("建立模型並載入運算裝置")
         self.model = self._build(state, image_size).to(self.device).eval()
+        report("預熱模型，準備首次辨識")
         self.detect(np.zeros((image_size, image_size, 3), dtype=np.uint8))
 
     def _build(self, state, image_size):
@@ -133,7 +139,9 @@ class FasterRCNNDetector(_TorchVisionDetector):
 class UltralyticsDetector:
     """YOLO Detect／Seg 與 RT-DETR；checkpoint.pt 是 Ultralytics 完整模型。"""
 
-    def __init__(self, info: ModelInfo, device: str = "auto", score_floor: float = 0.3):
+    def __init__(self, info: ModelInfo, device: str = "auto", score_floor: float = 0.3, progress=None):
+        report = progress or (lambda message: None)
+        report("載入推論套件")
         os.environ.setdefault("YOLO_OFFLINE", "true")
         os.environ.setdefault("MPLBACKEND", "Agg")
         import torch
@@ -143,17 +151,22 @@ class UltralyticsDetector:
         self.classes = info.classes
         self.score_floor = score_floor
         self._torch = torch
+        report("選擇運算裝置")
         self.device = _select_device(torch, device)
         self.image_size = int(info.image_size)
 
         constructor = RTDETR if info.engine.startswith("rt_detr_") else YOLO
-        self.model = constructor(str(ensure_checkpoint(info)))
+        report("讀取與驗證模型權重")
+        checkpoint = ensure_checkpoint(info)
+        report("建立辨識模型")
+        self.model = constructor(str(checkpoint))
         names = getattr(self.model, "names", None) or {}
         ordered = tuple(str(names[key]) for key in sorted(names))
         if ordered and ordered != tuple(self.classes):
             raise ModelBundleError(f"checkpoint 的類別與 model.json 不符：\n"
                                    f"  checkpoint：{'、'.join(ordered)}\n"
                                    f"  model.json：{'、'.join(self.classes)}")
+        report("預熱模型，準備首次辨識")
         self.detect(np.zeros((self.image_size, self.image_size, 3), dtype=np.uint8))
 
     @property

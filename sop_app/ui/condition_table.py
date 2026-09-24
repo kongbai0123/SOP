@@ -1,4 +1,4 @@
-"""條件編輯表格：類型 / 物件 / 區域 / 數量 / 信心度，並顯示即時判斷結果。"""
+"""條件編輯表格：類型 / 物件 / 區域 / 數量 / 信心度 / 區域比例與即時結果。"""
 from __future__ import annotations
 
 import copy
@@ -24,14 +24,16 @@ class ConditionTable(QWidget):
         self._roi_names: list[str] = []
         self._conditions: list[Condition] = []
 
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["類型", "物件", "區域", "數量≥", "信心度≥", "即時"])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["類型", "物件", "區域", "數量≥", "信心度≥", "物件在區域≥", "即時"])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         header = self.table.horizontalHeader()
         for column, mode in enumerate([QHeaderView.ResizeMode.ResizeToContents, QHeaderView.ResizeMode.Stretch,
                                        QHeaderView.ResizeMode.Stretch, QHeaderView.ResizeMode.ResizeToContents,
+                                       QHeaderView.ResizeMode.ResizeToContents,
                                        QHeaderView.ResizeMode.ResizeToContents,
                                        QHeaderView.ResizeMode.ResizeToContents]):
             header.setSectionResizeMode(column, mode)
@@ -65,7 +67,7 @@ class ConditionTable(QWidget):
 
     def set_live_results(self, results: Sequence[ConditionResult] | None):
         for row in range(self.table.rowCount()):
-            item = self.table.item(row, 5)
+            item = self.table.item(row, 6)
             if results is None or row >= len(results):
                 item.setText("—")
                 item.setBackground(QColor(0, 0, 0, 0))
@@ -73,7 +75,7 @@ class ConditionTable(QWidget):
             result = results[row]
             item.setText(f"{'✓' if result.met else '✗'} {result.count}")
             item.setBackground(QColor("#c8e6c9") if result.met else QColor("#ffcdd2"))
-            item.setToolTip(result.error or f"目前偵測到 {result.count} 個")
+            item.setToolTip(result.error or result.detail or f"目前偵測到 {result.count} 個")
 
     # ---- 內部 -----------------------------------------------------------------
     def _rebuild(self):
@@ -117,13 +119,20 @@ class ConditionTable(QWidget):
             score_box.setValue(cond.min_score)
             score_box.valueChanged.connect(lambda v, r=row: self._set(r, "min_score", round(v, 2)))
 
-            for column, widget in enumerate([type_box, label_box, roi_box, count_box, score_box]):
+            overlap_box = QSpinBox()
+            overlap_box.setRange(1, 100)
+            overlap_box.setSuffix(" %")
+            overlap_box.setValue(round(cond.roi_overlap * 100))
+            overlap_box.setToolTip("辨識物件本身至少有多少比例必須位於指定區域內")
+            overlap_box.valueChanged.connect(lambda v, r=row: self._set(r, "roi_overlap", v / 100))
+
+            for column, widget in enumerate([type_box, label_box, roi_box, count_box, score_box, overlap_box]):
                 widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
                 self.table.setCellWidget(row, column, widget)
             live = QTableWidgetItem("—")
             live.setFlags(Qt.ItemFlag.ItemIsEnabled)
             live.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(row, 5, live)
+            self.table.setItem(row, 6, live)
 
     def _set(self, row: int, field: str, value):
         if row >= len(self._conditions):

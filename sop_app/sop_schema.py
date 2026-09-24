@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Sequence
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 CONDITION_TYPES = {"appear": "出現", "disappear": "消失"}
 
 
@@ -51,6 +51,7 @@ class Step:
     hold_sec: float = 1.0         # 條件需持續多久
     ratio: float = 0.8            # 持續期間內至少多少比例的幀成立（抗辨識閃爍）
     timeout_sec: float = 0.0      # 0 = 不限時
+    completion_mode: str = "all"  # all / any；工序之間仍依序執行
 
 
 @dataclass
@@ -108,6 +109,7 @@ class SOPDefinition:
                 hold_sec=float(s.get("hold_sec", 1.0)),
                 ratio=float(s.get("ratio", 0.8)),
                 timeout_sec=float(s.get("timeout_sec", 0.0)),
+                completion_mode=str(s.get("completion_mode", "all")),
             ) for s in data.get("steps", [])],
         )
 
@@ -145,6 +147,8 @@ class SOPDefinition:
 
         for index, step in enumerate(self.steps, 1):
             where = f"工序 {index}「{step.name}」"
+            if step.completion_mode not in ("all", "any"):
+                errors.append(f"{where}：完成方式無效")
             if not step.conditions:
                 warnings.append(f"{where} 沒有完成條件，執行時需手動確認")
             if not 0 < step.ratio <= 1:

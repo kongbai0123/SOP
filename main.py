@@ -3,26 +3,39 @@ from __future__ import annotations
 
 import sys
 
-try:
-    import torch  # noqa: F401  先於 PySide6 載入，避免 Windows 上 DLL 載入順序衝突
-except (ImportError, OSError) as exc:
-    # Windows 應用程式控制可能封鎖模型 DLL；編輯與 OpenCV 定位仍可使用。
-    # 模型載入時由背景管線顯示可讀的錯誤，避免整個介面啟動失敗。
-    print(f"[WARNING] PyTorch unavailable; starting editor without AI inference: {exc}", file=sys.stderr)
-
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication
-
-from sop_app.ui.main_window import MainWindow
+from sop_app.startup import StartupProgress
 
 
 def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("SOP 工序監控")
-    app.setStyle("Fusion")
-    app.setFont(QFont("Microsoft JhengHei UI", 10))
-    window = MainWindow()
-    window.show()
+    progress = StartupProgress()
+    progress.start()
+    try:
+        progress.report(10, "1 / 4 · 正在載入 AI 執行環境…")
+        try:
+            import torch  # noqa: F401  保留 Windows 的 torch → Qt 載入順序
+        except (ImportError, OSError) as exc:
+            print(f"[WARNING] PyTorch unavailable: {exc}", file=sys.stderr)
+            progress.report(30, "AI 執行環境暫不可用，繼續開啟介面…")
+
+        progress.report(40, "2 / 4 · 正在載入介面元件…")
+        from PySide6.QtCore import QTimer
+        from PySide6.QtGui import QFont
+        from PySide6.QtWidgets import QApplication
+        from sop_app.ui.main_window import MainWindow
+
+        app = QApplication(sys.argv)
+        app.setApplicationName("SOP 工序監控")
+        app.setStyle("Fusion")
+        app.setFont(QFont("Microsoft JhengHei UI", 10))
+        progress.report(65, "3 / 4 · 正在建立工作視窗…")
+        window = MainWindow(defer_initial_sop=True)
+        progress.report(90, "4 / 4 · 介面就緒，準備讀取 SOP…")
+        window.show()
+        progress.report(100, "主介面已開啟")
+        # 關閉前置視窗後才讀取 SOP，避免錯誤對話框被前置視窗遮住。
+        QTimer.singleShot(0, window._open_initial_sop)
+    finally:
+        progress.close()
     sys.exit(app.exec())
 
 
