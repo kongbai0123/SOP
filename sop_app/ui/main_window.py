@@ -16,6 +16,7 @@ from ..sop_schema import SOPDefinition, Step, load_sop, save_sop
 from .editor_page import EditorPage
 from .records_page import RecordsPage
 from .run_page import RunPage
+from .camera_dialog import CameraDialog
 
 VIDEO_FILTER = "影片 (*.mp4 *.avi *.mov *.mkv *.wmv);;所有檔案 (*)"
 
@@ -29,6 +30,7 @@ class MainWindow(QMainWindow):
         self.model_info: ModelInfo | None = None
         self.model_ready = False
         self._requested_model: str | None = None
+        self._engine_running = False
         self.resize(1500, 900)
 
         self.pipeline = VideoPipeline(RECORDS_DIR, self)
@@ -59,6 +61,7 @@ class MainWindow(QMainWindow):
 
         self._build_menu()
         self._build_toolbar()
+        self.pipeline.camera_available.connect(self.camera_button.setEnabled)
         self.model_status = QLabel("模型：未載入")
         self.fps_status = QLabel("")
         self.statusBar().addPermanentWidget(self.fps_status)
@@ -100,6 +103,10 @@ class MainWindow(QMainWindow):
         disconnect_button = QPushButton("中斷")
         disconnect_button.clicked.connect(self.pipeline.close_source)
         toolbar.addWidget(disconnect_button)
+        self.camera_button = QPushButton("攝影機參數…")
+        self.camera_button.setEnabled(False)
+        self.camera_button.clicked.connect(self._camera_settings)
+        toolbar.addWidget(self.camera_button)
         self.source_status = QLabel("  未連線")
         toolbar.addWidget(self.source_status)
         toolbar.addSeparator()
@@ -147,6 +154,26 @@ class MainWindow(QMainWindow):
     def _apply_display(self, *_args):
         self.pipeline.set_display(self.mask_check.isChecked(), self.display_score.value())
 
+    def _camera_settings(self):
+        dialog = CameraDialog(self)
+        dialog.set_running(self._engine_running)
+        dialog.requested.connect(self.pipeline.camera_controls)
+        self.pipeline.camera_controls_ready.connect(dialog.update_controls)
+        self.pipeline.packet_ready.connect(dialog.on_packet)
+        self.pipeline.engine_state.connect(dialog.set_running)
+        def source_changed(_label):
+            dialog.reject()
+        self.pipeline.source_changed.connect(source_changed)
+        try:
+            self.pipeline.camera_controls()
+            dialog.exec()
+        finally:
+            self.pipeline.camera_controls_ready.disconnect(dialog.update_controls)
+            self.pipeline.packet_ready.disconnect(dialog.on_packet)
+            self.pipeline.engine_state.disconnect(dialog.set_running)
+            self.pipeline.source_changed.disconnect(source_changed)
+            dialog.deleteLater()
+
     def _on_source_changed(self, label: str):
         self.editor.clear_video("影像來源已變更，等待影像")
         self.source_status.setText(f"  {label}" if label else "  未連線")
@@ -164,7 +191,8 @@ class MainWindow(QMainWindow):
             elif page is self.editor:
                 self.editor.on_packet(packet)
             count = len([d for d in packet.result.detections if d.score >= self.display_score.value()])
-            self.fps_status.setText(f"{packet.fps:.1f} FPS · 推論 {packet.inference_ms:.0f} ms · 偵測 {count} 個  ")
+            capture = f"擷取 {packet.camera_fps:.1f} FPS · " if packet.camera_fps is not None else ""
+            self.fps_status.setText(f"{capture}處理 {packet.fps:.1f} FPS · 推論 {packet.inference_ms:.0f} ms · 偵測 {count} 個  ")
         finally:
             self.pipeline.acknowledge_packet()
 
@@ -174,6 +202,7 @@ class MainWindow(QMainWindow):
             self.records_page.mark_stale()
 
     def _on_engine_state(self, running: bool):
+        self._engine_running = running
         self.run_page.set_running(running)
         if not running:
             self.run_page.set_sop(self.editor.sop)

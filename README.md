@@ -1,6 +1,14 @@
 # SOP 工序監控雛形
 
-用攝影機 AI（Mask R-CNN）即時判斷工人是否**依序**完成每道工序。工序數量與內容全部在軟體內編輯，不需要改程式。
+用攝影機 AI（Mask R-CNN、Faster R-CNN、YOLO 或 RT-DETR）即時判斷工人是否**依序**完成每道工序。工序數量與內容全部在軟體內編輯，不需要改程式。
+
+## 主要功能
+
+- 在介面編輯 SOP 工序、完成條件、違規條件與逾時規則。
+- 攝影機參數拉桿、解析度與 FPS 設定，搭配同視窗即時預覽。
+- 支援 Mask R-CNN、Faster R-CNN、YOLO26 與 RT-DETR 模型包。
+- 固定偵測區域，以及跟隨參考工件移動的作業區域。
+- 依序判定作業、記錄 OK／NG、警報與完成截圖。
 
 ## 啟動
 
@@ -17,6 +25,7 @@
 ```bash
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe -m pip install --no-deps ultralytics==8.4.150 ultralytics-thop ultralytics-platform
 ```
 
 Git 儲存庫只包含程式、測試與範例設定，不包含作業紀錄、截圖、日誌、個人設定、
@@ -29,6 +38,7 @@ Git 儲存庫只包含程式、測試與範例設定，不包含作業紀錄、�
 
 1. **連線影像**：上方工具列選「攝影機 N」或「影片檔…」→ 按「連線」
    - 沒有攝影機時可用 `demo\demo_sop.mp4`（由訓練圖片串成的測試影片）
+   - 按「攝影機參數…」調整影像、解析度與 FPS，詳見下方說明。
 2. **工序編輯**分頁
    - 左側「工序清單」：新增／複製／刪除／上下移動工序
    - 右側「工序內容」：設定完成條件（物件、區域、數量、信心度）與選填的違規條件
@@ -40,6 +50,34 @@ Git 儲存庫只包含程式、測試與範例設定，不包含作業紀錄、�
    - 違規條件成立（例如跳步）或超時會發出警報，該輪判定為 NG
    - 無條件的工序需按「手動確認」；跳過有條件的工序也會判定為 NG
 4. **作業紀錄**分頁：每輪結果、各工序耗時、警報、完成當下的截圖
+
+## 攝影機設定
+
+連線攝影機後，按工具列的「攝影機參數…」。設定視窗同時顯示原始影像預覽，
+可直接比較調整前後的效果；影片檔來源不提供硬體參數設定。
+
+| 分頁 | 可調整內容 | 操作方式 |
+|---|---|---|
+| 解析度與 FPS | 解析度 | 選擇 640×480、1280×720、1920×1080、2560×1440、3840×2160，或輸入自訂寬高 |
+| 解析度與 FPS | 每秒擷取影格數 | 拖曳拉桿、輸入 1～240 FPS，或按 15／24／30／60 快選 |
+| 影像調整 | 亮度、對比、飽和度、銳利度、增益 | 直接拖曳拉桿，或用數值欄微調 |
+| 影像調整 | 曝光、白平衡色溫、對焦 | 手動調整或選自動模式，需 DirectShow 後端與攝影機支援 |
+
+1. 修改參數後，介面顯示待套用項目數量。
+2. 按「套用 N 項變更」，只傳送修改項目，並列出要求值與設備回報值。
+3. 若設備採用不同數值，會明確提示；失敗項目保留供修正後重試。
+4. 按「捨棄未套用變更」可取消尚未送出的修改，不會改動攝影機。
+
+常用解析度、FPS 與拉桿範圍只是操作選項，並非設備支援清單。
+影像參數可透過數值欄延伸拉桿範圍；實際允許值、單位及自動模式支援程度由驅動決定。
+回報 0 或 -1 也可能表示不支援，曝光負值不一定是錯誤。
+
+預覽區分三種資訊：設備設定回報、實際畫面尺寸與擷取 FPS、程式處理 FPS。
+提高攝影機 FPS 不保證 AI 辨識變快，處理速度仍受模型與硬體效能影響。
+作業進行中禁止變更解析度與 FPS，請先停止作業，以免影像重新初始化影響判定。
+
+已套用的設定不會因關閉視窗而復原；程式目前不保存攝影機參數。
+重新連線後以設備當下狀態為準。硬體功能仍需在實際使用的攝影機上驗證。
 
 ## 判定規則
 
@@ -61,25 +99,38 @@ sop_app/
   conditions.py            單一畫面的條件判斷（物件＋區域＋數量＋信心度）
   engine.py                判定引擎：嚴格依序、滑動時間窗、違規、超時、循環（純邏輯，可單元測試）
   model_bundle.py          讀取 Vision Workbench 模型包
-  detector.py              Mask R-CNN 推論
+  detector.py              TorchVision／YOLO／RT-DETR 推論
+  camera_controls.py       攝影機硬體參數、解析度及 FPS 設定
   pipeline.py              背景執行緒：影像 → 偵測 → 引擎 → 紀錄
   recorder.py              SQLite 紀錄與截圖（records/）
   ui/                      PySide6 介面
-tests/                     判定引擎單元測試
+tests/                     判定引擎、工件定位、模型包與攝影機設定測試
 tools/
   check_model.py           檢查模型能否載入與偵測
+  normalize_model_bundle.py 將舊版外層資料夾 ZIP 轉成標準模型包
   make_demo_video.py       用圖片串成測試影片
   simulate_sop.py          不開介面，用影片跑完整 SOP 並印出事件
 ```
 
 ## 常用指令
 
+執行測試（不需要實體攝影機或模型權重）：
+
 ```bash
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
+測試使用儲存庫原始的 `sops/example_sop.json`；若已覆寫成個人作業內容，
+範例類別驗證可能失敗。建議透過「另存新檔」保存自己的 SOP。
+
 ```bash
 .venv\Scripts\python.exe tools\simulate_sop.py sops\example_sop.json demo\demo_sop.mp4
+```
+
+若模型 ZIP 內含舊版外層資料夾，可先產生標準格式；原檔案不會被覆寫：
+
+```bash
+.venv\Scripts\python.exe tools\normalize_model_bundle.py <模型.zip>
 ```
 
 ## 工件定位與跟隨作業區域
@@ -112,5 +163,8 @@ tools/
 ### 更換辨識模型
 
 在「工序編輯 → 選擇模型…」選擇新的模型包 `.zip`。目前支援 Vision Workbench 匯出的
-`maskrcnn_resnet50_fpn`。第一次載入會把 checkpoint 解壓到模型旁的 `.extracted/` 資料夾並驗證 SHA-256。
+`maskrcnn_resnet50_fpn`、Faster R-CNN、`yolo26n_detect`、`yolo26s_detect`、
+`yolo26n_seg`、`yolo26s_seg` 與 `rt_detr_r50`。模型包可以直接放在 ZIP 根目錄，
+也可以包在任意一層外部資料夾內；程式會自動尋找成對的 `model.json` 和 checkpoint。
+第一次載入會把 checkpoint 解壓到模型旁的 `.extracted/` 資料夾並驗證 SHA-256。
 若 SOP 使用了新模型沒有的類別，開始作業前會提示錯誤。

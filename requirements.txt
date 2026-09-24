@@ -6,3 +6,19 @@ torchvision==0.22.1+cu128
 numpy==2.5.3
 opencv-python-headless==4.14.0.94
 PySide6>=6.8
+
+# 相機硬體參數（曝光、白平衡等，Windows DirectShow）
+comtypes==1.4.16
+pygrabber==0.2
+
+# YOLO26／RT-DETR 模型包的推論。使用 --no-deps 安裝，避免覆蓋
+# opencv-python-headless 並和 PySide6 發生 Qt plugin 衝突。
+# .venv\Scripts\python.exe -m pip install --no-deps ultralytics==8.4.150 ultralytics-thop ultralytics-platform
+cloudpickle>=3.1.1
+matplotlib>=3.3.0
+PyYAML>=5.3.1
+requests>=2.23.0
+psutil>=5.8.0
+polars>=0.20.0
+nvidia-ml-py>=12.0.0
+httpx>=0.28,<1

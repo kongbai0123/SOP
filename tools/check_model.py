@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cv2  # noqa: E402
 
-from sop_app.detector import MaskRCNNDetector  # noqa: E402
+from sop_app.detector import create_detector  # noqa: E402
 from sop_app.model_bundle import read_model_info  # noqa: E402
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp"}
@@ -47,7 +47,7 @@ def main():
     info = read_model_info(args.model)
     print(f"模型 {info.model_version_id} · 類別 {', '.join(info.classes)}")
     started = time.perf_counter()
-    detector = MaskRCNNDetector(info)
+    detector = create_detector(info)
     print(f"載入完成 {time.perf_counter() - started:.1f}s · {detector.device_name}")
 
     timings = []

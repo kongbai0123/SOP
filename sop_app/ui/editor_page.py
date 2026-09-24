@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import replace
+from pathlib import Path
 import numpy as np
 
 from PySide6.QtCore import Qt, Signal
@@ -235,7 +236,7 @@ class EditorPage(QWidget):
         self._loading = True
         self.name_edit.setText(sop.name)
         self.version_label.setText(str(sop.version))
-        self.model_label.setText(sop.model_path or "（未選擇）")
+        self._set_model_label(sop.model_path)
         self._capture_target = False
         self.reference_button.blockSignals(True)
         self.reference_button.setChecked(False)
@@ -382,6 +383,15 @@ class EditorPage(QWidget):
             self.modified.emit()
 
     # ---- SOP 與模型 ------------------------------------------------------------
+    def _set_model_label(self, path: str | None):
+        """畫面顯示檔名，完整路徑放在提示中，避免 ZIP 路徑擠壓表單。"""
+        if not path:
+            self.model_label.setText("（未選擇）")
+            self.model_label.setToolTip("")
+            return
+        self.model_label.setText(Path(path).name)
+        self.model_label.setToolTip(str(path))
+
     def _on_sop_name(self, text: str):
         self.sop.name = text
         self._mark_modified()
@@ -391,7 +401,7 @@ class EditorPage(QWidget):
                                               "模型包 (*.zip);;模型設定 (model.json)")
         if path:
             self.sop.model_path = relativize(path)
-            self.model_label.setText(self.sop.model_path)
+            self._set_model_label(self.sop.model_path)
             self.model_selected.emit(path)
             self._mark_modified()
 

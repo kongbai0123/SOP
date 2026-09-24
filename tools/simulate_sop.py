@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import cv2  # noqa: E402
 
 from sop_app.detection import FrameResult  # noqa: E402
-from sop_app.detector import MaskRCNNDetector  # noqa: E402
+from sop_app.detector import create_detector  # noqa: E402
 from sop_app.engine import SOPEngine  # noqa: E402
 from sop_app.model_bundle import read_model_info  # noqa: E402
 from sop_app.paths import resolve  # noqa: E402
@@ -37,7 +37,7 @@ def main():
     if errors:
         raise SystemExit(1)
 
-    detector = MaskRCNNDetector(info)
+    detector = create_detector(info)
     engine = SOPEngine(sop)
     locator = WorkpieceLocator(sop.workpiece) if sop.workpiece else None
     capture = cv2.VideoCapture(args.video)
