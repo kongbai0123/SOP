@@ -23,3 +23,4 @@ class FrameResult:
     workpiece_transform: np.ndarray | None = None  # 參考正規化座標 → 目前正規化座標，2x3
     tracking_status: str = "未設定工件"
     detection_valid: bool = True
+    tracking_metrics: dict = field(default_factory=dict)

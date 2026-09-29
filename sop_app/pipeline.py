@@ -39,6 +39,14 @@ class FramePacket:
     classes: tuple[str, ...] = ()     # 供監控頁依目前工序重畫相關物件
     min_score: float = 0.5
     show_masks: bool = True
+    processing_ms: float = 0.
+    capture_age_ms: float | None = None  # 僅攝影機，從 read 完成到送出；不含曝光與 GUI 繪製
+
+    @property
+    def tracking_load_ms(self):
+        """Preview budget includes pipeline work and, for cameras, queued frame age."""
+        age = max(0., (time.monotonic() - self.result.timestamp) * 1000) if self.capture_age_ms is not None else 0.
+        return max(self.inference_ms, self.processing_ms, age)
 
 
 class CameraSource:
@@ -262,7 +270,9 @@ class VideoPipeline(QThread):
         result = FrameResult(frame.shape[1], frame.shape[0], timestamp, detections)
         result.detection_valid = self._detector is not None
         if self._locator is not None:
-            result.workpiece_transform, result.tracking_status = self._locator.locate(frame, timestamp)
+            tracking_load = max(inference_ms, (time.monotonic() - timestamp) * 1000) if isinstance(self._source, CameraSource) else inference_ms
+            result.workpiece_transform, result.tracking_status = self._locator.locate(frame, timestamp, other_ms=tracking_load)
+            result.tracking_metrics = self._locator.metrics.copy()
         events = []
         if self._engine is not None:
             try:
@@ -297,7 +307,10 @@ class VideoPipeline(QThread):
             camera_fps = self._source.capture_fps if isinstance(self._source, CameraSource) else None
             self.packet_ready.emit(FramePacket(frame, self._last_display, result, snapshot,
                                                self._fps, inference_ms, camera_fps,
-                                               tuple(classes), self._min_score, self._show_masks))
+                                               tuple(classes), self._min_score, self._show_masks,
+                                               (time.perf_counter() - started) * 1000,
+                                               max(0., (time.monotonic() - timestamp) * 1000)
+                                               if isinstance(self._source, CameraSource) else None))
 
     def _emit_events(self, events, recorder: Recorder):
         sop = self._engine.sop
@@ -347,7 +360,7 @@ class VideoPipeline(QThread):
                     messages.insert(0, f"{'、'.join(blocked)}：未完成（請先停止作業，再變更影像格式）")
                 self.camera_controls_ready.emit(values, messages)
         elif command == "start":
-            locator = WorkpieceLocator(payload.workpiece) if payload.workpiece else None
+            locator = WorkpieceLocator(payload.workpiece, adaptive_budget=True) if payload.workpiece else None
             self._stop_engine(recorder)
             self._locator = locator
             self._engine = SOPEngine(payload)

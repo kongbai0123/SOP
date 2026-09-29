@@ -490,7 +490,7 @@ class EditorPage(QWidget):
         if sop.workpiece:
             try:
                 self._reference_frame = decode_reference(sop.workpiece)
-                self._locator = WorkpieceLocator(sop.workpiece)
+                self._locator = WorkpieceLocator(sop.workpiece, adaptive_budget=True)
                 self.tracking_label.setText("已設定位置跟隨；可標記安裝位置或觀察即時定位")
             except ValueError as exc:
                 self.tracking_label.setText(str(exc))
@@ -516,7 +516,7 @@ class EditorPage(QWidget):
             self._packet = packet
             self._preview_result = replace(packet.result, workpiece_transform=None)
             if self._locator:
-                matrix, status = self._locator.locate(packet.frame, packet.result.timestamp)
+                matrix, status = self._locator.locate(packet.frame, packet.result.timestamp, other_ms=packet.tracking_load_ms)
                 self._preview_result = replace(packet.result, workpiece_transform=matrix, tracking_status=status)
                 self.tracking_label.setText(status)
             self.video.set_frame(packet.frame if self._capture_target else
@@ -1013,7 +1013,7 @@ class EditorPage(QWidget):
         if self._capture_target:
             try:
                 target = capture_workpiece(self._packet.frame, points)
-                locator = WorkpieceLocator(target)
+                locator = WorkpieceLocator(target, adaptive_budget=True)
                 reference = decode_reference(target)
             except (ValueError, AttributeError) as exc:
                 QMessageBox.warning(self, "無法設定參考工件", str(exc))

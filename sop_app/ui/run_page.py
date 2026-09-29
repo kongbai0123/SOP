@@ -160,7 +160,7 @@ class RunPage(QWidget):
         self._locator_error = ""
         if self.sop.workpiece:
             try:
-                self._preview_locator = WorkpieceLocator(self.sop.workpiece)
+                self._preview_locator = WorkpieceLocator(self.sop.workpiece, adaptive_budget=True)
             except ValueError as exc:
                 self._locator_error = str(exc)
         self.step_list.clear()
@@ -193,7 +193,7 @@ class RunPage(QWidget):
             self._transform = packet.result.workpiece_transform
             status = packet.result.tracking_status
         elif self._preview_locator:
-            self._transform, status = self._preview_locator.locate(packet.frame, packet.result.timestamp)
+            self._transform, status = self._preview_locator.locate(packet.frame, packet.result.timestamp, other_ms=packet.tracking_load_ms)
         else:
             self._transform = None
             status = self._locator_error or "尚未設定參考工件"
@@ -204,7 +204,8 @@ class RunPage(QWidget):
             self._tracking_misses += 1
         self._update_start_availability()
         self._tracking_status = status
-        self._debug.capture(packet, self._transform, status)
+        self._debug.capture(packet, self._transform, status,
+                            self._preview_locator.metrics if not self._running and self._preview_locator else None)
         snapshot = packet.snapshot
         self._snapshot = snapshot
         self._show_monitor_frame(packet, snapshot)

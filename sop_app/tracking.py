@@ -9,6 +9,7 @@ import numpy as np
 
 from .sop_schema import ROI, Workpiece
 from .motion_filter import AdaptiveMotionFilter
+from .tracking_budget import TrackingBudget
 
 
 def decode_reference(workpiece: Workpiece) -> np.ndarray:
@@ -63,7 +64,10 @@ class WorkpieceLocator:
     MAX_RECHECK_FRAMES = 15
     MAX_FLOW_FRAMES = 60
 
-    def __init__(self, workpiece: Workpiece):
+    def __init__(self, workpiece: Workpiece, *, adaptive_budget=False):
+        self.budget = TrackingBudget() if adaptive_budget else None
+        self.metrics = {}
+        self._other_ms = 0.
         reference = decode_reference(workpiece)
         height, width = reference.shape[:2]
         points = np.asarray(workpiece.points, np.float32)
@@ -107,12 +111,23 @@ class WorkpieceLocator:
         self._flow_dst = None
         self._flow_age = 0
 
-    def locate(self, frame: np.ndarray, timestamp: float | None = None):
+    def locate(self, frame: np.ndarray, timestamp: float | None = None, *, other_ms=0.):
+        started = time.perf_counter()
+        self._started = started
+        self._other_ms = max(0., other_ms)
+        self.metrics = {"stages_ms": {}, "skipped": [], "outcomes": {}}
         timestamp = time.monotonic() if timestamp is None else timestamp
         try:
             matrix, count = self._estimate(frame)
         except cv2.error:
             matrix, count = None, 0
+            self.metrics["error"] = "opencv"
+        elapsed = (time.perf_counter() - started) * 1000
+        self.metrics.update(tracking_ms=elapsed, valid=matrix is not None)
+        if self.budget:
+            self.budget.observe_frame(elapsed + self._other_ms)
+            self.metrics.update(overloaded=self.budget.overloaded, budget_ms=self.budget.frame_ms,
+                                estimated_stage_ms=dict(self.budget.costs))
         if matrix is None:
             self._motion_filter.reset()
             self.misses += 1
@@ -145,13 +160,26 @@ class WorkpieceLocator:
         # 光流每幀更新；定期做絕對核對，2% 比較的是同一幀兩個估計的偏差。
         flowed = (None, 0)
         if self._flow_gray is not None and self._flow_age < self.MAX_FLOW_FRAMES:
+            flow_started = time.perf_counter()
             flowed = self._estimate_flow(gray)
+            self.metrics.setdefault("stages_ms", {})["flow"] = (time.perf_counter() - flow_started) * 1000
         if flowed[0] is not None:
             age = self._flow_age
             if age < self.MAX_RECHECK_FRAMES or age % self.MIN_RECHECK_FRAMES:
                 return flowed
-        for estimate in (self._estimate_features, self._estimate_sift, self._estimate_template):
+        for stage, estimate in (("orb", self._estimate_features), ("sift", self._estimate_sift),
+                                ("template", self._estimate_template)):
+            now = time.perf_counter()
+            spent = (now - getattr(self, '_started', now)) * 1000 + self._other_ms
+            if self.budget and stage != "orb" and not self.budget.allow(stage, now, spent):
+                self.metrics.setdefault("skipped", []).append(stage)
+                continue
             matrix, count = estimate(gray)
+            cost = (time.perf_counter() - now) * 1000
+            self.metrics.setdefault("stages_ms", {})[stage] = cost
+            self.metrics.setdefault("outcomes", {})[stage] = "accepted" if matrix is not None else "no_valid_match"
+            if self.budget:
+                self.budget.record(stage, now, cost)
             if matrix is not None:
                 self._measurement_verified = True
                 self._absolute_matrix = matrix.copy()
