@@ -21,6 +21,43 @@ class MotionFilterTests(unittest.TestCase):
                 smooth.append(result[:,2] * [640,480])
         self.assertLess(np.std(smooth), np.std(raw) * .8)
 
+    def test_small_stationary_jitter_keeps_anchor(self):
+        self.filter.update(self.identity, 0, 640, 480)
+        rng = np.random.default_rng(4)
+        for i in range(1, 90):
+            matrix = self.identity.copy()
+            matrix[:, 2] = rng.uniform(-.6, .6, 2) / [640, 480]
+            result = self.filter.update(matrix, i / 30, 640, 480)
+            np.testing.assert_allclose(result, self.identity, atol=1e-12)
+
+    def test_slow_motion_accumulates_against_anchor(self):
+        self.filter.update(self.identity, 0, 640, 480)
+        for i in range(1, 121):
+            moved = self.identity.copy()
+            moved[0, 2] = i * .2 / 640
+            result = self.filter.update(moved, i / 30, 640, 480)
+        self.assertLess(abs(result[0, 2] - moved[0, 2]) * 640, 4.)
+        self.assertGreater(result[0, 2] * 640, 20.)
+
+    def test_rotation_releases_stationary_anchor(self):
+        self.filter.update(self.identity, 0, 640, 480)
+        angle = .04
+        moved = np.array([[np.cos(angle), -np.sin(angle), 0.],
+                          [np.sin(angle), np.cos(angle), 0.]])
+        result = self.filter.update(moved, 1 / 30, 640, 480)
+        np.testing.assert_allclose(result, moved, atol=1e-12)
+        self.assertFalse(self.filter.stationary)
+
+    def test_stops_and_settles_without_prediction_drift(self):
+        for i in range(30):
+            moved = self.identity.copy()
+            moved[0, 2] = i / 640 * 3
+            self.filter.update(moved, i / 30, 640, 480)
+        for i in range(30, 90):
+            result = self.filter.update(moved, i / 30, 640, 480)
+        self.assertTrue(self.filter.stationary)
+        np.testing.assert_allclose(result, moved, atol=1e-12)
+
     def test_verified_large_jump_corrects_immediately(self):
         self.filter.update(self.identity, 0, 640,480)
         moved = self.identity.copy()
