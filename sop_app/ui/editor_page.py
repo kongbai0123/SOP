@@ -518,7 +518,8 @@ class EditorPage(QWidget):
             if self._locator:
                 matrix, status = self._locator.locate(packet.frame, packet.result.timestamp, other_ms=packet.tracking_load_ms)
                 self._preview_result = replace(packet.result, workpiece_transform=matrix, tracking_status=status)
-                self.tracking_label.setText(status)
+                self.tracking_label.setText(status if matrix is not None else "")
+                self.tracking_label.setToolTip(status)
             self.video.set_frame(packet.frame if self._capture_target else
                                  draw_detections(packet.frame, packet.result.detections, packet.classes,
                                                  packet.min_score, packet.show_masks, show_boxes=False),

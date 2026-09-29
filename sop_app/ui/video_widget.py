@@ -138,7 +138,7 @@ class VideoWidget(QWidget):
                 painter.setBrush(QColor('white'))
                 for point in polygon:
                     painter.drawRect(QRectF(point.x() - 5, point.y() - 5, 10, 10))
-            tag = f"{roi.name}（追蹤中斷）" if roi.name in self._stale else roi.name
+            tag = roi.name
             self._draw_tag(painter, polygon.boundingRect().topLeft() + QPointF(4, 4), tag,
                            pen.color(), label_font)
 

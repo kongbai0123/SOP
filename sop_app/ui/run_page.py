@@ -408,8 +408,6 @@ class RunPage(QWidget):
         if step.timeout_sec > 0:
             remaining = step.timeout_sec - (snapshot.now - runtime.started_at)
             lines.append(f"<span style='color:#607d8b'>剩餘時間 {max(0, remaining):.0f} 秒</span>")
-        if any(result.error for result in snapshot.results):
-            self.progress.setFormat("等待定位／辨識")
         self.condition_label.setText("<br>".join(lines))
         self._refresh_regions(self._tracking_status, snapshot)
 
