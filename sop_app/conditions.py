@@ -63,7 +63,7 @@ def evaluate_condition(cond: Condition, frame: FrameResult, rois: dict[str, ROI]
             return ConditionResult(cond, 0, False, f"找不到區域 {cond.roi}")
         roi = transform_roi(roi, frame.workpiece_transform)
         if roi is None:
-            return ConditionResult(cond, 0, False, "作業位置暫時無法確認或已超出畫面")
+            return ConditionResult(cond, 0, False, f"作業位置暫時無法確認或已超出畫面（{frame.tracking_status}）")
 
     labelled = [det for det in frame.detections if det.label == cond.label]
     confident = [det for det in labelled if det.score >= cond.min_score]
@@ -73,6 +73,14 @@ def evaluate_condition(cond: Condition, frame: FrameResult, rois: dict[str, ROI]
     met = count == 0 if cond.type == "disappear" else count >= cond.min_count
     if not labelled:
         detail = f"模型未輸出 {cond.label}"
+        if roi is not None:
+            others = sorted((det for det in frame.detections
+                             if det.label != cond.label and det.score >= cond.min_score
+                             and in_roi(det, roi, frame.width, frame.height, cond.roi_overlap)),
+                            key=lambda det: det.score, reverse=True)
+            if others:
+                actual = '、'.join(f"{det.label} {det.score:.2f}" for det in others[:3])
+                detail += f"；區域內辨識為 {actual}"
     elif not confident:
         detail = f"最高信心 {max(det.score for det in labelled):.2f}，門檻 {cond.min_score:.2f}"
     elif roi is not None and not count:

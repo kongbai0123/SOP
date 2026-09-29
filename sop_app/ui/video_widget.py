@@ -9,6 +9,7 @@ from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPolygo
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from ..sop_schema import ROI
+from ..overlay import class_color
 
 
 class VideoWidget(QWidget):
@@ -20,6 +21,8 @@ class VideoWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._image: QImage | None = None
+        self._detections = []
+        self._classes = ()
         self._placeholder = "尚未連線影像來源"
         self._rois: list[ROI] = []
         self._highlight: set[str] = set()
@@ -37,13 +40,16 @@ class VideoWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     # ---- 外部設定 --------------------------------------------------------------
-    def set_frame(self, bgr: np.ndarray):
+    def set_frame(self, bgr: np.ndarray, detections=(), classes=(), min_score=0.3):
+        self._detections = [d for d in detections if d.score >= min_score]
+        self._classes = classes
         bgr = np.ascontiguousarray(bgr)
         height, width = bgr.shape[:2]
         self._image = QImage(bgr.data, width, height, bgr.strides[0], QImage.Format.Format_BGR888).copy()
         self.update()
 
     def clear_frame(self, placeholder: str = "尚未連線影像來源"):
+        self._detections = []
         self._image, self._placeholder = None, placeholder
         self.update()
 
@@ -132,7 +138,7 @@ class VideoWidget(QWidget):
                 painter.setBrush(QColor('white'))
                 for point in polygon:
                     painter.drawRect(QRectF(point.x() - 5, point.y() - 5, 10, 10))
-            tag = f"{roi.name}（待定位）" if roi.name in self._stale else roi.name
+            tag = f"{roi.name}（追蹤中斷）" if roi.name in self._stale else roi.name
             self._draw_tag(painter, polygon.boundingRect().topLeft() + QPointF(4, 4), tag,
                            pen.color(), label_font)
 
@@ -159,6 +165,22 @@ class VideoWidget(QWidget):
             painter.setFont(label_font)
             self._draw_tag(painter, QPointF(rect.x() + 8, rect.bottom() - 30), "拖曳滑鼠框選偵測區域",
                            QColor("#00e5ff"), label_font)
+
+        # 辨識框與名稱最後繪製，避免被區域填色、標籤或其他遮罩蓋住。
+        painter.save()
+        painter.setClipRect(rect)
+        for det in self._detections:
+            b, g, r = class_color(det.label, self._classes)
+            color = QColor(r, g, b)
+            x1, y1, x2, y2 = det.box
+            box = QRectF(self._to_widget(rect, x1 / self._image.width(), y1 / self._image.height()),
+                         self._to_widget(rect, x2 / self._image.width(), y2 / self._image.height()))
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(box)
+            self._draw_tag(painter, QPointF(box.left(), max(rect.top(), box.top() - 22)),
+                           f"{det.label} {det.score:.2f}", color, label_font)
+        painter.restore()
 
     @staticmethod
     def _draw_tag(painter: QPainter, origin: QPointF, text: str, color: QColor, font: QFont):

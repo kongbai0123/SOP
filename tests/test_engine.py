@@ -132,6 +132,14 @@ class EngineTests(unittest.TestCase):
                                        frame(0, det('a', score=.61)), {})
         self.assertEqual(low_score.detail, '最高信心 0.61，門檻 0.80')
 
+    def test_wrong_side_label_is_reported_without_completing(self):
+        roi = ROI("right", [(0,0),(1,0),(1,1),(0,1)])
+        result = evaluate_condition(Condition(label="R_grip_done", roi="right", min_score=.7),
+                                    frame(0, det("L_grip_done", score=.83)), {roi.name: roi})
+        self.assertFalse(result.met)
+        self.assertIn("L_grip_done 0.83", result.detail)
+        self.assertIn("R_grip_done", result.detail)
+
     def test_missing_roi_never_met(self):
         result = evaluate_condition(Condition("disappear", "a", roi="不存在"), frame(0), {})
         self.assertFalse(result.met)

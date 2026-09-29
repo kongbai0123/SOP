@@ -53,8 +53,13 @@ def display_rois(rois, matrix):
 class WorkpieceLocator:
     """ORB 配對與 RANSAC 相似變換，支援平移、等比縮放、平面旋轉。
 
-    參考紋理需分散；連續三次定位穩定才輸出矩陣。不能保證區分外觀相同的工件。
+    每幀輸出有效量測；追蹤與參考核對偏差超過工件對角線 2% 時立即校正。不能保證區分外觀相同的工件。
     """
+
+    CORRECTION_RATIO = .02
+    MIN_RECHECK_FRAMES = 5
+    MAX_RECHECK_FRAMES = 15
+    MAX_FLOW_FRAMES = 60
 
     def __init__(self, workpiece: Workpiece):
         reference = decode_reference(workpiece)
@@ -71,22 +76,27 @@ class WorkpieceLocator:
         mask = np.zeros((height, width), np.uint8)
         cv2.fillConvexPoly(mask, pixels.astype(np.int32), 255)
         keypoints, self.descriptors = self.orb.detectAndCompute(cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY), mask)
-        if self.descriptors is None or len(keypoints) < 16:
-            raise ValueError("工件紋理不足，請選擇含清楚圖案、孔位或文字的範圍")
         self.reference_points = np.float32([k.pt for k in keypoints])
+        # ORB 對低紋理、尺度與光照改變較敏感；保留尺度不變特徵供重新定位。
+        self.sift = cv2.SIFT_create(nfeatures=1500, contrastThreshold=.015)
+        sift_points, self._sift_descriptors = self.sift.detectAndCompute(
+            cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY), mask)
+        self._sift_points = np.float32([k.pt for k in sift_points])
         self.span = np.ptp(pixels, axis=0)
         x, y, template_w, template_h = cv2.boundingRect(pixels.astype(np.int32))
         self._template_origin = (x, y)
         template_gray = cv2.cvtColor(reference, cv2.COLOR_BGR2GRAY)[y:y + template_h, x:x + template_w]
         self._template_edges = cv2.Canny(cv2.GaussianBlur(template_gray, (5, 5), 0), 40, 120)
+        if (self.descriptors is None or len(keypoints) < 16) and np.count_nonzero(self._template_edges) < 30:
+            raise ValueError("工件紋理與輪廓不足，請選擇含清楚圖案、孔位或文字的範圍")
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        self._template_cache = {}
         self.reset()
 
     def reset(self):
-        self.previous = None
-        self.stable = 0
+        self._absolute_matrix = None
+        self.last_deviation = 0.
         self.misses = 0
-        self._smoothed_matrix = None
         self._flow_gray = None
         self._flow_src = None
         self._flow_dst = None
@@ -99,28 +109,21 @@ class WorkpieceLocator:
             matrix, count = None, 0
         if matrix is None:
             self.misses += 1
-            # 單一模糊幀不清空已穩定的追蹤上下文，下一幀恢復時不必重新等待三幀。
+            # 失效時保留短期追蹤上下文；恢復有效量測的當幀即輸出。
             # 失效幀仍回傳 None，判定引擎不會拿舊位置通過條件。
             if self.misses >= 3:
                 self.reset()
                 return None, "位置跟隨已中斷，正在重新定位"
             return None, f"位置跟隨短暫不穩（{self.misses}/3）"
         self.misses = 0
-        corners = self.corners @ matrix[:, :2].T + matrix[:, 2]
-        if self.previous is not None and np.max(np.linalg.norm(corners - self.previous, axis=1)) < 0.12:
-            self.stable += 1
-            if self._smoothed_matrix is None:
-                self._smoothed_matrix = matrix.copy()
-            else:
-                self._smoothed_matrix = self._smoothed_matrix * 0.15 + matrix * 0.85
-        else:
-            self.stable = 1
-            self._smoothed_matrix = matrix.copy()
-        self.previous = corners
-        if self.stable < 3:
-            return None, f"定位確認中（{self.stable}/3）"
         quality = f"輪廓 {abs(count)}%" if count < 0 else f"{count} 個特徵"
-        return self._smoothed_matrix.copy(), f"位置跟隨穩定（{quality}）"
+        return matrix.copy(), f"位置跟隨穩定（{quality}）"
+
+    def _deviation_ratio(self, tracked, verified, width, height):
+        before = (self.corners @ tracked[:, :2].T + tracked[:, 2]) * [width, height]
+        after = (self.corners @ verified[:, :2].T + verified[:, 2]) * [width, height]
+        diagonal = np.linalg.norm(np.ptp(before, axis=0))
+        return float(np.max(np.linalg.norm(after - before, axis=1)) / max(diagonal, 1.))
 
     def _estimate(self, frame):
         height, width = frame.shape[:2]
@@ -128,24 +131,31 @@ class WorkpieceLocator:
         small = cv2.resize(frame, (round(width * factor), round(height * factor))) if factor < 1 else frame
         h, w = small.shape[:2]
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        # 逐幀量測光流；每五幀回到原始參考校正，避免連續追蹤累積漂移。
-        if self._flow_gray is not None and self._flow_age < 4:
+        # 光流每幀更新；定期做絕對核對，2% 比較的是同一幀兩個估計的偏差。
+        flowed = (None, 0)
+        if self._flow_gray is not None and self._flow_age < self.MAX_FLOW_FRAMES:
             flowed = self._estimate_flow(gray)
-            if flowed[0] is not None:
+        if flowed[0] is not None:
+            age = self._flow_age
+            if age < self.MAX_RECHECK_FRAMES or age % self.MIN_RECHECK_FRAMES:
                 return flowed
-        matrix, count = self._estimate_features(gray)
-        if matrix is not None:
-            return matrix, count
-        # 純色、反光工件可能缺少足夠角點，改以邊緣模板做絕對位置復原。
-        matrix, count = self._estimate_template(gray)
-        if matrix is not None:
-            return matrix, count
-        # 模糊／局部遮擋時只允許短期、經雙向驗證的追蹤，絕不沿用舊座標。
-        if self._flow_gray is not None and self._flow_age < 8:
-            return self._estimate_flow(gray)
+        for estimate in (self._estimate_features, self._estimate_sift, self._estimate_template):
+            matrix, count = estimate(gray)
+            if matrix is not None:
+                self._absolute_matrix = matrix.copy()
+                if flowed[0] is not None:
+                    self.last_deviation = self._deviation_ratio(flowed[0], matrix, w, h)
+                    if self.last_deviation <= self.CORRECTION_RATIO:
+                        # 小差異僅做輕量平滑；光流內部基準已由本次絕對定位更新。
+                        matrix = flowed[0] * .8 + matrix * .2
+                return matrix, count
+        if flowed[0] is not None:
+            return flowed
         return None, 0
 
     def _estimate_features(self, gray):
+        if self.descriptors is None or len(self.reference_points) < 8:
+            return None, 0
         h, w = gray.shape
         keypoints, descriptors = self.orb.detectAndCompute(gray, None)
         if descriptors is None or len(descriptors) < 2:
@@ -177,6 +187,40 @@ class WorkpieceLocator:
         self._flow_dst = dst[keep].copy()
         self._flow_age = 0
         return normalized, count
+
+    def _estimate_sift(self, gray):
+        if self._sift_descriptors is None or len(self._sift_points) < 12:
+            return None, 0
+        keypoints, descriptors = self.sift.detectAndCompute(gray, None)
+        if descriptors is None or len(keypoints) < 12:
+            return None, 0
+        matcher = cv2.BFMatcher(cv2.NORM_L2)
+        reverse = {m.queryIdx: m.trainIdx for m in matcher.match(descriptors, self._sift_descriptors)}
+        matches = [a for pair in matcher.knnMatch(self._sift_descriptors, descriptors, k=2)
+                   if len(pair) == 2 for a, b in [pair]
+                   if a.distance < .7 * b.distance and reverse.get(a.trainIdx) == a.queryIdx]
+        if len(matches) < 12:
+            return None, 0
+        src = np.float32([self._sift_points[m.queryIdx] for m in matches])
+        dst = np.float32([keypoints[m.trainIdx].pt for m in matches])
+        affine, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC,
+                                                     ransacReprojThreshold=3., maxIters=3000)
+        if affine is None or inliers is None:
+            return None, 0
+        keep = inliers.ravel().astype(bool)
+        count = int(keep.sum())
+        # 雙向唯一配對、分散的內點與幾何誤差一起驗證，不以少數相似孔位通過。
+        if count < 12 or keep.mean() < .35 or (np.ptp(src[keep], axis=0) < self.span * .25).any():
+            return None, 0
+        residual = np.linalg.norm(src[keep] @ affine[:, :2].T + affine[:, 2] - dst[keep], axis=1)
+        if np.median(residual) > 1.5 or not .3 <= np.linalg.norm(affine[:, 0]) <= 3:
+            return None, 0
+        rw, rh = self.reference_size
+        h, w = gray.shape
+        self._flow_gray = gray.copy()
+        self._flow_src, self._flow_dst = src[keep].copy(), dst[keep].copy()
+        self._flow_age = 0
+        return np.diag([1/w, 1/h]) @ affine @ np.diag([rw, rh, 1]), count
 
     def _estimate_flow(self, gray):
         if gray.shape != self._flow_gray.shape or len(self._flow_dst) < 10:
@@ -218,25 +262,70 @@ class WorkpieceLocator:
         template = self._template_edges
         if template.size == 0 or np.count_nonzero(template) < 30:
             return None, 0
+        full_gray = gray
+        factor = min(1., 640 / max(gray.shape))
+        if factor < 1:
+            gray = cv2.resize(gray, (round(gray.shape[1] * factor), round(gray.shape[0] * factor)))
         current_edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 40, 120)
+        if np.count_nonzero(current_edges) < 30:
+            return None, 0
+        rw, rh = self.reference_size
+        sx, sy = gray.shape[1] / rw, gray.shape[0] / rh
+        # 優先平移比對；只有失敗才搜尋小角度旋轉，模板依解析度快取。
+        if self._template_cache.get('shape') != gray.shape:
+            self._template_cache = {'shape': gray.shape}
         best = None
-        for scale in (0.9, 1.0, 1.1):
-            width = round(template.shape[1] * scale)
-            height = round(template.shape[0] * scale)
-            if width < 12 or height < 12 or width > gray.shape[1] or height > gray.shape[0]:
-                continue
-            candidate = cv2.resize(template, (width, height), interpolation=cv2.INTER_AREA)
-            scores = cv2.matchTemplate(current_edges, candidate, cv2.TM_CCOEFF_NORMED)
-            _minimum, score, _min_at, location = cv2.minMaxLoc(scores)
-            if best is None or score > best[0]:
-                best = (float(score), scale, location)
+        for angles in ((0,), (-12, -6, 6, 12)):
+            for angle in angles:
+                for scale in (0.9, 1.0, 1.1):
+                    key = (angle, scale)
+                    if key not in self._template_cache:
+                        local = cv2.getRotationMatrix2D((0, 0), angle, scale)
+                        local = np.diag([sx, sy]) @ local
+                        th, tw = template.shape
+                        corners = np.array([[0,0], [tw,0], [tw,th], [0,th]]) @ local[:, :2].T
+                        offset = np.floor(corners.min(axis=0))
+                        size = np.ceil(corners.max(axis=0) - offset).astype(int)
+                        local[:, 2] -= offset
+                        candidate = cv2.warpAffine(template, local, tuple(size))
+                        self._template_cache[key] = (candidate, local)
+                    candidate, local = self._template_cache[key]
+                    height, width = candidate.shape
+                    if width < 12 or height < 12 or width > gray.shape[1] or height > gray.shape[0]:
+                        continue
+                    scores = cv2.matchTemplate(current_edges, candidate, cv2.TM_CCOEFF_NORMED)
+                    _minimum, score, _min_at, location = cv2.minMaxLoc(scores)
+                    if best is None or score > best[0]:
+                        best = (float(score), local, location)
+            if best is not None and best[0] >= 0.58:
+                break
         if best is None or best[0] < 0.58:
             return None, 0
-        score, scale, (x, y) = best
-        origin_x, origin_y = self._template_origin
-        affine = np.array([[scale, 0., x - scale * origin_x],
-                           [0., scale, y - scale * origin_y]], dtype=np.float64)
+        score, local, location = best
+        affine = local.copy()
+        affine[:, 2] += np.asarray(location) - affine[:, :2] @ self._template_origin
+        affine = np.diag([full_gray.shape[1] / gray.shape[1], full_gray.shape[0] / gray.shape[0]]) @ affine
         rw, rh = self.reference_size
-        h, w = gray.shape
+        h, w = full_gray.shape
         normalized = np.diag([1 / w, 1 / h]) @ affine @ np.diag([rw, rh, 1])
+        self._seed_template_flow(full_gray, affine)
         return normalized, -round(score * 100)
+
+    def _seed_template_flow(self, gray, affine):
+        """輪廓絕對定位後，建立參考座標對應，讓後續幀使用實測光流。"""
+        rw, rh = self.reference_size
+        polygon = self.corners * [rw, rh] @ affine[:, :2].T + affine[:, 2]
+        mask = np.zeros(gray.shape, np.uint8)
+        cv2.fillConvexPoly(mask, np.int32(polygon), 255)
+        points = cv2.goodFeaturesToTrack(gray, 160, .01, 7, mask=mask)
+        if points is None or len(points) < 10:
+            return
+        dst = points.reshape(-1, 2)
+        inverse = cv2.invertAffineTransform(affine)
+        src = dst @ inverse[:, :2].T + inverse[:, 2]
+        if (np.ptp(src, axis=0) < self.span * .2).any():
+            return
+        self._flow_gray = gray.copy()
+        self._flow_src = np.float32(src)
+        self._flow_dst = np.float32(dst)
+        self._flow_age = 0

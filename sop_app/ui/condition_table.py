@@ -123,7 +123,7 @@ class ConditionTable(QWidget):
             overlap_box.setRange(1, 100)
             overlap_box.setSuffix(" %")
             overlap_box.setValue(round(cond.roi_overlap * 100))
-            overlap_box.setToolTip("辨識物件本身至少有多少比例必須位於指定區域內")
+            overlap_box.setToolTip("交集面積 ÷ 物件面積；不是安裝區域的覆蓋率。\n使用分割遮罩（無遮罩才使用辨識框）。待定位時不判定完成。")
             overlap_box.valueChanged.connect(lambda v, r=row: self._set(r, "roi_overlap", v / 100))
 
             for column, widget in enumerate([type_box, label_box, roi_box, count_box, score_box, overlap_box]):

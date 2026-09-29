@@ -19,7 +19,7 @@ def class_color(label: str, classes: Sequence[str]) -> tuple[int, int, int]:
 
 
 def draw_detections(frame: np.ndarray, detections: list[Detection], classes: Sequence[str],
-                    min_score: float = 0.3, show_masks: bool = True) -> np.ndarray:
+                    min_score: float = 0.3, show_masks: bool = True, show_boxes: bool = True) -> np.ndarray:
     canvas = frame.copy()
     scale = max(1.0, frame.shape[1] / 1280)
     thickness = max(2, round(2 * scale))
@@ -32,6 +32,14 @@ def draw_detections(frame: np.ndarray, detections: list[Detection], classes: Seq
             region = canvas[y1:y2, x1:x2]
             object_mask = det.mask[y1:y2, x1:x2]
             region[object_mask] = (region[object_mask] * 0.55 + np.array(color) * 0.45).astype(np.uint8)
+    # 所有遮罩先畫完，才畫所有框與文字。
+    if not show_boxes:
+        return canvas
+    for det in detections:
+        if det.score < min_score:
+            continue
+        color = class_color(det.label, classes)
+        x1, y1, x2, y2 = det.box
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness)
         text = f"{det.label} {det.score:.2f}"
         font_scale = 0.6 * scale

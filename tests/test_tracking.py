@@ -53,8 +53,9 @@ class TrackingTests(unittest.TestCase):
             np.testing.assert_allclose(actual, expected, atol=.015)
         # 特徵配對暫時失敗時使用實際光流；超過上限必須失效，不能永遠漂移。
         with patch.object(locator, '_estimate_features', return_value=(None,0)), \
+             patch.object(locator, '_estimate_sift', return_value=(None,0)), \
              patch.object(locator, '_estimate_template', return_value=(None,0)):
-            outputs = [locator.locate(moved)[0] for _ in range(10)]
+            outputs = [locator.locate(moved)[0] for _ in range(locator.MAX_FLOW_FRAMES + 3)]
         self.assertTrue(any(m is not None for m in outputs))
         self.assertIsNone(outputs[-1])
         self.assertIsNone(locator._flow_gray)
@@ -64,11 +65,11 @@ class TrackingTests(unittest.TestCase):
         locator = WorkpieceLocator(capture_workpiece(reference, TARGET))
         shifted = cv2.warpAffine(reference, np.float32([[1,0,18],[0,1,9]]), (640,480))
         with patch.object(locator, '_estimate_features', return_value=(None,0)):
-            self.assertIsNone(locator.locate(shifted)[0])
-            self.assertIsNone(locator.locate(shifted)[0])
+            self.assertIsNotNone(locator.locate(shifted)[0])
+            self.assertIsNotNone(locator.locate(shifted)[0])
             actual, status = locator.locate(shifted)
         self.assertIsNotNone(actual)
-        self.assertIn('輪廓', status)
+        self.assertIsNotNone(locator._flow_gray)
         expected = IDENTITY.copy()
         expected[:,2] = [18/640, 9/480]
         np.testing.assert_allclose(actual, expected, atol=.012)
@@ -79,8 +80,8 @@ class TrackingTests(unittest.TestCase):
         affine = cv2.getRotationMatrix2D((320, 240), 18, 0.85)
         affine[:, 2] += [55, 25]
         moved = cv2.warpAffine(reference, affine, (640, 480))
-        self.assertIsNone(locator.locate(moved)[0])
-        self.assertIsNone(locator.locate(moved)[0])
+        self.assertIsNotNone(locator.locate(moved)[0])
+        self.assertIsNotNone(locator.locate(moved)[0])
         actual, _ = locator.locate(moved)
         self.assertIsNotNone(actual)
         expected = np.diag([1/640, 1/480]) @ affine @ np.diag([640, 480, 1])
@@ -88,6 +89,89 @@ class TrackingTests(unittest.TestCase):
         self.assertIsNone(locator.locate(np.zeros_like(reference))[0])
         # 單一失效幀後若位置一致，應立即恢復，不再重新等待三幀。
         self.assertIsNotNone(locator.locate(moved)[0])
+
+    def test_contour_only_reference_can_follow_translation(self):
+        reference = scene()
+        with patch('sop_app.tracking.cv2.ORB_create') as create:
+            create.return_value.detectAndCompute.return_value = ([], None)
+            locator = WorkpieceLocator(capture_workpiece(reference, TARGET))
+            moved = cv2.warpAffine(reference, np.float32([[1,0,18],[0,1,9]]), (640,480))
+            for _ in range(3):
+                actual, status = locator.locate(moved)
+        self.assertIsNotNone(actual)
+        self.assertIsNotNone(locator._flow_gray)
+        expected = IDENTITY.copy()
+        expected[:, 2] = [18/640, 9/480]
+        np.testing.assert_allclose(actual, expected, atol=.012)
+        self.assertIsNone(locator.locate(np.zeros_like(reference))[0])
+
+    def test_template_handles_resolution_change(self):
+        reference = scene()
+        locator = WorkpieceLocator(capture_workpiece(reference, TARGET))
+        with patch.object(locator, '_estimate_features', return_value=(None, 0)):
+            for _ in range(3):
+                actual, _ = locator.locate(cv2.resize(reference, (960, 720)))
+        self.assertIsNotNone(actual)
+        np.testing.assert_allclose(actual, IDENTITY, atol=.015)
+
+    def test_template_rotation_seeds_fast_flow_and_rechecks_reference(self):
+        reference = scene()
+        locator = WorkpieceLocator(capture_workpiece(reference, TARGET))
+        affine = cv2.getRotationMatrix2D((320, 240), 6, 1)
+        affine[:, 2] += [18, 9]
+        moved = cv2.warpAffine(reference, affine, (640, 480))
+        expected = np.diag([1/640, 1/480]) @ affine @ np.diag([640, 480, 1])
+        with patch.object(locator, '_estimate_features', return_value=(None, 0)), \
+             patch.object(locator, '_estimate_sift', return_value=(None, 0)), \
+             patch.object(locator, '_estimate_template', wraps=locator._estimate_template) as template:
+            for _ in range(5):
+                actual, _ = locator.locate(moved)
+            self.assertEqual(template.call_count, 1)
+            np.testing.assert_allclose(actual, expected, atol=.015)
+            for _ in range(locator.MAX_RECHECK_FRAMES - 4):
+                locator.locate(moved)
+            self.assertEqual(template.call_count, 2)
+        self.assertIsNone(locator.locate(np.zeros_like(reference))[0])
+
+    def test_sift_relocalizes_scale_rotation_and_rejects_blank(self):
+        reference = scene()
+        locator = WorkpieceLocator(capture_workpiece(reference, TARGET))
+        affine = cv2.getRotationMatrix2D((320, 240), 25, .8)
+        affine[:, 2] += [30, 15]
+        moved = cv2.warpAffine(reference, affine, (640, 480))
+        actual, count = locator._estimate_sift(cv2.cvtColor(moved, cv2.COLOR_BGR2GRAY))
+        self.assertIsNotNone(actual)
+        self.assertGreaterEqual(count, 12)
+        expected = np.diag([1/640, 1/480]) @ affine @ np.diag([640, 480, 1])
+        np.testing.assert_allclose(actual, expected, atol=.015)
+        self.assertIsNone(locator._estimate_sift(np.zeros((480,640), np.uint8))[0])
+
+    def test_two_percent_compares_estimates_and_corrects_large_error(self):
+        locator = WorkpieceLocator(capture_workpiece(scene(), TARGET))
+        diagonal = np.linalg.norm(np.ptp(np.array(TARGET) * [640, 480], axis=0))
+        for ratio in (.01, .03):
+            verified = IDENTITY.copy()
+            verified[0, 2] = diagonal * ratio / 640
+            self.assertAlmostEqual(locator._deviation_ratio(IDENTITY, verified, 640, 480), ratio)
+            locator._flow_gray = np.zeros((480,640), np.uint8)
+            locator._flow_age = locator.MAX_RECHECK_FRAMES
+            with patch.object(locator, '_estimate_flow', return_value=(IDENTITY.copy(), 30)), \
+                 patch.object(locator, '_estimate_features', return_value=(verified, 30)):
+                matrix, _ = locator._estimate(scene())
+            expected = verified if ratio > .02 else IDENTITY * .8 + verified * .2
+            np.testing.assert_allclose(matrix, expected)
+
+    def test_first_frame_and_recovery_have_no_confirmation_delay(self):
+        reference = scene()
+        locator = WorkpieceLocator(capture_workpiece(reference, TARGET))
+        self.assertIsNotNone(locator.locate(reference)[0])
+        for _ in range(4):
+            self.assertIsNone(locator.locate(np.zeros_like(reference))[0])
+        moved = cv2.warpAffine(reference, np.float32([[1,0,40],[0,1,20]]), (640,480))
+        matrix, _ = locator.locate(moved)
+        self.assertIsNotNone(matrix)
+        self.assertAlmostEqual(matrix[0, 2], 40/640, delta=.01)
+        self.assertAlmostEqual(matrix[1, 2], 20/480, delta=.01)
 
     def test_low_texture_rejected(self):
         with self.assertRaises(ValueError):
@@ -180,9 +264,9 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(editor.step_list.isVisible())
         self.assertTrue(editor.sop_box.isVisible())
         self.assertIn('1 道', editor.steps_box.title())
-        self.assertTrue(editor.mode_buttons['overview'].isChecked())
+        self.assertEqual(editor.settings_tool.currentData(), 'overview')
         self.assertIn('已設定工序', editor.setup_summary.text())
-        editor.mode_buttons['steps'].click()
+        editor.settings_tool.setCurrentIndex(editor.settings_tool.findData('steps'))
         self.app.processEvents()
         self.assertTrue(editor.tabs.isVisible())
         self.assertFalse(editor.manual_tools.isVisible())
@@ -191,8 +275,8 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(editor.step_list.isVisible())
         self.assertFalse(editor.sop_box.isVisible())
         self.assertEqual(editor.tabs.currentIndex(), 0)
-        self.assertTrue(editor.mode_buttons['steps'].isChecked())
-        editor.mode_buttons['positions'].click()
+        self.assertEqual(editor.settings_tool.currentData(), 'steps')
+        editor.settings_tool.setCurrentIndex(editor.settings_tool.findData('positions'))
         self.app.processEvents()
         self.assertTrue(editor.left_panel.isVisible())
         self.assertTrue(editor.step_list.isVisible())
@@ -230,7 +314,7 @@ class EditorTests(unittest.TestCase):
         blank = np.zeros_like(frame)
         run.on_packet(FramePacket(blank,blank,FrameResult(640,480,2),None,10,5))
         self.assertEqual([r.name for r in run.video._rois], ['桌面','安裝位置'])
-        self.assertEqual(run.video._stale, set())
+        self.assertEqual(run.video._stale, {'安裝位置'})
         run.on_packet(FramePacket(blank,blank,FrameResult(640,480,3),None,10,5))
         self.assertEqual(run.video._stale, {'安裝位置'})
         self.assertIn('位置跟隨暫停', run.tracking_label.text())
@@ -245,6 +329,29 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(run.video._rois, [])
         self.assertIsNone(run._transform)
 
+    def test_editor_tools_and_monitor_share_all_results_by_default(self):
+        editor, run = EditorPage(), RunPage()
+        self.addCleanup(editor.close)
+        self.addCleanup(run.close)
+        sop = SOPDefinition(rois=[ROI('left', TARGET), ROI('right', TARGET)],
+                            steps=[Step('install', conditions=[Condition(label='R_grip_done', roi='right')])])
+        editor.set_sop(sop)
+        run.set_sop(sop)
+        raw = scene()
+        detections = [Detection('L_grip_done', .84, (200,150,300,250)),
+                      Detection('handlebar', .94, (160,120,450,350))]
+        packet = FramePacket(raw, raw, FrameResult(640,480,0,detections), None,10,5,None,
+                             ('L_grip_done', 'handlebar'), .5, False)
+        run.on_packet(packet)
+        self.assertEqual(run.display_mode.currentData(), 'all')
+        for mode in ('overview', 'follow', 'positions', 'steps', 'cycle'):
+            editor.settings_tool.setCurrentIndex(editor.settings_tool.findData(mode))
+            editor.on_packet(packet)
+            self.assertEqual([d.label for d in editor.video._detections],
+                             [d.label for d in run.video._detections])
+            self.assertEqual([r.name for r in editor.video._rois], [r.name for r in run.video._rois])
+        self.assertTrue(run.details_panel.isHidden())
+
     def test_monitor_hides_frame_by_frame_tracking_details_when_step_has_no_region(self):
         frame = scene()
         sop = SOPDefinition(
@@ -254,6 +361,7 @@ class EditorTests(unittest.TestCase):
         run = RunPage()
         self.addCleanup(run.close)
         run.set_sop(sop)
+        run.display_mode.setCurrentIndex(run.display_mode.findData("step"))
         texts = {run.tracking_label.text()}
         for index, image in enumerate([frame, frame, frame, np.zeros_like(frame), frame]):
             run.on_packet(FramePacket(image, image, FrameResult(640,480,index), None,10,5))
@@ -342,11 +450,12 @@ class EditorTests(unittest.TestCase):
         result = FrameResult(100,100,0,detections)
         packet = FramePacket(raw, np.full_like(raw,255), result, engine.snapshot(),10,5,None,
                              ('left_part','right_part','noise'),.5,False)
+        run.display_mode.setCurrentIndex(run.display_mode.findData('step'))
         run.on_packet(packet)
         self.assertEqual([r.name for r in run.video._rois],['左'])
         self.assertIn('目前流程 1：左步驟',run.display_summary.text())
         self.assertIn('left_part',run.display_summary.text())
-        self.assertGreater(run.video._image.pixelColor(15,15).red(), 0)
+        self.assertEqual([d.label for d in run.video._detections], ['left_part'])
         self.assertEqual(run.video._image.pixelColor(85,75).red(), 0)
         run.display_mode.setCurrentIndex(run.display_mode.findData('all'))
         self.assertEqual([r.name for r in run.video._rois],['左','右'])
@@ -489,7 +598,7 @@ class EditorTests(unittest.TestCase):
             page = RecordsPage(Path(folder))
             page.refresh()
             page.cycles.selectRow(0)
-            self.assertEqual(page.positioning.rowCount(), 2)
+            self.assertEqual(page.positioning.rowCount(), 0)
             page.close()
             pipe._handle_command("stop", None, recorder)
             self.assertIsNone(pipe._locator)

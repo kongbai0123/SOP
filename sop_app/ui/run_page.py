@@ -16,6 +16,7 @@ from ..pipeline import FramePacket
 from ..overlay import draw_detections
 from ..sop_schema import SOPDefinition
 from ..tracking import WorkpieceLocator, display_rois
+from ..tracking_debug import TrackingDebug
 from .video_widget import VideoWidget
 
 STATUS_COLORS = {StepStatus.PENDING: "#78909c", StepStatus.ACTIVE: "#1565c0",
@@ -41,6 +42,7 @@ class RunPage(QWidget):
         self._last_packet = None
         self._tracking_status = "等待影像定位"
         self._stats = {"OK": 0, "NG": 0, "中止": 0}
+        self._debug = TrackingDebug()
         self._build()
 
     def _build(self):
@@ -60,6 +62,13 @@ class RunPage(QWidget):
         self.condition_label = QLabel("")
         self.condition_label.setTextFormat(Qt.TextFormat.RichText)
         self.condition_label.setWordWrap(True)
+        self.details_button = QPushButton("顯示判定詳情")
+        self.details_button.setCheckable(True)
+        self.details_panel = QWidget()
+        details_layout = QVBoxLayout(self.details_panel)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        self.details_panel.setVisible(False)
+        self.details_button.toggled.connect(self._toggle_details)
 
         self.step_list = QListWidget()
         self.step_list.setFont(QFont(self.font().family(), 11))
@@ -73,8 +82,8 @@ class RunPage(QWidget):
         self.start_button.setToolTip("可直接開始作業；位置尚未確認時，跟隨位置的條件會暫停累積。")
         self.start_button.clicked.connect(self._on_start_clicked)
         self.display_mode = QComboBox()
-        self.display_mode.addItem("逐步｜目前流程", "step")
-        self.display_mode.addItem("全開｜所有結果", "all")
+        self.display_mode.addItem("所有辨識結果與安裝位置（預設）", "all")
+        self.display_mode.addItem("只看目前工序（進階篩選）", "step")
         self.display_mode.setToolTip(
             "逐步：只輸出目前流程的完成與違規條件物件及位置\n"
             "全開：輸出模型所有辨識結果與所有位置\n"
@@ -98,14 +107,16 @@ class RunPage(QWidget):
         display_row = QHBoxLayout()
         display_row.addWidget(QLabel("畫面顯示"))
         display_row.addWidget(self.display_mode, 1)
-        layout.addLayout(display_row)
-        layout.addWidget(self.display_summary)
+        details_layout.addLayout(display_row)
         layout.addLayout(buttons)
         layout.addWidget(self.step_title)
         layout.addWidget(self.instruction)
-        layout.addWidget(self.tracking_label)
         layout.addWidget(self.progress)
-        layout.addWidget(self.condition_label)
+        layout.addWidget(self.details_button)
+        details_layout.addWidget(self.display_summary)
+        details_layout.addWidget(self.tracking_label)
+        details_layout.addWidget(self.condition_label)
+        layout.addWidget(self.details_panel)
         layout.addWidget(self._section("工序進度"))
         layout.addWidget(self.step_list, 2)
         layout.addWidget(self.cycle_label)
@@ -128,6 +139,10 @@ class RunPage(QWidget):
         label = QLabel(text)
         label.setStyleSheet("font-weight:bold; margin-top:6px")
         return label
+
+    def _toggle_details(self, visible: bool):
+        self.details_panel.setVisible(visible)
+        self.details_button.setText("隱藏判定詳情" if visible else "顯示判定詳情")
 
     # ---- 外部介面 --------------------------------------------------------------
     def set_sop(self, sop: SOPDefinition):
@@ -189,9 +204,10 @@ class RunPage(QWidget):
             self._tracking_misses += 1
         self._update_start_availability()
         self._tracking_status = status
+        self._debug.capture(packet, self._transform, status)
         snapshot = packet.snapshot
         self._snapshot = snapshot
-        self.video.set_frame(self._monitor_frame(packet, snapshot))
+        self._show_monitor_frame(packet, snapshot)
         self._refresh_regions(status, snapshot)
         if self.sop is None or snapshot is None or snapshot.phase == Phase.IDLE or not self._running:
             return
@@ -242,13 +258,18 @@ class RunPage(QWidget):
         prefix = "目前" if snapshot and snapshot.phase == Phase.RUNNING else "待機預覽"
         return f"{prefix}流程 {index + 1}：{self.sop.steps[index].name}", rois, labels
 
+    def _show_monitor_frame(self, packet, snapshot):
+        mode = self.display_mode.currentData()
+        _context, _rois, labels = self._step_context(snapshot)
+        detections = [d for d in packet.result.detections if mode == "all" or d.label in labels]
+        self.video.set_frame(self._monitor_frame(packet, snapshot), detections, packet.classes, packet.min_score)
+
     def _monitor_frame(self, packet, snapshot):
         mode = self.display_mode.currentData()
-        if mode == "all" or not packet.classes:
-            return packet.display
         _context, _rois, labels = self._step_context(snapshot)
-        detections = [d for d in packet.result.detections if d.label in labels]
-        return draw_detections(packet.frame, detections, packet.classes, packet.min_score, packet.show_masks)
+        detections = [d for d in packet.result.detections if mode == "all" or d.label in labels]
+        return draw_detections(packet.frame, detections, packet.classes, packet.min_score,
+                               packet.show_masks, show_boxes=False)
 
     def _refresh_regions(self, status="等待影像定位", snapshot=None):
         if self.sop is None:
@@ -257,8 +278,7 @@ class RunPage(QWidget):
             return
         context, current, labels = self._step_context(snapshot)
         selected = self.sop.rois if self.display_mode.currentData() == "all" else [r for r in self.sop.rois if r.name in current]
-        tracking_lost = (self.sop.workpiece is not None and self._transform is None
-                         and (self._last_transform is None or self._tracking_misses >= 2))
+        tracking_lost = self.sop.workpiece is not None and self._transform is None
         display_transform = self._transform
         if display_transform is None and self._last_transform is not None:
             display_transform = self._last_transform
@@ -285,7 +305,8 @@ class RunPage(QWidget):
                                         else "全開｜目前沒有工作區域")
         elif stale and not hidden:
             self.tracking_label.setText(
-                f"{mode_text}｜區域 {len(visible)}/{len(selected)}｜位置跟隨暫停｜顯示最後位置，條件停止累積")
+                f"{mode_text}｜區域 {len(visible)}/{len(selected)}｜位置跟隨暫停：{status}｜"
+                f"{'顯示最後位置' if self._last_transform is not None else '顯示參考位置'}，條件停止累積")
         elif hidden:
             self.tracking_label.setText(
                 f"{mode_text}｜區域 {len(visible)}/{len(selected)}｜{hidden} 個區域超出畫面｜條件停止累積")
@@ -299,7 +320,7 @@ class RunPage(QWidget):
     def _on_display_mode_changed(self, _index):
         self._refresh_regions(self._tracking_status, self._snapshot)
         if self._last_packet is not None:
-            self.video.set_frame(self._monitor_frame(self._last_packet, self._snapshot))
+            self._show_monitor_frame(self._last_packet, self._snapshot)
 
     def on_events(self, events: list[EngineEvent]):
         for event in events:
@@ -334,7 +355,7 @@ class RunPage(QWidget):
     def _render_steps(self, snapshot: EngineSnapshot):
         for index, (step, runtime) in enumerate(zip(self.sop.steps, snapshot.steps)):
             if runtime.status == StepStatus.ACTIVE:
-                text = f"▶  {index + 1}. {step.name}   {snapshot.now - runtime.started_at:.1f}s"
+                text = f"▶  {index + 1}. {step.name}"
             elif runtime.status == StepStatus.DONE:
                 manual = "（手動）" if runtime.manual else ""
                 text = f"✔  {index + 1}. {step.name}   {runtime.ended_at - runtime.started_at:.1f}s{manual}"
@@ -387,7 +408,7 @@ class RunPage(QWidget):
             remaining = step.timeout_sec - (snapshot.now - runtime.started_at)
             lines.append(f"<span style='color:#607d8b'>剩餘時間 {max(0, remaining):.0f} 秒</span>")
         if any(result.error for result in snapshot.results):
-            self.progress.setFormat("判定暫停")
+            self.progress.setFormat("等待定位／辨識")
         self.condition_label.setText("<br>".join(lines))
         self._refresh_regions(self._tracking_status, snapshot)
 

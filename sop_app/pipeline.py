@@ -274,12 +274,14 @@ class VideoPipeline(QThread):
 
         if events or self._gui_ready.is_set():
             classes = self._detector.classes if self._detector is not None else ()
-            self._last_display = draw_detections(frame, detections, classes, self._min_score, self._show_masks)
+            self._last_display = frame.copy()
             if self._engine is not None:
                 for roi in display_rois(self._engine.sop.rois, result.workpiece_transform):
                     if any(r.name == roi.name and r.anchor == "workpiece" for r in self._engine.sop.rois):
                         polygon = np.int32(np.asarray(roi.points) * [result.width, result.height])
                         cv2.polylines(self._last_display, [polygon], True, (0, 220, 255), 2)
+            self._last_display = draw_detections(self._last_display, detections, classes,
+                                                 self._min_score, self._show_masks)
         if events:
             self._emit_events(events, recorder)
 

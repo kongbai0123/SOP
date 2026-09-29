@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout,
                                QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
                                QSplitter, QTabWidget, QVBoxLayout, QWidget)
@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QCheckBox, QComb
 from ..conditions import evaluate_conditions
 from ..paths import PROJECT_ROOT, relativize
 from ..pipeline import FramePacket
+from ..overlay import draw_detections
 from ..sop_schema import Condition, ROI, SOPDefinition, Step
 from ..tracking import WorkpieceLocator, capture_workpiece, decode_reference, display_rois
 from .condition_table import ConditionTable
@@ -35,6 +36,7 @@ class EditorPage(QWidget):
         self._loading = False
         self._locator = None
         self._preview_result = None
+        self._last_transform = None
         self._capture_target = False
         self._reference_frame = None
         self._roi_undo = []
@@ -190,31 +192,24 @@ class EditorPage(QWidget):
         center_layout = QVBoxLayout(center)
         title = QLabel("設定作業流程")
         title.setStyleSheet("font-size:18px; font-weight:bold; color:#1f2933")
-        subtitle = QLabel("一般設定使用引導即可；只有需要調整條件、位置細節或循環規則時才展開進階設定。")
+        subtitle = QLabel("即時畫面統一顯示所有辨識結果與安裝位置；需要修改時再展開設定工具。")
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color:#607d8b")
         center_layout.addWidget(title)
         center_layout.addWidget(subtitle)
         center_layout.addWidget(self.setup_summary)
 
-        self.mode_group = QButtonGroup(self)
-        self.mode_group.setExclusive(True)
-        self.mode_buttons = {}
-        mode_row = QHBoxLayout()
-        for key, text in (("overview", "總覽"), ("follow", "位置跟隨"),
-                          ("positions", "安裝位置"), ("steps", "工序條件"), ("cycle", "循環設定")):
-            button = QPushButton(text)
-            button.setCheckable(True)
-            button.setMinimumHeight(36)
-            button.setStyleSheet(
-                "QPushButton{padding:7px; border:1px solid #cfd8dc; background:#f5f7f8; color:#37474f;}"
-                "QPushButton:checked{background:#1565c0; color:white; border-color:#1565c0; font-weight:bold;}")
-            button.clicked.connect(lambda _checked=False, value=key: self._set_editor_mode(value))
-            self.mode_group.addButton(button)
-            self.mode_buttons[key] = button
-            mode_row.addWidget(button)
-        self.mode_buttons["overview"].setChecked(True)
-        center_layout.addLayout(mode_row)
+        self.settings_tool = QComboBox()
+        for key, text in (("overview", "收合設定工具"), ("follow", "設定位置跟隨"),
+                          ("positions", "編輯安裝位置"), ("steps", "編輯工序條件"), ("cycle", "設定循環")):
+            self.settings_tool.addItem(text, key)
+        self.settings_tool.setToolTip("只切換設定工具；即時畫面的辨識結果與安裝框保持一致")
+        self.settings_tool.currentIndexChanged.connect(
+            lambda _index: self._set_editor_mode(self.settings_tool.currentData()))
+        tool_row = QHBoxLayout()
+        tool_row.addWidget(QLabel("設定工具"))
+        tool_row.addWidget(self.settings_tool, 1)
+        center_layout.addLayout(tool_row)
 
         self.mode_hint = QLabel()
         self.mode_hint.setWordWrap(True)
@@ -401,10 +396,14 @@ class EditorPage(QWidget):
         self._set_editor_mode("steps" if visible else "overview")
 
     def _set_editor_mode(self, mode: str):
-        if mode not in self.mode_buttons:
+        if self.settings_tool.findData(mode) < 0:
             mode = "overview"
+        if mode not in ("follow", "positions") and (self.reference_button.isChecked() or self._capture_target):
+            self._return_live()
         self._editor_mode = mode
-        self.mode_buttons[mode].setChecked(True)
+        self.settings_tool.blockSignals(True)
+        self.settings_tool.setCurrentIndex(self.settings_tool.findData(mode))
+        self.settings_tool.blockSignals(False)
         config = {
             "overview": (True, False, False, None,
                          "先查看設定完成度；需要修改時，選擇一項功能。"),
@@ -483,6 +482,7 @@ class EditorPage(QWidget):
         self._locator = None
         self._reference_frame = None
         self._preview_result = None
+        self._last_transform = None
         self._packet = None
         self.freeze_check.setChecked(False)
         self.draw_button.setChecked(False)
@@ -519,8 +519,11 @@ class EditorPage(QWidget):
                 matrix, status = self._locator.locate(packet.frame)
                 self._preview_result = replace(packet.result, workpiece_transform=matrix, tracking_status=status)
                 self.tracking_label.setText(status)
-            clean_modes = {"overview", "follow", "positions", "cycle"}
-            self.video.set_frame(packet.frame if self._editor_mode in clean_modes else packet.display)
+            self.video.set_frame(packet.frame if self._capture_target else
+                                 draw_detections(packet.frame, packet.result.detections, packet.classes,
+                                                 packet.min_score, packet.show_masks, show_boxes=False),
+                                 () if self._capture_target else packet.result.detections,
+                                 packet.classes, packet.min_score)
             self._refresh_video_rois()
         self._update_live()
 
@@ -528,6 +531,7 @@ class EditorPage(QWidget):
         self._return_live()
         self._packet = None
         self._preview_result = None
+        self._last_transform = None
         if self._locator:
             self._locator.reset()
         self.video.clear_frame(text)
@@ -593,18 +597,20 @@ class EditorPage(QWidget):
         used = {c.roi for c in (step.conditions + step.forbidden) if c.roi} if step else set()
         if self._editor_mode == "cycle":
             used = {c.roi for c in self.sop.cycle.reset_conditions if c.roi}
+        stale = set()
         if self.reference_button.isChecked():
             rois = [r for r in self.sop.rois if r.anchor == "workpiece"]
         else:
             matrix = self._preview_result.workpiece_transform if self._preview_result else None
+            if matrix is not None:
+                self._last_transform = matrix.copy()
+            elif self.sop.workpiece is not None:
+                stale = {r.name for r in self.sop.rois if r.anchor == "workpiece"}
+                matrix = self._last_transform
+                if matrix is None:
+                    matrix = np.array([[1., 0., 0.], [0., 1., 0.]])
             rois = display_rois(self.sop.rois, matrix)
-        if self._editor_mode == "overview" and self._quick_phase != "verify":
-            rois = []
-        elif self._editor_mode in ("steps", "cycle"):
-            rois = [roi for roi in rois if roi.name in used]
-        elif self._editor_mode == "follow":
-            rois = []
-        self.video.set_rois(rois, used, selected)
+        self.video.set_rois(rois, (), selected, stale=stale)
         editable = [r.name for r in self.sop.rois
                     if (r.anchor == "workpiece" and self.reference_button.isChecked())
                     or (r.anchor == "fixed" and self.freeze_check.isChecked() and not self.reference_button.isChecked())]
@@ -994,6 +1000,7 @@ class EditorPage(QWidget):
             self.video.set_editable([])
             self._packet = None
             self._preview_result = None
+            self._last_transform = None
             self._capture_target = False
             self.draw_button.setChecked(False)
             self.video.set_draw_mode(False)
@@ -1105,6 +1112,7 @@ class EditorPage(QWidget):
         self._locator = None
         self._reference_frame = None
         self._preview_result = None
+        self._last_transform = None
         self.reference_button.setEnabled(False)
         self._set_quick_phase("")
         self._refresh_roi_list()
@@ -1149,6 +1157,7 @@ class EditorPage(QWidget):
         self.draw_button.setChecked(False)
         self.video.set_draw_mode(False)
         if enabled and self._reference_frame is not None:
+            self.video.set_banner("參考影像 · 編輯安裝位置，非即時畫面", "#546e7a")
             self.roi_status.setText("參考影像編輯中；返回即時後顯示各位置判定結果。")
             self.video.set_frame(self._reference_frame)
             self.freeze_check.setEnabled(False)
@@ -1157,12 +1166,16 @@ class EditorPage(QWidget):
             self.draw_button.setChecked(True)
             self.tracking_label.setText("參考影像：框選每道工序的作業區，再於工序條件的「區域」選取它")
         else:
+            self.video.set_banner("")
             self.freeze_check.setEnabled(True)
             self.freeze_check.setChecked(False)
             self.draw_button.setText("▭ 框選偵測區域")
             self.guide_label.setText("③ 即時測試：移動工件，確認作業區是否跟隨；再查看工序條件的「即時」結果。")
             if self._packet:
-                self.video.set_frame(self._packet.display)
+                self.video.set_frame(draw_detections(self._packet.frame, self._packet.result.detections,
+                                                     self._packet.classes, self._packet.min_score,
+                                                     self._packet.show_masks, show_boxes=False), self._packet.result.detections,
+                                     self._packet.classes, self._packet.min_score)
             else:
                 self.video.clear_frame("等待即時影像")
         self._refresh_video_rois()
