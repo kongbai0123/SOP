@@ -262,7 +262,7 @@ class VideoPipeline(QThread):
         result = FrameResult(frame.shape[1], frame.shape[0], timestamp, detections)
         result.detection_valid = self._detector is not None
         if self._locator is not None:
-            result.workpiece_transform, result.tracking_status = self._locator.locate(frame)
+            result.workpiece_transform, result.tracking_status = self._locator.locate(frame, timestamp)
         events = []
         if self._engine is not None:
             try:

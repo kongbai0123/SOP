@@ -193,7 +193,7 @@ class RunPage(QWidget):
             self._transform = packet.result.workpiece_transform
             status = packet.result.tracking_status
         elif self._preview_locator:
-            self._transform, status = self._preview_locator.locate(packet.frame)
+            self._transform, status = self._preview_locator.locate(packet.frame, packet.result.timestamp)
         else:
             self._transform = None
             status = self._locator_error or "尚未設定參考工件"

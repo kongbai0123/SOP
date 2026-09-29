@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import time
 import cv2
 import numpy as np
 
 from .sop_schema import ROI, Workpiece
+from .motion_filter import AdaptiveMotionFilter
 
 
 def decode_reference(workpiece: Workpiece) -> np.ndarray:
@@ -91,9 +93,12 @@ class WorkpieceLocator:
             raise ValueError("工件紋理與輪廓不足，請選擇含清楚圖案、孔位或文字的範圍")
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
         self._template_cache = {}
+        self._motion_filter = AdaptiveMotionFilter(self.corners, self.CORRECTION_RATIO)
         self.reset()
 
     def reset(self):
+        self._motion_filter.reset()
+        self._measurement_verified = False
         self._absolute_matrix = None
         self.last_deviation = 0.
         self.misses = 0
@@ -102,12 +107,14 @@ class WorkpieceLocator:
         self._flow_dst = None
         self._flow_age = 0
 
-    def locate(self, frame: np.ndarray):
+    def locate(self, frame: np.ndarray, timestamp: float | None = None):
+        timestamp = time.monotonic() if timestamp is None else timestamp
         try:
             matrix, count = self._estimate(frame)
         except cv2.error:
             matrix, count = None, 0
         if matrix is None:
+            self._motion_filter.reset()
             self.misses += 1
             # 失效時保留短期追蹤上下文；恢復有效量測的當幀即輸出。
             # 失效幀仍回傳 None，判定引擎不會拿舊位置通過條件。
@@ -116,6 +123,9 @@ class WorkpieceLocator:
                 return None, "位置跟隨已中斷，正在重新定位"
             return None, f"位置跟隨短暫不穩（{self.misses}/3）"
         self.misses = 0
+        quality_weight = min(1., count / 30) if count > 0 else abs(count) / 100
+        matrix = self._motion_filter.update(matrix, timestamp, frame.shape[1], frame.shape[0],
+                                             quality_weight, self._measurement_verified)
         quality = f"輪廓 {abs(count)}%" if count < 0 else f"{count} 個特徵"
         return matrix.copy(), f"位置跟隨穩定（{quality}）"
 
@@ -126,6 +136,7 @@ class WorkpieceLocator:
         return float(np.max(np.linalg.norm(after - before, axis=1)) / max(diagonal, 1.))
 
     def _estimate(self, frame):
+        self._measurement_verified = False
         height, width = frame.shape[:2]
         factor = min(1.0, 1280 / max(height, width))
         small = cv2.resize(frame, (round(width * factor), round(height * factor))) if factor < 1 else frame
@@ -142,12 +153,12 @@ class WorkpieceLocator:
         for estimate in (self._estimate_features, self._estimate_sift, self._estimate_template):
             matrix, count = estimate(gray)
             if matrix is not None:
+                self._measurement_verified = True
                 self._absolute_matrix = matrix.copy()
                 if flowed[0] is not None:
                     self.last_deviation = self._deviation_ratio(flowed[0], matrix, w, h)
-                    if self.last_deviation <= self.CORRECTION_RATIO:
-                        # 小差異僅做輕量平滑；光流內部基準已由本次絕對定位更新。
-                        matrix = flowed[0] * .8 + matrix * .2
+                    if self.last_deviation > self.CORRECTION_RATIO:
+                        self._motion_filter.reset()
                 return matrix, count
         if flowed[0] is not None:
             return flowed

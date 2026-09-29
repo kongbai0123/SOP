@@ -158,7 +158,7 @@ class TrackingTests(unittest.TestCase):
             with patch.object(locator, '_estimate_flow', return_value=(IDENTITY.copy(), 30)), \
                  patch.object(locator, '_estimate_features', return_value=(verified, 30)):
                 matrix, _ = locator._estimate(scene())
-            expected = verified if ratio > .02 else IDENTITY * .8 + verified * .2
+            expected = verified
             np.testing.assert_allclose(matrix, expected)
 
     def test_first_frame_and_recovery_have_no_confirmation_delay(self):
