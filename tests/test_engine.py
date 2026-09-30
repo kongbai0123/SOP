@@ -17,7 +17,7 @@ from sop_app.conditions import evaluate_condition  # noqa: E402
 from sop_app.detection import Detection, FrameResult  # noqa: E402
 from sop_app.engine import Phase, SOPEngine, StepStatus  # noqa: E402
 from sop_app.sop_schema import (ROI, Condition, CycleSettings, SOPDefinition, Step,  # noqa: E402
-                                load_sop, save_sop)
+                                Workpiece, load_sop, save_sop)
 
 W, H, FPS = 200, 100, 10
 
@@ -52,6 +52,63 @@ def make_sop(*steps, **cycle):
 
 
 class EngineTests(unittest.TestCase):
+    def _position_engine(self):
+        roi = ROI("安裝位置", [(0, 0), (.8, 0), (.8, .8), (0, .8)], "workpiece")
+        workpiece = Workpiece(points=[(.1, .1), (.9, .1), (.9, .9), (.1, .9)])
+        sop = SOPDefinition(rois=[roi], workpiece=workpiece,
+                            steps=[Step("安裝", conditions=[appear("a", roi=roi.name)], hold_sec=1.)])
+        engine = SOPEngine(sop)
+        engine.start(0.)
+        return engine
+
+    @staticmethod
+    def _position_frame(at, *, visible=True, offset=0., detected=True):
+        pose = np.array([[1., 0., offset], [0., 1., 0.]]) if visible else None
+        detections = [det("a")] if detected else []
+        return FrameResult(W, H, at, detections, pose)
+
+    def test_short_position_loss_pauses_without_completing_during_loss(self):
+        engine = self._position_engine()
+        for at in (0., .3, .6):
+            engine.update(self._position_frame(at))
+        progress = None
+        for at in (.7, .9):
+            events = engine.update(self._position_frame(at, visible=False))
+            self.assertNotIn("step_completed", kinds(events))
+            if progress is None:
+                progress = engine.snapshot().progress
+            self.assertAlmostEqual(engine.snapshot().progress, progress)
+        self.assertNotIn("step_completed", kinds(engine.update(self._position_frame(1.))))
+        self.assertIn("step_completed", kinds(engine.update(self._position_frame(1.31))))
+
+    def test_long_position_loss_resets_hold(self):
+        engine = self._position_engine()
+        for at in (0., .3, .6):
+            engine.update(self._position_frame(at))
+        engine.update(self._position_frame(.7, visible=False))
+        engine.update(self._position_frame(1.2, visible=False))
+        self.assertEqual(engine.snapshot().progress, 0.)
+        self.assertNotIn("step_completed", kinds(engine.update(self._position_frame(1.3))))
+        self.assertNotIn("step_completed", kinds(engine.update(self._position_frame(2.2))))
+        self.assertIn("step_completed", kinds(engine.update(self._position_frame(2.31))))
+
+    def test_recovery_at_different_position_resets_hold(self):
+        engine = self._position_engine()
+        for at in (0., .3, .6):
+            engine.update(self._position_frame(at))
+        engine.update(self._position_frame(.7, visible=False))
+        self.assertNotIn("step_completed", kinds(engine.update(self._position_frame(.9, offset=.1))))
+        self.assertNotIn("step_completed", kinds(engine.update(self._position_frame(1.8, offset=.1))))
+        self.assertIn("step_completed", kinds(engine.update(self._position_frame(1.91, offset=.1))))
+
+    def test_recovery_requires_current_detection(self):
+        engine = self._position_engine()
+        for at in (0., .3, .6):
+            engine.update(self._position_frame(at))
+        engine.update(self._position_frame(.7, visible=False))
+        self.assertNotIn("step_completed", kinds(engine.update(self._position_frame(.9, detected=False))))
+        self.assertNotIn("step_completed", kinds(engine.update(self._position_frame(1.2, detected=False))))
+
     def test_step_completes_after_hold(self):
         engine = SOPEngine(make_sop(Step("A", conditions=[appear("a")], hold_sec=1.0)))
         engine.start(0.0)

@@ -9,6 +9,8 @@ import copy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
+import numpy as np
+
 from .conditions import ConditionResult, evaluate_conditions
 from .detection import FrameResult
 from .sop_schema import SOPDefinition
@@ -60,6 +62,11 @@ class SlidingWindow:
         while len(self._samples) > 1 and self._samples[0][0] < cutoff:
             self._samples.popleft()
 
+    def resume(self, elapsed: float):
+        """Exclude a brief unobservable interval from the hold window."""
+        self._started += elapsed
+        self._samples = deque((at + elapsed, value) for at, value in self._samples)
+
     def _true_ratio(self) -> float:
         return sum(v for _, v in self._samples) / len(self._samples) if self._samples else 0.0
 
@@ -108,6 +115,9 @@ class EngineSnapshot:
 
 
 class SOPEngine:
+    POSITION_GRACE_SEC = 0.4
+    POSITION_RECOVERY_MAX_SHIFT = 0.05  # fraction of workpiece diagonal
+
     def __init__(self, sop: SOPDefinition):
         self.sop = copy.deepcopy(sop)
         self.rois = self.sop.roi_map()
@@ -126,6 +136,26 @@ class SOPEngine:
         self._position_blocked = False
         self._completion_invalid = False
         self._forbidden_invalid = False
+        self._position_pause_at: float | None = None
+        self._last_valid_pose: np.ndarray | None = None
+        self._last_valid_size: tuple[int, int] | None = None
+
+    def _pose_corners(self, frame: FrameResult) -> np.ndarray | None:
+        if frame.workpiece_transform is None or self.sop.workpiece is None:
+            return None
+        corners = np.asarray(self.sop.workpiece.points, dtype=float)
+        if corners.shape != (4, 2):
+            return None
+        mapped = (corners @ frame.workpiece_transform[:, :2].T +
+                  frame.workpiece_transform[:, 2]) * [frame.width, frame.height]
+        return mapped if np.isfinite(mapped).all() else None
+
+    def _same_position(self, pose: np.ndarray, frame: FrameResult) -> bool:
+        if self._last_valid_pose is None or self._last_valid_size != (frame.width, frame.height):
+            return False
+        diagonal = max(float(np.linalg.norm(np.ptp(self._last_valid_pose, axis=0))), 1.)
+        shift = float(np.max(np.linalg.norm(pose - self._last_valid_pose, axis=1)))
+        return shift / diagonal <= self.POSITION_RECOVERY_MAX_SHIFT
 
     # ---- 控制指令 -------------------------------------------------------------
     def start(self, now: float) -> list[EngineEvent]:
@@ -163,10 +193,32 @@ class SOPEngine:
             step, runtime = self.sop.steps[self.index], self.runtimes[self.index]
             met, self._results = evaluate_conditions(step.conditions, frame, self.rois, step.completion_mode)
             invalid = any(r.error for r in self._results)
-            if invalid or self._completion_invalid:
+            position_missing = (invalid and frame.detection_valid and frame.workpiece_transform is None and
+                                any(self.rois.get(c.roi) is not None and
+                                    self.rois[c.roi].anchor == "workpiece" for c in step.conditions))
+            pose = self._pose_corners(frame) if not invalid else None
+            if position_missing and self._last_valid_pose is not None:
+                if self._position_pause_at is None:
+                    self._position_pause_at = now
+                if now - self._position_pause_at > self.POSITION_GRACE_SEC:
+                    self._window.reset(now)
+                    self._last_valid_pose = None
+            elif self._position_pause_at is not None:
+                pause = now - self._position_pause_at
+                if (not invalid and pose is not None and pause <= self.POSITION_GRACE_SEC and
+                        self._same_position(pose, frame)):
+                    self._window.resume(pause)
+                else:
+                    self._window.reset(now)
+                self._position_pause_at = None
+            elif invalid or self._completion_invalid:
                 self._window.reset(now)
             self._completion_invalid = invalid
-            self._window.push(now, met)
+            if not position_missing:
+                self._window.push(now, met)
+            if not invalid and pose is not None:
+                self._last_valid_pose = pose.copy()
+                self._last_valid_size = (frame.width, frame.height)
 
             if step.forbidden:
                 forbidden_met, self._forbidden_results = evaluate_conditions(step.forbidden, frame, self.rois)
@@ -187,7 +239,7 @@ class SOPEngine:
                 self._position_blocked = blocked
                 events.append(self._event("position_lost" if blocked else "position_recovered", now,
                                           "作業位置或辨識無法確認，相關條件停止累積" if blocked
-                                          else "作業位置與辨識恢復，重新累積條件"))
+                                          else "作業位置與辨識恢復，重新檢查條件"))
 
             if step.timeout_sec > 0 and not runtime.timeout_alarmed and now - runtime.started_at >= step.timeout_sec:
                 runtime.timeout_alarmed = True
@@ -195,7 +247,7 @@ class SOPEngine:
                 events.append(self._event("alarm", now, f"超時：「{step.name}」超過 {step.timeout_sec:g} 秒未完成",
                                           alarm="timeout"))
 
-            if step.conditions and self._window.satisfied(now):
+            if step.conditions and not invalid and self._window.satisfied(now):
                 events += self._finish_step(now, StepStatus.DONE)
 
         elif self.phase == Phase.CYCLE_DONE:
@@ -220,7 +272,8 @@ class SOPEngine:
             cycle_ok=self.cycle_ok, cycle_started_at=self.cycle_started_at, cycle_ended_at=self.cycle_ended_at,
             steps=[replace(r) for r in self.runtimes], results=list(self._results),
             forbidden_results=list(self._forbidden_results),
-            progress=self._window.progress(self._now) if self.phase != Phase.IDLE else 0.0,
+            progress=self._window.progress(self._position_pause_at if self._position_pause_at is not None
+                                           else self._now) if self.phase != Phase.IDLE else 0.0,
         )
 
     # ---- 內部 -----------------------------------------------------------------
@@ -231,6 +284,9 @@ class SOPEngine:
 
     def _begin_cycle(self, now: float) -> list[EngineEvent]:
         self._position_blocked = False
+        self._position_pause_at = None
+        self._last_valid_pose = None
+        self._last_valid_size = None
         self.cycle += 1
         self.phase = Phase.RUNNING
         self.index = 0
@@ -241,6 +297,9 @@ class SOPEngine:
 
     def _activate(self, index: int, now: float) -> list[EngineEvent]:
         self._completion_invalid = self._forbidden_invalid = False
+        self._position_pause_at = None
+        self._last_valid_pose = None
+        self._last_valid_size = None
         step = self.sop.steps[index]
         self.index = index
         self.runtimes[index].status = StepStatus.ACTIVE
