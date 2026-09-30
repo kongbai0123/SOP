@@ -271,7 +271,8 @@ class VideoPipeline(QThread):
         result.detection_valid = self._detector is not None
         if self._locator is not None:
             tracking_load = max(inference_ms, (time.monotonic() - timestamp) * 1000) if isinstance(self._source, CameraSource) else inference_ms
-            result.workpiece_transform, result.tracking_status = self._locator.locate(frame, timestamp, other_ms=tracking_load)
+            result.workpiece_transform, result.tracking_status = self._locator.locate(
+                frame, timestamp, other_ms=tracking_load, detections=detections)
             result.tracking_metrics = self._locator.metrics.copy()
         events = []
         if self._engine is not None:

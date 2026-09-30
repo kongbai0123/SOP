@@ -516,7 +516,9 @@ class EditorPage(QWidget):
             self._packet = packet
             self._preview_result = replace(packet.result, workpiece_transform=None)
             if self._locator:
-                matrix, status = self._locator.locate(packet.frame, packet.result.timestamp, other_ms=packet.tracking_load_ms)
+                matrix, status = self._locator.locate(
+                    packet.frame, packet.result.timestamp, other_ms=packet.tracking_load_ms,
+                    detections=packet.result.detections)
                 self._preview_result = replace(packet.result, workpiece_transform=matrix, tracking_status=status)
                 self.tracking_label.setText(status if matrix is not None else "")
                 self.tracking_label.setToolTip(status)

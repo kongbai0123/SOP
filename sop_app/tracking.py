@@ -110,15 +110,16 @@ class WorkpieceLocator:
         self._flow_src = None
         self._flow_dst = None
         self._flow_age = 0
+        self._last_local_search = getattr(self, '_last_local_search', 0.)
 
-    def locate(self, frame: np.ndarray, timestamp: float | None = None, *, other_ms=0.):
+    def locate(self, frame: np.ndarray, timestamp: float | None = None, *, other_ms=0., detections=()):
         started = time.perf_counter()
         self._started = started
         self._other_ms = max(0., other_ms)
-        self.metrics = {"stages_ms": {}, "skipped": [], "outcomes": {}}
+        self.metrics = {"stages_ms": {}, "skipped": [], "outcomes": {}, "diagnostics": {}}
         timestamp = time.monotonic() if timestamp is None else timestamp
         try:
-            matrix, count = self._estimate(frame)
+            matrix, count = self._estimate(frame, detections)
         except cv2.error:
             matrix, count = None, 0
             self.metrics["error"] = "opencv"
@@ -150,37 +151,83 @@ class WorkpieceLocator:
         diagonal = np.linalg.norm(np.ptp(before, axis=0))
         return float(np.max(np.linalg.norm(after - before, axis=1)) / max(diagonal, 1.))
 
-    def _estimate(self, frame):
+    def _diagnose(self, stage, reason, **values):
+        self.metrics.setdefault("diagnostics", {})[stage] = {"reason": reason, **values}
+
+    @staticmethod
+    def _detected_search_box(detections, width, height, factor):
+        candidates = [d for d in detections if d.label == "handlebar" and d.score >= .5]
+        if not candidates:
+            return None
+        chosen = max(candidates, key=lambda d: d.score)
+        x1, y1, x2, y2 = [float(v) for v in chosen.box]
+        pad = max(x2 - x1, y2 - y1) * .15
+        box = (max(0, int((x1 - pad) * factor)), max(0, int((y1 - pad) * factor)),
+               min(width, int(np.ceil((x2 + pad) * factor))),
+               min(height, int(np.ceil((y2 + pad) * factor))))
+        return box if box[2] - box[0] >= 30 and box[3] - box[1] >= 30 else None
+
+    def _candidate_in_box(self, matrix, box, width, height):
+        corners = (self.corners @ matrix[:, :2].T + matrix[:, 2]) * [width, height]
+        x1, y1 = np.min(corners, axis=0)
+        x2, y2 = np.max(corners, axis=0)
+        area = max(0., (x2 - x1) * (y2 - y1))
+        intersection = max(0., min(x2, box[2]) - max(x1, box[0])) * max(
+            0., min(y2, box[3]) - max(y1, box[1]))
+        return bool(area > 0 and intersection / area >= .7)
+
+    def _estimate(self, frame, detections=()):
         self._measurement_verified = False
         height, width = frame.shape[:2]
         factor = min(1.0, 1280 / max(height, width))
         small = cv2.resize(frame, (round(width * factor), round(height * factor))) if factor < 1 else frame
         h, w = small.shape[:2]
         gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        search_box = self._detected_search_box(detections, w, h, factor)
+        self.metrics["detector_guided"] = search_box is not None
         # 光流每幀更新；定期做絕對核對，2% 比較的是同一幀兩個估計的偏差。
         flowed = (None, 0)
         if self._flow_gray is not None and self._flow_age < self.MAX_FLOW_FRAMES:
             flow_started = time.perf_counter()
             flowed = self._estimate_flow(gray)
             self.metrics.setdefault("stages_ms", {})["flow"] = (time.perf_counter() - flow_started) * 1000
+            self.metrics.setdefault("outcomes", {})["flow"] = "accepted" if flowed[0] is not None else "no_valid_match"
         if flowed[0] is not None:
             age = self._flow_age
             if age < self.MAX_RECHECK_FRAMES or age % self.MIN_RECHECK_FRAMES:
+                self.metrics["source"] = "flow"
                 return flowed
-        for stage, estimate in (("orb", self._estimate_features), ("sift", self._estimate_sift),
-                                ("template", self._estimate_template)):
+        stages = [("orb", lambda: self._estimate_features(gray)),
+                  ("sift", lambda: self._estimate_sift(gray)),
+                  ("template", lambda: self._estimate_template(gray))]
+        if search_box is not None:
+            stages.extend((("local_orb", lambda: self._estimate_features(gray, search_box)),
+                           ("local_sift", lambda: self._estimate_sift(gray, search_box))))
+        local_allowed = not self._last_local_search or time.perf_counter() - self._last_local_search >= .5
+        for stage, estimate in stages:
             now = time.perf_counter()
+            # Preserve the original full-frame result. A detected crop is a
+            # bounded extra recovery attempt only when all original methods
+            # failed, so detector jitter cannot replace a verified pose.
+            if stage.startswith("local_") and not local_allowed:
+                self.metrics.setdefault("skipped", []).append(stage)
+                self._diagnose(stage, "local_retry_interval")
+                continue
             spent = (now - getattr(self, '_started', now)) * 1000 + self._other_ms
             if self.budget and stage != "orb" and not self.budget.allow(stage, now, spent):
                 self.metrics.setdefault("skipped", []).append(stage)
+                self._diagnose(stage, "compute_budget_deferred")
                 continue
-            matrix, count = estimate(gray)
+            if stage.startswith("local_"):
+                self._last_local_search = now
+            matrix, count = estimate()
             cost = (time.perf_counter() - now) * 1000
             self.metrics.setdefault("stages_ms", {})[stage] = cost
             self.metrics.setdefault("outcomes", {})[stage] = "accepted" if matrix is not None else "no_valid_match"
             if self.budget:
                 self.budget.record(stage, now, cost)
             if matrix is not None:
+                self.metrics["source"] = stage
                 self._measurement_verified = True
                 self._absolute_matrix = matrix.copy()
                 if flowed[0] is not None:
@@ -189,15 +236,32 @@ class WorkpieceLocator:
                         self._motion_filter.reset()
                 return matrix, count
         if flowed[0] is not None:
+            self.metrics["source"] = "flow"
             return flowed
+        self.metrics["source"] = "none"
         return None, 0
 
-    def _estimate_features(self, gray):
+    @staticmethod
+    def _keypoints_in_box(detector, gray, box):
+        if box is None:
+            return detector.detectAndCompute(gray, None)
+        x1, y1, x2, y2 = box
+        points, descriptors = detector.detectAndCompute(gray[y1:y2, x1:x2], None)
+        if points is None:
+            points = []
+        for point in points:
+            point.pt = (point.pt[0] + x1, point.pt[1] + y1)
+        return points, descriptors
+
+    def _estimate_features(self, gray, box=None):
+        stage = "local_orb" if box is not None else "orb"
         if self.descriptors is None or len(self.reference_points) < 8:
+            self._diagnose(stage, "reference_features_insufficient", reference_count=len(self.reference_points))
             return None, 0
         h, w = gray.shape
-        keypoints, descriptors = self.orb.detectAndCompute(gray, None)
+        keypoints, descriptors = self._keypoints_in_box(self.orb, gray, box)
         if descriptors is None or len(descriptors) < 2:
+            self._diagnose(stage, "frame_features_insufficient", frame_count=len(keypoints))
             return None, 0
         pairs = self.matcher.knnMatch(self.descriptors, descriptors, k=2)
         matches = [a for pair in pairs if len(pair) == 2 for a, b in [pair]
@@ -205,33 +269,46 @@ class WorkpieceLocator:
         # 一個當前特徵只允許對應一個參考特徵
         matches = list({m.trainIdx: m for m in sorted(matches, key=lambda m: -m.distance)}.values())
         if len(matches) < 8:
+            self._diagnose(stage, "matches_insufficient", matches=len(matches))
             return None, 0
         src = np.float32([self.reference_points[m.queryIdx] for m in matches])
         dst = np.float32([keypoints[m.trainIdx].pt for m in matches])
         affine, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC,
                                                      ransacReprojThreshold=3.0)
         if affine is None or inliers is None:
+            self._diagnose(stage, "affine_failed", matches=len(matches))
             return None, 0
         keep = inliers.ravel().astype(bool)
         count = int(keep.sum())
+        spread = np.ptp(src[keep], axis=0).tolist() if count else [0., 0.]
         if count < 8 or count / len(matches) < 0.6 or (np.ptp(src[keep], axis=0) < self.span * 0.15).any():
+            self._diagnose(stage, "geometry_rejected", matches=len(matches), inliers=count,
+                           inlier_ratio=round(count / len(matches), 3), spread=spread)
             return None, 0
         scale = np.linalg.norm(affine[:, 0])
         if not 0.3 <= scale <= 3.0:
+            self._diagnose(stage, "scale_rejected", scale=round(float(scale), 3))
             return None, 0
+        self._diagnose(stage, "accepted", matches=len(matches), inliers=count, spread=spread)
         rw, rh = self.reference_size
         normalized = np.diag([1 / w, 1 / h]) @ affine @ np.diag([rw, rh, 1])
+        if box is not None and not self._candidate_in_box(normalized, box, w, h):
+            self._diagnose(stage, "outside_detection_box", matches=len(matches), inliers=count)
+            return None, 0
         self._flow_gray = gray.copy()
         self._flow_src = src[keep].copy()
         self._flow_dst = dst[keep].copy()
         self._flow_age = 0
         return normalized, count
 
-    def _estimate_sift(self, gray):
+    def _estimate_sift(self, gray, box=None):
+        stage = "local_sift" if box is not None else "sift"
         if self._sift_descriptors is None or len(self._sift_points) < 12:
+            self._diagnose(stage, "reference_features_insufficient", reference_count=len(self._sift_points))
             return None, 0
-        keypoints, descriptors = self.sift.detectAndCompute(gray, None)
+        keypoints, descriptors = self._keypoints_in_box(self.sift, gray, box)
         if descriptors is None or len(keypoints) < 12:
+            self._diagnose(stage, "frame_features_insufficient", frame_count=len(keypoints))
             return None, 0
         matcher = cv2.BFMatcher(cv2.NORM_L2)
         reverse = {m.queryIdx: m.trainIdx for m in matcher.match(descriptors, self._sift_descriptors)}
@@ -239,39 +316,54 @@ class WorkpieceLocator:
                    if len(pair) == 2 for a, b in [pair]
                    if a.distance < .7 * b.distance and reverse.get(a.trainIdx) == a.queryIdx]
         if len(matches) < 12:
+            self._diagnose(stage, "matches_insufficient", matches=len(matches))
             return None, 0
         src = np.float32([self._sift_points[m.queryIdx] for m in matches])
         dst = np.float32([keypoints[m.trainIdx].pt for m in matches])
         affine, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC,
                                                      ransacReprojThreshold=3., maxIters=3000)
         if affine is None or inliers is None:
+            self._diagnose(stage, "affine_failed", matches=len(matches))
             return None, 0
         keep = inliers.ravel().astype(bool)
         count = int(keep.sum())
+        spread = np.ptp(src[keep], axis=0).tolist() if count else [0., 0.]
         # 雙向唯一配對、分散的內點與幾何誤差一起驗證，不以少數相似孔位通過。
         if count < 12 or keep.mean() < .35 or (np.ptp(src[keep], axis=0) < self.span * .25).any():
+            self._diagnose(stage, "geometry_rejected", matches=len(matches), inliers=count,
+                           inlier_ratio=round(float(keep.mean()), 3), spread=spread)
             return None, 0
         residual = np.linalg.norm(src[keep] @ affine[:, :2].T + affine[:, 2] - dst[keep], axis=1)
         if np.median(residual) > 1.5 or not .3 <= np.linalg.norm(affine[:, 0]) <= 3:
+            self._diagnose(stage, "residual_or_scale_rejected", median_residual=round(float(np.median(residual)), 3))
             return None, 0
+        self._diagnose(stage, "accepted", matches=len(matches), inliers=count, spread=spread,
+                       median_residual=round(float(np.median(residual)), 3))
         rw, rh = self.reference_size
         h, w = gray.shape
+        normalized = np.diag([1/w, 1/h]) @ affine @ np.diag([rw, rh, 1])
+        if box is not None and not self._candidate_in_box(normalized, box, w, h):
+            self._diagnose(stage, "outside_detection_box", matches=len(matches), inliers=count)
+            return None, 0
         self._flow_gray = gray.copy()
         self._flow_src, self._flow_dst = src[keep].copy(), dst[keep].copy()
         self._flow_age = 0
-        return np.diag([1/w, 1/h]) @ affine @ np.diag([rw, rh, 1]), count
+        return normalized, count
 
     def _estimate_flow(self, gray):
         if gray.shape != self._flow_gray.shape or len(self._flow_dst) < 10:
+            self._diagnose("flow", "seed_or_resolution_invalid", seed_count=len(self._flow_dst))
             return None, 0
         old = self._flow_dst.reshape(-1, 1, 2)
         options = dict(winSize=(21,21), maxLevel=3,
                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, .01))
         new, forward, error = cv2.calcOpticalFlowPyrLK(self._flow_gray, gray, old, None, **options)
         if new is None or forward is None:
+            self._diagnose("flow", "forward_failed")
             return None, 0
         back, backward, _ = cv2.calcOpticalFlowPyrLK(gray, self._flow_gray, new, None, **options)
         if back is None or backward is None:
+            self._diagnose("flow", "backward_failed")
             return None, 0
         h, w = gray.shape
         dst = new.reshape(-1,2)
@@ -281,15 +373,22 @@ class WorkpieceLocator:
         keep &= np.isfinite(dst).all(axis=1) & (dst >= 0).all(axis=1) & (dst < [w,h]).all(axis=1)
         src, dst = self._flow_src[keep], dst[keep]
         if len(src) < 10:
+            self._diagnose("flow", "points_insufficient", valid_points=len(src), seed_count=len(old))
             return None, 0
         affine, inliers = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC, ransacReprojThreshold=2.0)
         if affine is None or inliers is None:
+            self._diagnose("flow", "affine_failed", valid_points=len(src))
             return None, 0
         good = inliers.ravel().astype(bool)
         if good.sum() < 10 or good.mean() < .7 or (np.ptp(src[good], axis=0) < self.span * .2).any():
+            self._diagnose("flow", "geometry_rejected", valid_points=len(src), inliers=int(good.sum()),
+                           inlier_ratio=round(float(good.mean()), 3),
+                           spread=np.ptp(src[good], axis=0).tolist() if good.any() else [0., 0.])
             return None, 0
         if not .3 <= np.linalg.norm(affine[:,0]) <= 3:
+            self._diagnose("flow", "scale_rejected", valid_points=len(src), inliers=int(good.sum()))
             return None, 0
+        self._diagnose("flow", "accepted", valid_points=len(src), inliers=int(good.sum()))
         rw, rh = self.reference_size
         matrix = np.diag([1/w, 1/h]) @ affine @ np.diag([rw,rh,1])
         self._flow_gray = gray.copy()
@@ -300,6 +399,7 @@ class WorkpieceLocator:
     def _estimate_template(self, gray):
         template = self._template_edges
         if template.size == 0 or np.count_nonzero(template) < 30:
+            self._diagnose("template", "reference_edges_insufficient")
             return None, 0
         full_gray = gray
         factor = min(1., 640 / max(gray.shape))
@@ -307,6 +407,7 @@ class WorkpieceLocator:
             gray = cv2.resize(gray, (round(gray.shape[1] * factor), round(gray.shape[0] * factor)))
         current_edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 40, 120)
         if np.count_nonzero(current_edges) < 30:
+            self._diagnose("template", "frame_edges_insufficient")
             return None, 0
         rw, rh = self.reference_size
         sx, sy = gray.shape[1] / rw, gray.shape[0] / rh
@@ -339,8 +440,10 @@ class WorkpieceLocator:
             if best is not None and best[0] >= 0.58:
                 break
         if best is None or best[0] < 0.58:
+            self._diagnose("template", "score_below_threshold", best_score=round(best[0], 3) if best else None)
             return None, 0
         score, local, location = best
+        self._diagnose("template", "accepted", best_score=round(score, 3))
         affine = local.copy()
         affine[:, 2] += np.asarray(location) - affine[:, :2] @ self._template_origin
         affine = np.diag([full_gray.shape[1] / gray.shape[1], full_gray.shape[0] / gray.shape[0]]) @ affine
