@@ -1,12 +1,107 @@
 import io
 import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from sop_app.startup import StartupProgress, read_progress_messages
+from sop_app.startup import (StartupProgress, initial_model_path, initial_sop_path,
+                             read_progress_messages)
+
+
+class InitialModelPathTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.sops = self.root / "sops"
+        self.sops.mkdir()
+        self.settings = self.root / "app_settings.json"
+        self.example = self.sops / "example_sop.json"
+        self.model = self.root / "model.zip"
+        self.model.touch()
+        self.addCleanup(patch.stopall)
+        patch.multiple("sop_app.startup", APP_SETTINGS=self.settings, SOPS_DIR=self.sops).start()
+        patch("sop_app.startup.resolve", side_effect=self.resolve).start()
+
+    def resolve(self, value):
+        path = Path(value)
+        return path if path.is_absolute() else self.root / path
+
+    @staticmethod
+    def write_json(path, value):
+        path.write_text(json.dumps(value), encoding="utf-8")
+
+    def test_last_sop_and_relative_model_resolve_from_project_root(self):
+        saved = self.sops / "saved.json"
+        self.write_json(self.settings, {"last_sop": "sops/saved.json"})
+        self.write_json(saved, {"model_path": "model.zip"})
+        self.assertEqual(initial_sop_path({"last_sop": "sops/saved.json"}), saved)
+        self.assertEqual(initial_model_path(), self.model)
+
+    def test_absolute_sop_and_model_paths_are_preserved(self):
+        saved = self.root / "saved.json"
+        self.write_json(self.settings, {"last_sop": str(saved)})
+        self.write_json(saved, {"model_path": str(self.model)})
+        self.assertEqual(initial_model_path(), self.model)
+
+    def test_missing_last_sop_uses_example(self):
+        self.write_json(self.settings, {"last_sop": "missing.json"})
+        self.write_json(self.example, {"model_path": "model.zip"})
+        self.assertEqual(initial_sop_path({"last_sop": "missing.json"}), self.example)
+        self.assertEqual(initial_model_path(), self.model)
+
+    def test_existing_malformed_last_sop_does_not_preload_example(self):
+        saved = self.sops / "saved.json"
+        self.write_json(self.settings, {"last_sop": str(saved)})
+        saved.write_text("invalid JSON", encoding="utf-8")
+        self.write_json(self.example, {"model_path": "model.zip"})
+        self.assertEqual(initial_sop_path({"last_sop": str(saved)}), saved)
+        self.assertIsNone(initial_model_path())
+
+    def test_missing_or_malformed_settings_use_example(self):
+        self.write_json(self.example, {"model_path": "model.zip"})
+        self.assertEqual(initial_model_path(), self.model)
+        self.settings.write_text("invalid JSON", encoding="utf-8")
+        self.assertEqual(initial_model_path(), self.model)
+
+    def test_settings_with_invalid_types_use_example(self):
+        self.write_json(self.example, {"model_path": "model.zip"})
+        for value in ([], None, 1, {"last_sop": ["saved.json"]}, {"last_sop": 1}):
+            with self.subTest(value=value):
+                self.write_json(self.settings, value)
+                self.assertEqual(initial_model_path(), self.model)
+
+    def test_invalid_sop_or_model_types_do_not_preload(self):
+        for value in ([], None, 1, {}, {"model_path": None}, {"model_path": 1},
+                      {"model_path": ["model.zip"]}, {"model_path": ""},
+                      {"model_path": "\u0000"}):
+            with self.subTest(value=value):
+                self.write_json(self.example, value)
+                self.assertIsNone(initial_model_path())
+
+    def test_missing_model_or_sop_does_not_preload(self):
+        self.assertIsNone(initial_sop_path({}))
+        self.assertIsNone(initial_model_path())
+        self.write_json(self.example, {"model_path": "missing.zip"})
+        self.assertIsNone(initial_model_path())
+
+    def test_directory_models_can_preload(self):
+        model_dir = self.root / "model"
+        model_dir.mkdir()
+        self.write_json(self.example, {"model_path": "model"})
+        self.assertEqual(initial_model_path(), model_dir)
+
+    def test_import_keeps_torch_and_qt_out_of_ui_parent(self):
+        script = ("import sys; import sop_app.startup; "
+                  "assert not any(name == 'torch' or name.startswith('torch.') "
+                  "or name == 'PySide6' or name.startswith('PySide6.') "
+                  "for name in sys.modules)")
+        subprocess.run([sys.executable, "-c", script], check=True, timeout=10,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 class StartupProgressTests(unittest.TestCase):

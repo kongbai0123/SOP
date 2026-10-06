@@ -15,6 +15,7 @@ from ..model_bundle import ModelBundleError, ModelInfo, read_model_info
 from ..paths import APP_SETTINGS, PROJECT_ROOT, RECORDS_DIR, SOPS_DIR, resolve
 from ..pipeline import FramePacket, VideoPipeline
 from ..sop_schema import SOPDefinition, Step, load_sop, save_sop
+from ..startup import initial_sop_path
 from .editor_page import EditorPage
 from .records_page import RecordsPage
 from .run_page import RunPage
@@ -24,7 +25,7 @@ VIDEO_FILTER = "影片 (*.mp4 *.avi *.mov *.mkv *.wmv);;所有檔案 (*)"
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, defer_initial_sop=False):
+    def __init__(self, defer_initial_sop=False, inference_worker=None):
         super().__init__()
         self.settings = self._load_settings()
         self.sop_path: Path | None = None
@@ -37,7 +38,7 @@ class MainWindow(QMainWindow):
         self._model_stage = ""
         self.resize(1500, 900)
 
-        self.pipeline = VideoPipeline(RECORDS_DIR, self)
+        self.pipeline = VideoPipeline(RECORDS_DIR, self, inference_worker=inference_worker)
         self.pipeline.packet_ready.connect(self._on_packet)
         self.pipeline.events_ready.connect(self._on_events)
         self.pipeline.model_loaded.connect(self._on_model_loaded)
@@ -269,12 +270,9 @@ class MainWindow(QMainWindow):
 
     # ---- SOP 檔案 --------------------------------------------------------------
     def _open_initial_sop(self):
-        last = self.settings.get("last_sop")
-        if last and resolve(last).exists():
-            return self._open_path(resolve(last))
-        example = SOPS_DIR / "example_sop.json"
-        if example.exists():
-            return self._open_path(example)
+        path = initial_sop_path(self.settings)
+        if path is not None:
+            return self._open_path(path)
         self._apply_sop(SOPDefinition(steps=[Step("工序 1")]), None)
 
     def _open_path(self, path: Path):
@@ -394,5 +392,8 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             event.ignore()
             return
-        self.pipeline.shutdown()
+        if not self.pipeline.shutdown():
+            self.statusBar().showMessage("影像來源正在關閉，請稍候再關閉視窗", 6000)
+            event.ignore()
+            return
         event.accept()

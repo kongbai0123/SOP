@@ -1,6 +1,6 @@
 """背景執行緒：讀取影像 → 模型偵測 → 判定引擎 → 紀錄，結果以 Qt Signal 傳給介面。
 
-介面只透過指令佇列控制這個執行緒，模型、引擎、SQLite 都只在背景執行緒內使用，不需要鎖。
+介面只透過指令佇列控制這個執行緒；模型在獨立 AI 程序，判定引擎與 SQLite 留在背景執行緒。
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from PySide6.QtCore import QThread, Signal
 from .detection import FrameResult
 from .camera_controls import apply_controls, read_controls
 from .engine import EngineSnapshot, Phase, SOPEngine
+from .inference_worker import InferenceWorker, InferenceWorkerClosed
 from .model_bundle import read_model_info
 from .overlay import draw_detections
 from .recorder import Recorder
@@ -176,11 +177,13 @@ class VideoPipeline(QThread):
     status = Signal(str)
     error = Signal(str)
 
-    def __init__(self, records_dir: Path, parent=None):
+    def __init__(self, records_dir: Path, parent=None, inference_worker=None):
         super().__init__(parent)
         self._records_dir = Path(records_dir)
         self._commands: queue.Queue = queue.Queue()
         self._alive = True
+        self._inference_worker = inference_worker
+        self._worker_lock = threading.Lock()
         self._gui_ready = threading.Event()
         self._gui_ready.set()
 
@@ -220,8 +223,12 @@ class VideoPipeline(QThread):
         self._gui_ready.set()
 
     def shutdown(self):
-        self._alive = False
-        self.wait(5000)
+        with self._worker_lock:
+            self._alive = False
+            worker = self._inference_worker
+        if worker is not None:
+            worker.close()
+        return self.wait(5000)
 
     # ---- 背景執行緒 ------------------------------------------------------------
     def run(self):
@@ -250,6 +257,8 @@ class VideoPipeline(QThread):
                     continue
                 self._process(*got, recorder)
         finally:
+            if self._inference_worker is not None:
+                self._inference_worker.close()
             if self._source is not None:
                 self._source.close()
             recorder.close()
@@ -263,7 +272,11 @@ class VideoPipeline(QThread):
                 detections = self._detector.detect(frame)
             except Exception as exc:     # 推論失敗不讓整個執行緒掛掉
                 self._detector = None
-                self.error.emit(f"模型推論失敗，已停用模型：{exc}")
+                if self._alive:
+                    logging.getLogger("sop.launcher").exception("模型推論失敗")
+                    if getattr(exc, "remote_traceback", None):
+                        logging.getLogger("sop.launcher").error("AI 程序例外：\n%s", exc.remote_traceback)
+                    self.error.emit(f"模型推論失敗，已停用模型：{exc}")
                 self.model_loaded.emit(None, "")
         inference_ms = (time.perf_counter() - started) * 1000
 
@@ -323,7 +336,7 @@ class VideoPipeline(QThread):
         self.events_ready.emit(events)
 
     def _drain_commands(self, recorder: Recorder):
-        while True:
+        while self._alive:
             try:
                 command, payload = self._commands.get_nowait()
             except queue.Empty:
@@ -331,7 +344,8 @@ class VideoPipeline(QThread):
             try:
                 self._handle_command(command, payload, recorder)
             except Exception as exc:
-                self.error.emit(str(exc))
+                if self._alive:
+                    self.error.emit(str(exc))
 
     def _handle_command(self, command: str, payload, recorder: Recorder):
         if command == "source":
@@ -405,8 +419,8 @@ class VideoPipeline(QThread):
         self.camera_available.emit(isinstance(self._source, CameraSource))
 
     def _load_model(self, path: str):
-        from .detector import create_detector      # 延遲匯入：torch／ultralytics 載入較慢
-
+        if not self._alive:
+            return
         started = time.perf_counter()
         def report(message):
             self.model_progress.emit(message)
@@ -417,8 +431,23 @@ class VideoPipeline(QThread):
         try:
             report("讀取模型資訊")
             info = read_model_info(path)
-            self._detector = create_detector(info, progress=report)
+            with self._worker_lock:
+                if not self._alive:
+                    return
+                if self._inference_worker is None:
+                    self._inference_worker = InferenceWorker().start()
+            detector = self._inference_worker.load_model(path, progress=report)
+            if not self._alive:
+                return
+            self._detector = detector
+        except InferenceWorkerClosed:
+            if self._alive:
+                raise
+            return
         except Exception as exc:
+            logging.getLogger("sop.launcher").exception("模型載入失敗：%s", path)
+            if getattr(exc, "remote_traceback", None):
+                logging.getLogger("sop.launcher").error("AI 程序例外：\n%s", exc.remote_traceback)
             report("載入失敗")
             self.model_loaded.emit(None, "")
             if isinstance(exc, OSError) and getattr(exc, "winerror", None) == 4551:

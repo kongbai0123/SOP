@@ -1,4 +1,4 @@
-"""Independent splash process so torch can still load before Qt in the main process."""
+"""Independent splash process while the UI and isolated AI worker start together."""
 import queue
 import sys
 import threading
