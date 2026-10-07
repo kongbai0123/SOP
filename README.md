@@ -2,7 +2,24 @@
 
 用攝影機 AI（Mask R-CNN、Faster R-CNN、YOLO 或 RT-DETR）即時判斷工人是否**依序**完成每道工序。工序數量與內容全部在軟體內編輯，不需要改程式。
 
-目前測試版本：[v2026.10.06](https://github.com/kongbai0123/SOP/releases/tag/v2026.10.06)。版本變更見 [更新紀錄](CHANGELOG.md)。
+目前測試版本：[v2026.10.07](https://github.com/kongbai0123/SOP/releases/tag/v2026.10.07)。版本變更見 [更新紀錄](CHANGELOG.md)。
+
+## v2026.10.07：OpenCV 載入相容性
+
+固定使用官方 `opencv-python-headless==4.13.0.92`。2026-10-07 在本機 Smart App Control
+強制模式下，4.14.0.94 的 `cv2.pyd` 被 Windows 封鎖；4.13.0.92 的官方 wheel 經 PyPI
+SHA-256 核對後可正常載入，並通過 140 項測試、實際 GPU 模型預熱與示範影片辨識。
+本次未修改安全原則或使用自簽憑證。
+
+更新已安裝的環境，只替換 OpenCV：
+
+```powershell
+.venv\Scripts\python.exe -m pip install --no-deps --only-binary=:all: --index-url https://pypi.org/simple opencv-python-headless==4.13.0.92
+.venv\Scripts\python.exe -c "import cv2; print(cv2.__version__)"
+```
+
+此為本機驗證結果；SAC 判斷可能隨環境或信譽資訊改變，不能保證所有電腦永久放行。
+升級 OpenCV 前須先測試原生模組載入與實際影像功能。
 
 ## v2026.10.06：加快啟動
 

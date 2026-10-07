@@ -4,7 +4,8 @@
 torch==2.7.1+cu128
 torchvision==0.22.1+cu128
 numpy==2.5.3
-opencv-python-headless==4.14.0.94
+# Windows SAC 開啟時已實測可載入；升版前須重新驗證原生模組。
+opencv-python-headless==4.13.0.92
 PySide6>=6.8
 
 # 相機硬體參數（曝光、白平衡等，Windows DirectShow）
