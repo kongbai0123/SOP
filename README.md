@@ -2,7 +2,7 @@
 
 用攝影機 AI（Mask R-CNN、Faster R-CNN、YOLO 或 RT-DETR）即時判斷工人是否**依序**完成每道工序。工序數量與內容全部在軟體內編輯，不需要改程式。
 
-目前測試版本：[v2026.10.07](https://github.com/kongbai0123/SOP/releases/tag/v2026.10.07)。版本變更見 [更新紀錄](CHANGELOG.md)。
+目前測試版本：[v2026.10.07](https://github.com/kongbai0123/SOP/tree/v2026.10.07)。版本變更見 [更新紀錄](CHANGELOG.md)。
 
 ## v2026.10.07：OpenCV 載入相容性
 
