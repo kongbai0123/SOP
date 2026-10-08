@@ -82,6 +82,9 @@ class ModelETA:
         self.path = Path(history_path)
         self.key = key
         self.events = []
+        self.deadline = None
+        self.expired = False
+        self.finished = False
         self.history = {}
         try:
             history = json.loads(self.path.read_text(encoding="utf-8"))
@@ -94,6 +97,7 @@ class ModelETA:
         stage = stage_key(event)
         measured = event.measured_at
         if stage == "載入完成":
+            self.finished = True
             # Only successful completion trains the estimate. Delivery delays
             # from queued preloading never count as model work.
             if not self.events:
@@ -122,8 +126,15 @@ class ModelETA:
         self.events.append((stage, measured, event.mode))
 
     def remaining_text(self, now=None):
+        if self.finished:
+            return "剩餘 00:00"
+        now = time.perf_counter() if now is None else now
+        if self.deadline is not None and now >= self.deadline:
+            self.expired = True
+        if self.expired:
+            return "載入超出預估時間"
         if not self.events:
-            return "正在估算完成時間"
+            return "剩餘時間估算中"
         stage, stamp, mode = self.events[-1]
         samples = self.history.get(self.key, {})
         runs = samples.get(mode, []) if isinstance(samples, dict) else []
@@ -131,13 +142,16 @@ class ModelETA:
         values = [v for v in values if isinstance(v, (float, int)) and not isinstance(v, bool)
                   and math.isfinite(v) and 0 < v < 3600]
         if not values:
-            return "尚無此階段紀錄，正在估算完成時間"
-        elapsed = max(0, (time.perf_counter() if now is None else now) - stamp)
-        lower, upper = min(values) - elapsed, max(values) - elapsed
-        if upper <= 0:
-            return "超出歷史耗時，完成時間待重新評估"
-        if lower <= 0:
-            return f"預估剩餘約 {duration(upper)}（接近歷史範圍上限）"
-        if math.ceil(lower) == math.ceil(upper):
-            return f"預估剩餘約 {duration(upper)}"
-        return f"預估剩餘 {duration(lower)}～{duration(upper)}"
+            if self.deadline is None:
+                return "剩餘時間估算中"
+        else:
+            candidate = stamp + max(values)
+            # Actual milestones can bring completion closer, never push the
+            # displayed deadline later. An overrun stays explicit until ready.
+            self.deadline = candidate if self.deadline is None else min(self.deadline, candidate)
+        remaining = self.deadline - now
+        if remaining <= 0:
+            self.expired = True
+            return "載入超出預估時間"
+        minutes, seconds = divmod(math.ceil(remaining), 60)
+        return f"預估剩餘 {minutes:02d}:{seconds:02d}"

@@ -26,32 +26,32 @@ class ModelETATests(unittest.TestCase):
         self.train(10)
         eta = ModelETA(self.path, "model-a")
         eta.observe(event("預熱模型", 200))
-        self.assertEqual(eta.remaining_text(now=204), "預估剩餘約 6 秒")
+        self.assertEqual(eta.remaining_text(now=204), "預估剩餘 00:06")
 
-    def test_range_and_expired_estimate_never_claim_zero_seconds(self):
+    def test_single_estimate_and_expired_estimate_never_claim_zero_seconds(self):
         self.train(10)
         self.train(20)
         eta = ModelETA(self.path, "model-a")
         eta.observe(event("預熱模型", 200))
-        self.assertEqual(eta.remaining_text(now=202), "預估剩餘 8 秒～18 秒")
-        self.assertIn("接近歷史範圍上限", eta.remaining_text(now=212))
-        self.assertIn("重新評估", eta.remaining_text(now=220))
+        self.assertEqual(eta.remaining_text(now=202), "預估剩餘 00:18")
+        self.assertEqual(eta.remaining_text(now=212), "預估剩餘 00:08")
+        self.assertEqual(eta.remaining_text(now=220), "載入超出預估時間")
 
     def test_initial_and_reload_measurements_are_separate(self):
         self.train(10)
         self.train(2, "reload")
         eta = ModelETA(self.path, "model-a")
         eta.observe(event("預熱模型", 200, "reload"))
-        self.assertEqual(eta.remaining_text(now=200), "預估剩餘約 2 秒")
+        self.assertEqual(eta.remaining_text(now=200), "預估剩餘 00:02")
 
     def test_model_and_unknown_stage_have_no_invented_estimate(self):
         self.train()
         eta = ModelETA(self.path, "model-b")
         eta.observe(event("預熱模型", 200))
-        self.assertIn("尚無", eta.remaining_text(now=200))
+        self.assertEqual(eta.remaining_text(now=200), "剩餘時間估算中")
         eta = ModelETA(self.path, "model-a")
         eta.observe(event("新階段", 200))
-        self.assertIn("尚無", eta.remaining_text(now=200))
+        self.assertEqual(eta.remaining_text(now=200), "剩餘時間估算中")
 
     def test_incomplete_or_failed_load_does_not_train(self):
         eta = ModelETA(self.path, "model-a")
@@ -65,7 +65,21 @@ class ModelETATests(unittest.TestCase):
         eta.observe(event("載入完成", 105))
         eta = ModelETA(self.path, "model-a")
         eta.observe(event("AI 執行環境已載入（47.16 秒）", 200))
-        self.assertEqual(eta.remaining_text(now=200), "預估剩餘約 5 秒")
+        self.assertEqual(eta.remaining_text(now=200), "預估剩餘 00:05")
+
+    def test_later_stage_never_adds_time_or_restarts_expired_countdown(self):
+        self.path.write_text(json.dumps({"model-a": {"startup": [
+            {"載入 AI 執行環境": 10, "預熱模型": 20}]}}), encoding="utf-8")
+        eta = ModelETA(self.path, "model-a")
+        eta.observe(event("載入 AI 執行環境", 100))
+        self.assertEqual(eta.remaining_text(now=100), "預估剩餘 00:10")
+        eta.observe(event("預熱模型", 105))
+        self.assertEqual(eta.remaining_text(now=105), "預估剩餘 00:05")
+        self.assertEqual(eta.remaining_text(now=110), "載入超出預估時間")
+        eta.observe(event("預熱模型", 111))
+        self.assertEqual(eta.remaining_text(now=111), "載入超出預估時間")
+        eta.observe(event("載入完成", 112))
+        self.assertEqual(eta.remaining_text(now=112), "剩餘 00:00")
 
     def test_bad_history_is_ignored_and_samples_are_bounded(self):
         self.path.write_text("broken", encoding="utf-8")

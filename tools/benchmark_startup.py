@@ -98,7 +98,10 @@ def main():
                 time.sleep(.01)
             if loaded and loaded[-1][0] is not None:
                 info, device = loaded[-1]
-                record("model_ready", device=device, torch_in_ui="torch" in sys.modules)
+                assert window.model_progress.isHidden(), "Completed model progress must hide automatically"
+                assert window.model_progress.value() == 100, "Only a ready model completes progress"
+                record("model_ready", device=device, torch_in_ui="torch" in sys.modules,
+                       progress_hidden=window.model_progress.isHidden())
                 import numpy as np
 
                 proxy = window.pipeline._detector

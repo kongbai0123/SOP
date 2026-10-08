@@ -269,13 +269,13 @@ class MainWindow(QMainWindow):
         if self._model_started is not None:
             work = self._model_work
             self.model_progress.setValue(work.percent)
-            self.model_progress.setFormat(f"階段 {work.completed}/{work.total} · %p%")
-            self.model_progress.setToolTip(work.tooltip())
+            self.model_progress.setFormat("%p%")
+            self.model_progress.setToolTip("完成度依已完成工作計算；模型就緒後才達到 100%。")
             if self._model_stage in ("載入完成", "載入失敗"):
                 self.model_status.setText(f"模型：{self._model_stage}")
                 return
-            estimate = self._model_eta.remaining_text() if self._model_eta else "正在估算完成時間"
-            self.model_status.setText(f"模型：{self._model_stage} · {estimate}")
+            estimate = self._model_eta.remaining_text() if self._model_eta else "剩餘時間估算中"
+            self.model_status.setText(f"模型載入 · {estimate}")
 
     def _on_model_loaded(self, info: ModelInfo | None, device: str):
         self.model_timer.stop()
@@ -283,6 +283,7 @@ class MainWindow(QMainWindow):
             self._model_work.completed = self._model_work.total
             self._model_stage = "載入完成"
         self._update_model_progress()
+        self.model_progress.hide()
         self._model_started = None
         self._model_eta = None
         self.model_ready = info is not None
