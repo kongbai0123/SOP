@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from sop_app.inference_worker import ModelProgress
-from sop_app.model_eta import ModelETA, model_key
+from sop_app.model_eta import ModelETA, ModelLoadProgress, model_key
 
 
 def event(stage, stamp, mode="startup"):
@@ -80,3 +80,36 @@ class ModelETATests(unittest.TestCase):
         original = model_key(model)
         model.write_bytes(b"different model")
         self.assertNotEqual(original, model_key(model))
+
+    def test_progress_counts_only_completed_stages(self):
+        work = ModelLoadProgress()
+        work.observe(event("載入 AI 執行環境", 100))
+        self.assertEqual((work.completed, work.total, work.percent), (0, 7, 0))
+        work.observe(event("AI 執行環境已載入（1.46 秒）", 101))
+        self.assertEqual(work.completed, 1)
+        work.observe(event("讀取模型資訊", 102))
+        self.assertEqual(work.completed, 1)  # No double-counting the same milestone.
+        work.observe(event("預熱模型，準備首次辨識", 103))
+        self.assertEqual((work.completed, work.percent), (6, 86))
+        self.assertIn("預熱模型，準備首次辨識：進行中", work.tooltip())
+        work.observe(event("載入完成", 104))
+        self.assertEqual(work.percent, 100)
+        self.assertNotIn("進行中", work.tooltip())
+
+    def test_reload_omits_runtime_and_torchvision_uses_same_milestone(self):
+        work = ModelLoadProgress()
+        work.observe(event("讀取模型資訊", 100, "reload"))
+        self.assertEqual((work.completed, work.total), (0, 6))
+        work.observe(event("建立模型並載入運算裝置", 101, "reload"))
+        self.assertEqual(work.completed, 4)
+        work.observe(event("預熱模型，準備首次辨識", 102, "reload"))
+        self.assertEqual((work.completed, work.percent), (5, 83))
+
+    def test_unknown_events_do_not_invent_work_and_failure_stays_incomplete(self):
+        work = ModelLoadProgress()
+        work.observe(event("未知訊息", 100))
+        self.assertEqual(work.completed, 0)
+        work.observe(event("讀取與驗證模型權重", 101))
+        work.failed = True
+        self.assertLess(work.percent, 100)
+        self.assertIn("讀取與驗證模型權重：失敗", work.tooltip())

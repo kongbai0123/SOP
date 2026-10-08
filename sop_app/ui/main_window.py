@@ -9,10 +9,10 @@ from pathlib import Path
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QLabel, QMainWindow, QMessageBox,
-                               QPushButton, QTabWidget, QToolBar)
+                               QProgressBar, QPushButton, QTabWidget, QToolBar)
 
 from ..model_bundle import ModelBundleError, ModelInfo, read_model_info
-from ..model_eta import ModelETA, model_key, stage_key
+from ..model_eta import ModelETA, ModelLoadProgress, model_key, stage_key
 from ..paths import APP_SETTINGS, PROJECT_ROOT, RECORDS_DIR, SOPS_DIR, resolve
 from ..pipeline import FramePacket, VideoPipeline
 from ..sop_schema import SOPDefinition, Step, load_sop, save_sop
@@ -38,6 +38,7 @@ class MainWindow(QMainWindow):
         self._model_started = None
         self._model_stage = ""
         self._model_eta = None
+        self._model_work = ModelLoadProgress()
         self.resize(1500, 900)
 
         self.pipeline = VideoPipeline(RECORDS_DIR, self, inference_worker=inference_worker)
@@ -71,6 +72,12 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self.pipeline.camera_available.connect(self.camera_button.setEnabled)
         self.model_status = QLabel("模型：未載入")
+        self.model_progress = QProgressBar()
+        self.model_progress.setRange(0, 100)
+        self.model_progress.setFixedWidth(170)
+        self.model_progress.setValue(0)
+        self.model_progress.hide()
+        self.statusBar().addPermanentWidget(self.model_progress)
         self.model_timer = QTimer(self)
         self.model_timer.setInterval(500)
         self.model_timer.timeout.connect(self._update_model_progress)
@@ -240,21 +247,30 @@ class MainWindow(QMainWindow):
         self._requested_model = str(Path(path).resolve())
         self._model_started = time.monotonic()
         self._model_eta = ModelETA(PROJECT_ROOT / "logs" / "model-load-times.json", model_key(path))
+        self._model_work = ModelLoadProgress()
         self._model_stage = "正在準備模型…"
+        self.model_progress.show()
         self.model_timer.start()
         self._update_model_progress()
         self.pipeline.load_model(path)
 
     def _on_model_progress(self, stage):
         self._model_stage = stage_key(stage)
+        if self._model_stage == "載入失敗":
+            self._model_work.failed = True
         self._update_model_progress()
 
     def _on_model_timing(self, event):
         if self._model_eta is not None:
             self._model_eta.observe(event)
+            self._model_work.observe(event)
 
     def _update_model_progress(self):
         if self._model_started is not None:
+            work = self._model_work
+            self.model_progress.setValue(work.percent)
+            self.model_progress.setFormat(f"階段 {work.completed}/{work.total} · %p%")
+            self.model_progress.setToolTip(work.tooltip())
             if self._model_stage in ("載入完成", "載入失敗"):
                 self.model_status.setText(f"模型：{self._model_stage}")
                 return
@@ -263,6 +279,10 @@ class MainWindow(QMainWindow):
 
     def _on_model_loaded(self, info: ModelInfo | None, device: str):
         self.model_timer.stop()
+        if info is not None:
+            self._model_work.completed = self._model_work.total
+            self._model_stage = "載入完成"
+        self._update_model_progress()
         self._model_started = None
         self._model_eta = None
         self.model_ready = info is not None

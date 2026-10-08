@@ -35,6 +35,48 @@ def duration(seconds):
     return f"{minutes} 分 {seconds} 秒" if minutes else f"{seconds} 秒"
 
 
+class ModelLoadProgress:
+    """Count finished work stages, rather than pretending time is work done."""
+
+    STAGES = ("載入 AI 執行環境", "讀取模型資訊", "載入推論套件", "選擇運算裝置",
+              "讀取與驗證模型權重", "建立辨識模型", "預熱模型，準備首次辨識")
+
+    def __init__(self):
+        self.stages = self.STAGES
+        self.completed = 0
+        self.failed = False
+
+    def observe(self, event):
+        stage = stage_key(event)
+        self.stages = self.STAGES[1:] if event.mode == "reload" else self.STAGES
+        if stage == "載入完成":
+            self.completed = len(self.stages)
+        else:
+            if stage == "AI 執行環境已載入":
+                stage = "讀取模型資訊"
+            elif stage == "建立模型並載入運算裝置":
+                stage = "建立辨識模型"
+            if stage in self.stages:
+                self.completed = max(self.completed, self.stages.index(stage))
+
+    @property
+    def total(self):
+        return len(self.stages)
+
+    @property
+    def percent(self):
+        return round(100 * self.completed / self.total)
+
+    def tooltip(self):
+        lines = ["百分比依已完成階段計算；各階段耗時不同。"]
+        for index, stage in enumerate(self.stages):
+            state = "已完成" if index < self.completed else (
+                "失敗" if self.failed and index == self.completed else
+                "進行中" if index == self.completed else "等待")
+            lines.append(f"{index + 1}. {stage}：{state}")
+        return "\n".join(lines)
+
+
 class ModelETA:
     def __init__(self, history_path, key):
         self.path = Path(history_path)
