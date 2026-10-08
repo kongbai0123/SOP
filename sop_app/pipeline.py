@@ -170,6 +170,7 @@ class VideoPipeline(QThread):
     events_ready = Signal(object)          # list[EngineEvent]
     model_loaded = Signal(object, str)     # ModelInfo | None, 裝置名稱
     model_progress = Signal(str)
+    model_timing = Signal(object)
     source_changed = Signal(str)           # 來源名稱，空字串 = 已中斷
     camera_available = Signal(bool)
     camera_controls_ready = Signal(object, object)
@@ -423,6 +424,8 @@ class VideoPipeline(QThread):
             return
         started = time.perf_counter()
         def report(message):
+            if hasattr(message, "measured_at"):
+                self.model_timing.emit(message)
             self.model_progress.emit(message)
             logging.getLogger("sop.launcher").info("模型載入 %.2fs · %s", time.perf_counter() - started, message)
 

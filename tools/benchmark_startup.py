@@ -80,7 +80,8 @@ def main():
             # Capture errors instead of displaying a modal dialog in unattended measurements.
             window.pipeline.error.disconnect()
             window.pipeline.error.connect(errors.append)
-            window.pipeline.model_progress.connect(lambda stage: record("model_progress", message=stage))
+            window.pipeline.model_progress.connect(lambda stage: record(
+                "model_progress", message=stage, displayed_status=window.model_status.text()))
             loaded = []
             window.pipeline.model_loaded.connect(lambda info, device: loaded.append((info, device)))
             window.show()

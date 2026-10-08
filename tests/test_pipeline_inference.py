@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from sop_app.inference_worker import InferenceWorkerClosed, InferenceWorkerError
+from sop_app.inference_worker import InferenceWorkerClosed, InferenceWorkerError, ModelProgress
 from sop_app.pipeline import VideoPipeline
 
 
@@ -57,6 +57,23 @@ class PipelineInferenceTests(unittest.TestCase):
             factory.assert_called_once_with()
         self.assertIs(pipeline._inference_worker, self.worker)
         self.assertIs(pipeline._detector, self.proxy)
+
+    def test_child_timing_reaches_ui_without_losing_measurement(self):
+        timing = ModelProgress({"message": "預熱模型", "measured_at": 123.5,
+                                "mode": "reload"})
+        received = []
+        self.pipeline.model_timing.connect(received.append)
+
+        def load(path, progress):
+            progress(timing)
+            return self.proxy
+
+        self.worker.load_model.side_effect = load
+        self.pipeline._load_model(self.path)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0].measured_at, 123.5)
+        self.assertEqual(received[0].mode, "reload")
+        self.assertIn("預熱模型", self.progress)
 
     def test_remote_application_control_failure_has_ui_message_and_traceback_log(self):
         remote_error = InferenceWorkerError(

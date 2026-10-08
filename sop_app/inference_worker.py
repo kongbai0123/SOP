@@ -20,6 +20,16 @@ import traceback
 _POLL_SECONDS = 0.05
 
 
+class ModelProgress(str):
+    """Compatible text callback carrying the child's actual measurement."""
+
+    def __new__(cls, response):
+        value = super().__new__(cls, response["message"])
+        value.measured_at = response.get("measured_at", time.perf_counter())
+        value.mode = response.get("mode", "startup")
+        return value
+
+
 class InferenceWorkerClosed(RuntimeError):
     """The owner cancelled a pending operation or closed the worker."""
 
@@ -184,7 +194,7 @@ class InferenceWorker:
                 logging.getLogger("sop.launcher").info(
                     "AI 程序 %.2fs · %s", response.get("elapsed", 0.), response["message"])
                 if progress is not None and response["id"] in (None, request_id):
-                    progress(response["message"])
+                    progress(ModelProgress(response))
             else:
                 self._responses[response["id"]] = response
 
@@ -204,6 +214,10 @@ class InferenceWorker:
             try:
                 metadata = self._receive(request_id, progress)
                 self._check_open()
+                if progress is not None:
+                    progress(ModelProgress({"message": "載入完成",
+                                            "measured_at": metadata["completed_at"],
+                                            "mode": metadata["load_mode"]}))
             finally:
                 if preload_id is not None and preload_id != request_id:
                     self._responses.pop(preload_id, None)
@@ -294,7 +308,9 @@ def _serve(connection, cancelled, load_detector, *, bootstrap=None):
 
     def report(request_id, message):
         connection.send({"kind": "progress", "id": request_id, "message": str(message),
-                         "elapsed": time.perf_counter() - child_started})
+                         "elapsed": time.perf_counter() - child_started,
+                         "measured_at": time.perf_counter(),
+                         "mode": "startup" if generation <= 1 else "reload"})
 
     detector, generation = None, 0
     try:
@@ -323,7 +339,9 @@ def _serve(connection, cancelled, load_detector, *, bootstrap=None):
                     detector = load_detector(Path(request["path"]),
                                              lambda message: report(request_id, message))
                     result = {"info": detector.info, "classes": tuple(detector.classes),
-                              "device_name": detector.device_name, "generation": generation}
+                              "device_name": detector.device_name, "generation": generation,
+                              "completed_at": time.perf_counter(),
+                              "load_mode": "startup" if generation == 1 else "reload"}
                 elif request["operation"] == "detect":
                     if detector is None or request["generation"] != generation:
                         raise RuntimeError("模型已變更或不可用，請重新載入模型")

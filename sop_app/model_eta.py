@@ -1,0 +1,101 @@
+"""Local estimates from successful loads, measured in the inference process."""
+from __future__ import annotations
+
+import hashlib
+from importlib.metadata import version, PackageNotFoundError
+import json
+import math
+from pathlib import Path
+import re
+import sys
+import time
+
+
+def model_key(path):
+    model = Path(path).resolve()
+    stat = model.stat()
+    runtime = []
+    for package in ("torch", "ultralytics", "numpy", "opencv-python-headless"):
+        try:
+            runtime.append(version(package))
+        except PackageNotFoundError:
+            runtime.append("unknown")
+    return hashlib.sha256(repr((str(model), stat.st_size, stat.st_mtime_ns,
+                                sys.version, runtime)).encode()).hexdigest()
+
+
+def stage_key(stage):
+    # Runtime import reports include a measured duration in their display text.
+    return re.sub(r"（[^）]*秒）", "", str(stage))
+
+
+def duration(seconds):
+    seconds = max(1, math.ceil(seconds))
+    minutes, seconds = divmod(seconds, 60)
+    return f"{minutes} 分 {seconds} 秒" if minutes else f"{seconds} 秒"
+
+
+class ModelETA:
+    def __init__(self, history_path, key):
+        self.path = Path(history_path)
+        self.key = key
+        self.events = []
+        self.history = {}
+        try:
+            history = json.loads(self.path.read_text(encoding="utf-8"))
+            if isinstance(history, dict):
+                self.history = history
+        except (OSError, ValueError):
+            pass
+
+    def observe(self, event):
+        stage = stage_key(event)
+        measured = event.measured_at
+        if stage == "載入完成":
+            # Only successful completion trains the estimate. Delivery delays
+            # from queued preloading never count as model work.
+            if not self.events:
+                return
+            mode = event.mode
+            samples = self.history.get(self.key, {})
+            if not isinstance(samples, dict):
+                samples = {}
+            runs = samples.get(mode, [])
+            if not isinstance(runs, list):
+                runs = []
+            run = {name: measured - stamp for name, stamp, _ in self.events
+                   if 0 <= measured - stamp < 3600}
+            samples[mode] = (runs + [run])[-12:]
+            self.history[self.key] = samples
+            # Keep a bounded local history and write atomically.
+            self.history = dict(list(self.history.items())[-32:])
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(self.history, ensure_ascii=False), encoding="utf-8")
+                temporary.replace(self.path)
+            except OSError:
+                pass  # A read-only history must never prevent model loading.
+            return
+        self.events.append((stage, measured, event.mode))
+
+    def remaining_text(self, now=None):
+        if not self.events:
+            return "正在估算完成時間"
+        stage, stamp, mode = self.events[-1]
+        samples = self.history.get(self.key, {})
+        runs = samples.get(mode, []) if isinstance(samples, dict) else []
+        values = [run.get(stage) for run in runs if isinstance(run, dict)] if isinstance(runs, list) else []
+        values = [v for v in values if isinstance(v, (float, int)) and not isinstance(v, bool)
+                  and math.isfinite(v) and 0 < v < 3600]
+        if not values:
+            return "尚無此階段紀錄，正在估算完成時間"
+        elapsed = max(0, (time.perf_counter() if now is None else now) - stamp)
+        lower, upper = min(values) - elapsed, max(values) - elapsed
+        if upper <= 0:
+            return "超出歷史耗時，完成時間待重新評估"
+        if lower <= 0:
+            return f"預估剩餘約 {duration(upper)}（接近歷史範圍上限）"
+        if math.ceil(lower) == math.ceil(upper):
+            return f"預估剩餘約 {duration(upper)}"
+        return f"預估剩餘 {duration(lower)}～{duration(upper)}"

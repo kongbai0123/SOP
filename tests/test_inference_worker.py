@@ -95,7 +95,9 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(detector.info.process_id, worker.pid)
         self.assertEqual(detector.classes, ("part", "hand"))
         self.assertEqual(detector.device_name, "test CPU")
-        self.assertEqual(messages, ["loading model", "warmup complete"])
+        self.assertEqual(messages, ["loading model", "warmup complete", "載入完成"])
+        self.assertTrue(all(message.mode == "startup" for message in messages))
+        self.assertLessEqual(messages[0].measured_at, messages[-1].measured_at)
         self.assertIs(worker.start(), worker)
 
     def test_different_model_uses_same_child_and_does_not_return_preload(self):
@@ -105,7 +107,8 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(changed.info.model_version_id, "changed")
         self.assertEqual(changed.info.load_count, 2)
         self.assertEqual(changed.info.process_id, worker.pid)
-        self.assertEqual(messages, ["loading changed", "warmup complete"])
+        self.assertEqual(messages, ["loading changed", "warmup complete", "載入完成"])
+        self.assertTrue(all(message.mode == "reload" for message in messages))
         third = worker.load_model(self.root / "third")
         self.assertEqual(third.info.process_id, worker.pid)
         self.assertEqual(third.info.load_count, 3)
