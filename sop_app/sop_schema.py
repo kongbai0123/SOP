@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Sequence
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 CONDITION_TYPES = {"appear": "出現", "disappear": "消失"}
 
 
@@ -52,6 +52,10 @@ class Step:
     ratio: float = 0.8            # 持續期間內至少多少比例的幀成立（抗辨識閃爍）
     timeout_sec: float = 0.0      # 0 = 不限時
     completion_mode: str = "all"  # all / any；工序之間仍依序執行
+    forbidden_mode: str = "all"   # all / any：違規條件全部或任一成立即違規
+    forbidden_hold_sec: float | None = None  # None = 沿用 hold_sec
+    forbidden_ratio: float | None = None     # None = 沿用 ratio
+    min_duration_sec: float = 0.0  # 自動完成早於此秒數 → 「工時過短」警報（0 = 不檢查）
 
 
 @dataclass
@@ -59,6 +63,8 @@ class CycleSettings:
     reset_conditions: list[Condition] = field(default_factory=list)
     reset_hold_sec: float = 2.0
     auto_restart_sec: float = 3.0   # 沒有重置條件時，本輪完成後幾秒自動開始下一輪
+    reset_ratio: float = 0.8        # 重置條件觀察期間至少多少比例的幀成立
+    detect_sequence: bool = False   # 後續工序的完成條件提前成立 → 「順序錯誤」警報
 
 
 @dataclass
@@ -100,6 +106,8 @@ class SOPDefinition:
                 reset_conditions=_conditions(cycle.get("reset_conditions")),
                 reset_hold_sec=float(cycle.get("reset_hold_sec", 2.0)),
                 auto_restart_sec=float(cycle.get("auto_restart_sec", 3.0)),
+                reset_ratio=float(cycle.get("reset_ratio", 0.8)),
+                detect_sequence=bool(cycle.get("detect_sequence", False)),
             ),
             steps=[Step(
                 name=str(s.get("name", "新工序")),
@@ -110,6 +118,10 @@ class SOPDefinition:
                 ratio=float(s.get("ratio", 0.8)),
                 timeout_sec=float(s.get("timeout_sec", 0.0)),
                 completion_mode=str(s.get("completion_mode", "all")),
+                forbidden_mode=str(s.get("forbidden_mode", "all")),
+                forbidden_hold_sec=_optional_float(s.get("forbidden_hold_sec")),
+                forbidden_ratio=_optional_float(s.get("forbidden_ratio")),
+                min_duration_sec=float(s.get("min_duration_sec", 0.0)),
             ) for s in data.get("steps", [])],
         )
 
@@ -144,19 +156,48 @@ class SOPDefinition:
                     errors.append(f"{where}：模型沒有「{cond.label}」這個類別")
                 if cond.roi and cond.roi not in roi_names:
                     errors.append(f"{where}：找不到偵測區域「{cond.roi}」")
+                if cond.min_count < 1:
+                    errors.append(f"{where}：「{cond.label}」數量需至少 1")
+                if not 0 <= cond.min_score <= 1:
+                    errors.append(f"{where}：「{cond.label}」信心度需介於 0～1")
+                if not 0 < cond.roi_overlap <= 1:
+                    errors.append(f"{where}：「{cond.label}」區域比例需介於 1%～100%")
 
+        names = [step.name.strip() for step in self.steps]
+        for name in sorted({name for name in names if names.count(name) > 1}):
+            warnings.append(f"工序名稱「{name}」重複，作業紀錄將難以區分")
         for index, step in enumerate(self.steps, 1):
             where = f"工序 {index}「{step.name}」"
+            if not step.name.strip():
+                warnings.append(f"工序 {index}：名稱空白，作業紀錄將難以辨識")
             if step.completion_mode not in ("all", "any"):
                 errors.append(f"{where}：完成方式無效")
+            if step.forbidden_mode not in ("all", "any"):
+                errors.append(f"{where}：違規判定方式無效")
             if not step.conditions:
                 warnings.append(f"{where} 沒有完成條件，執行時需手動確認")
             if not 0 < step.ratio <= 1:
                 errors.append(f"{where}：成立比例需介於 1%～100%")
+            if step.forbidden_ratio is not None and not 0 < step.forbidden_ratio <= 1:
+                errors.append(f"{where}：違規成立比例需介於 1%～100%")
+            for value, label in ((step.hold_sec, "觀察時間"), (step.timeout_sec, "超時秒數"),
+                                 (step.min_duration_sec, "最短工時"), (step.forbidden_hold_sec or 0.0, "違規觀察時間")):
+                if value < 0:
+                    errors.append(f"{where}：{label}不可為負數")
+            if step.timeout_sec > 0 and step.min_duration_sec >= step.timeout_sec:
+                warnings.append(f"{where}：最短工時不小於超時秒數，任何完成都會觸發警報")
             check(step.conditions, where)
             check(step.forbidden, where + "的違規條件")
+        if not 0 < self.cycle.reset_ratio <= 1:
+            errors.append("循環重置條件：成立比例需介於 1%～100%")
+        if self.cycle.reset_hold_sec < 0 or self.cycle.auto_restart_sec < 0:
+            errors.append("循環設定：秒數不可為負數")
         check(self.cycle.reset_conditions, "循環重置條件")
         return errors, warnings
+
+
+def _optional_float(value) -> float | None:
+    return None if value is None or value == "" else float(value)
 
 
 def _conditions(rows) -> list[Condition]:

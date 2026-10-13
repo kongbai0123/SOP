@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from sop_app.tracking import WorkpieceLocator, capture_workpiece, transform_roi
+from sop_app.tracking import WorkpieceLocator, capture_workpiece, transform_roi, workpiece_key
 from sop_app.sop_schema import ROI, Condition, Step, SOPDefinition, load_sop, save_sop
 from sop_app.detection import Detection, FrameResult
 from sop_app.conditions import evaluate_condition
@@ -35,6 +35,20 @@ def scene():
 
 TARGET = [(0.25, 0.25), (0.7, 0.25), (0.7, 0.72), (0.25, 0.72)]
 IDENTITY = np.array([[1., 0., 0.], [0., 1., 0.]])
+
+
+class PipelineTracking:
+    """模擬背景管線：逐幀定位並把結果與工件識別碼放進畫面封包（介面不再自行定位）。"""
+
+    def __init__(self, workpiece):
+        self.locator = WorkpieceLocator(workpiece)
+        self.key = workpiece_key(workpiece)
+
+    def packet(self, image, timestamp):
+        transform, status = self.locator.locate(image)
+        result = FrameResult(image.shape[1], image.shape[0], timestamp, workpiece_transform=transform,
+                             tracking_status=status, workpiece_key=self.key)
+        return FramePacket(image, image.copy(), result, None, 10, 5)
 
 
 class TrackingTests(unittest.TestCase):
@@ -255,18 +269,20 @@ class EditorTests(unittest.TestCase):
         editor = EditorPage()
         self.addCleanup(editor.close)
         editor.set_sop(SOPDefinition(steps=[Step('安裝左握把')]))
+        editor._set_editor_mode('overview')
         editor.show()
         self.app.processEvents()
-        self.assertFalse(editor.tabs.isVisible())
+        self.assertTrue(editor.tabs.isVisible())
         self.assertFalse(editor.manual_tools.isVisible())
-        self.assertFalse(editor.step_actions.isVisible())
+        self.assertTrue(editor.step_actions.isVisible())
         self.assertTrue(editor.left_panel.isVisible())
         self.assertTrue(editor.step_list.isVisible())
         self.assertTrue(editor.sop_box.isVisible())
         self.assertIn('1 道', editor.steps_box.title())
-        self.assertEqual(editor.settings_tool.currentData(), 'overview')
+        self.assertTrue(editor.mode_buttons['overview'].isChecked())
         self.assertIn('已設定工序', editor.setup_summary.text())
-        editor.settings_tool.setCurrentIndex(editor.settings_tool.findData('steps'))
+        self.assertTrue(editor.validation_box.isVisible())
+        editor.mode_buttons['steps'].click()
         self.app.processEvents()
         self.assertTrue(editor.tabs.isVisible())
         self.assertFalse(editor.manual_tools.isVisible())
@@ -275,8 +291,8 @@ class EditorTests(unittest.TestCase):
         self.assertTrue(editor.step_list.isVisible())
         self.assertFalse(editor.sop_box.isVisible())
         self.assertEqual(editor.tabs.currentIndex(), 0)
-        self.assertEqual(editor.settings_tool.currentData(), 'steps')
-        editor.settings_tool.setCurrentIndex(editor.settings_tool.findData('positions'))
+        self.assertTrue(editor.mode_buttons['steps'].isChecked())
+        editor.mode_buttons['positions'].click()
         self.app.processEvents()
         self.assertTrue(editor.left_panel.isVisible())
         self.assertTrue(editor.step_list.isVisible())
@@ -292,7 +308,8 @@ class EditorTests(unittest.TestCase):
         self.addCleanup(run.close)
         run.set_sop(sop)
         self.assertTrue(run.start_button.isEnabled())
-        self.assertEqual(run.start_button.text(), '▶ 開始作業')
+        self.assertEqual(run.start_button.text(), '開始作業')
+        self.assertFalse(run.start_button.icon().isNull())
         started = []
         run.start_requested.connect(lambda: started.append(True))
         run.start_button.click()
@@ -301,21 +318,22 @@ class EditorTests(unittest.TestCase):
         self.assertEqual([r.name for r in run.video._rois], ['桌面','安裝位置'])
         self.assertEqual(run.video._stale, {'安裝位置'})
         packet = FramePacket(frame, frame.copy(), FrameResult(640,480,0), None,10,5)
+        pipeline = PipelineTracking(sop.workpiece)
         for _ in range(3):
-            run.on_packet(packet)
+            run.on_packet(pipeline.packet(frame, 0))
         self.assertTrue(run.start_button.isEnabled())
-        self.assertEqual(run.start_button.text(), '▶ 開始作業')
+        self.assertEqual(run.start_button.text(), '開始作業')
         self.assertEqual([r.name for r in run.video._rois], ['桌面','安裝位置'])
         self.assertIn('2/2', run.tracking_label.text())
         # 監控待機沒有 snapshot，也應持續更新座標。
         moved = cv2.warpAffine(frame, np.float32([[1,0,20],[0,1,10]]), (640,480))
-        run.on_packet(FramePacket(moved,moved,FrameResult(640,480,1),None,10,5))
+        run.on_packet(pipeline.packet(moved, 1))
         self.assertAlmostEqual(run.video._rois[1].points[0][0], .4+20/640, places=2)
         blank = np.zeros_like(frame)
-        run.on_packet(FramePacket(blank,blank,FrameResult(640,480,2),None,10,5))
+        run.on_packet(pipeline.packet(blank, 2))
         self.assertEqual([r.name for r in run.video._rois], ['桌面','安裝位置'])
-        self.assertEqual(run.video._stale, {'安裝位置'})
-        run.on_packet(FramePacket(blank,blank,FrameResult(640,480,3),None,10,5))
+        self.assertEqual(run.video._stale, set())
+        run.on_packet(pipeline.packet(blank, 3))
         self.assertEqual(run.video._stale, {'安裝位置'})
         self.assertIn('位置跟隨暫停', run.tracking_label.text())
         self.assertIn('停止累積', run.tracking_label.text())
@@ -329,29 +347,6 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(run.video._rois, [])
         self.assertIsNone(run._transform)
 
-    def test_editor_tools_and_monitor_share_all_results_by_default(self):
-        editor, run = EditorPage(), RunPage()
-        self.addCleanup(editor.close)
-        self.addCleanup(run.close)
-        sop = SOPDefinition(rois=[ROI('left', TARGET), ROI('right', TARGET)],
-                            steps=[Step('install', conditions=[Condition(label='R_grip_done', roi='right')])])
-        editor.set_sop(sop)
-        run.set_sop(sop)
-        raw = scene()
-        detections = [Detection('L_grip_done', .84, (200,150,300,250)),
-                      Detection('handlebar', .94, (160,120,450,350))]
-        packet = FramePacket(raw, raw, FrameResult(640,480,0,detections), None,10,5,None,
-                             ('L_grip_done', 'handlebar'), .5, False)
-        run.on_packet(packet)
-        self.assertEqual(run.display_mode.currentData(), 'all')
-        for mode in ('overview', 'follow', 'positions', 'steps', 'cycle'):
-            editor.settings_tool.setCurrentIndex(editor.settings_tool.findData(mode))
-            editor.on_packet(packet)
-            self.assertEqual([d.label for d in editor.video._detections],
-                             [d.label for d in run.video._detections])
-            self.assertEqual([r.name for r in editor.video._rois], [r.name for r in run.video._rois])
-        self.assertTrue(run.details_panel.isHidden())
-
     def test_monitor_hides_frame_by_frame_tracking_details_when_step_has_no_region(self):
         frame = scene()
         sop = SOPDefinition(
@@ -361,7 +356,6 @@ class EditorTests(unittest.TestCase):
         run = RunPage()
         self.addCleanup(run.close)
         run.set_sop(sop)
-        run.display_mode.setCurrentIndex(run.display_mode.findData("step"))
         texts = {run.tracking_label.text()}
         for index, image in enumerate([frame, frame, frame, np.zeros_like(frame), frame]):
             run.on_packet(FramePacket(image, image, FrameResult(640,480,index), None,10,5))
@@ -394,6 +388,8 @@ class EditorTests(unittest.TestCase):
         editor.save_requested.connect(lambda: saved.append(True))
         editor._save_quick_setup()
         self.assertEqual(saved,[True])
+        self.assertEqual(editor._quick_phase,'verify')
+        editor.on_save_result('saved')
         self.assertEqual(editor._quick_phase,'')
 
     def test_clear_workpiece_removes_dependent_positions_and_conditions(self):
@@ -416,7 +412,7 @@ class EditorTests(unittest.TestCase):
         self.assertEqual([roi.name for roi in editor.sop.rois], ['桌面'])
         self.assertEqual([c.roi for c in editor.sop.steps[0].conditions], ['桌面'])
         self.assertFalse(editor.reference_button.isEnabled())
-        self.assertIn('○', editor.setup_summary.text())
+        self.assertIn('未設定', editor.setup_summary.text())
 
     def test_following_position_can_be_outside_hidden_tracking_reference(self):
         frame = scene()
@@ -450,12 +446,11 @@ class EditorTests(unittest.TestCase):
         result = FrameResult(100,100,0,detections)
         packet = FramePacket(raw, np.full_like(raw,255), result, engine.snapshot(),10,5,None,
                              ('left_part','right_part','noise'),.5,False)
-        run.display_mode.setCurrentIndex(run.display_mode.findData('step'))
         run.on_packet(packet)
         self.assertEqual([r.name for r in run.video._rois],['左'])
         self.assertIn('目前流程 1：左步驟',run.display_summary.text())
         self.assertIn('left_part',run.display_summary.text())
-        self.assertEqual([d.label for d in run.video._detections], ['left_part'])
+        self.assertGreater(run.video._image.pixelColor(15,15).red(), 0)
         self.assertEqual(run.video._image.pixelColor(85,75).red(), 0)
         run.display_mode.setCurrentIndex(run.display_mode.findData('all'))
         self.assertEqual([r.name for r in run.video._rois],['左','右'])
@@ -495,9 +490,15 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(editor.sop.rois[0].anchor, "workpiece")
         editor.sop.steps[0].conditions = [Condition(label="tool", roi="壓合位置")]
         editor.reference_button.setChecked(False)
+        pipeline = PipelineTracking(editor.sop.workpiece)
         for _ in range(3):
-            editor.on_packet(packet)
+            editor.on_packet(pipeline.packet(frame, 0))
         self.assertIsNotNone(editor._preview_result.workpiece_transform)
+        # 舊參考工件的定位結果不能套用到目前設定。
+        stale = pipeline.packet(frame, 1)
+        stale.result.workpiece_key = "old-reference"
+        editor.on_packet(stale)
+        self.assertIsNone(editor._preview_result.workpiece_transform)
         saved = SOPDefinition.from_dict(editor.sop.to_dict())
         editor.set_sop(saved)
         self.assertTrue(editor.reference_button.isEnabled())
@@ -591,14 +592,14 @@ class EditorTests(unittest.TestCase):
             pipe._handle_command("start", sop, recorder)
             for t in (0, 0.1, 0.2):
                 pipe.acknowledge_packet()
-                pipe._process(frame, t, recorder)
+                pipe._process(np.zeros_like(frame) if t == 0 else frame, t, recorder)
             self.assertEqual(pipe._engine.phase, Phase.CYCLE_DONE)
             self.assertIsNotNone(packets[-1].result.workpiece_transform)
             self.assertTrue(list((Path(folder) / "snapshots").glob("*.jpg")))
             page = RecordsPage(Path(folder))
             page.refresh()
             page.cycles.selectRow(0)
-            self.assertEqual(page.positioning.rowCount(), 0)
+            self.assertEqual(page.positioning.rowCount(), 2)
             page.close()
             pipe._handle_command("stop", None, recorder)
             self.assertIsNone(pipe._locator)

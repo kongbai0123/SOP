@@ -4,7 +4,8 @@ from __future__ import annotations
 import base64
 import binascii
 import time
-import cv2
+import hashlib
+from .native_runtime import cv2
 import numpy as np
 
 from .sop_schema import ROI, Workpiece
@@ -12,7 +13,17 @@ from .motion_filter import AdaptiveMotionFilter
 from .tracking_budget import TrackingBudget
 
 
+def workpiece_key(workpiece: Workpiece | None) -> str:
+    """參考影像與框選範圍的識別碼；背景定位結果帶著它，介面才不會套用舊設定的位置。"""
+    if workpiece is None:
+        return ""
+    digest = hashlib.sha1(workpiece.reference_png.encode("ascii", "ignore"))
+    digest.update(repr([tuple(map(float, p)) for p in workpiece.points]).encode())
+    return digest.hexdigest()[:16]
+
+
 def decode_reference(workpiece: Workpiece) -> np.ndarray:
+    cv2.require()
     try:
         raw = base64.b64decode(workpiece.reference_png, validate=True)
         frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
@@ -113,6 +124,7 @@ class WorkpieceLocator:
         self._last_local_search = getattr(self, '_last_local_search', 0.)
 
     def locate(self, frame: np.ndarray, timestamp: float | None = None, *, other_ms=0., detections=()):
+        cv2.require()
         started = time.perf_counter()
         self._started = started
         self._other_ms = max(0., other_ms)

@@ -6,6 +6,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QDoubleSpin
 
 from ..camera_controls import AUTO_PROPERTIES, PROPERTIES
 from .video_widget import VideoWidget
+from .workbench_widgets import install_readability_guard
 
 
 class CameraDialog(QDialog):
@@ -14,7 +15,7 @@ class CameraDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("攝影機設定")
-        self.resize(960, 780)
+        self.resize(960, 690)
         self._loading = True
         self._waiting = True
         self._running = False
@@ -22,11 +23,13 @@ class CameraDialog(QDialog):
         self._submitted = {}
         self._last_values = {}
         self.rows, self.sliders = {}, {}
-        layout = QVBoxLayout(self)
+        content = QWidget()
+        layout = QVBoxLayout(content)
         layout.setSpacing(12)
         preview_row = QHBoxLayout()
         self.preview = VideoWidget()
-        self.preview.setFixedHeight(200)
+        self.preview.setMinimumHeight(140)
+        self.preview.setMaximumHeight(180)
         self.preview.clear_frame("等待攝影機畫面…")
         preview_row.addWidget(self.preview, 2)
         summary = QVBoxLayout()
@@ -89,7 +92,10 @@ class CameraDialog(QDialog):
         explanation.setWordWrap(True)
         format_layout.addWidget(explanation)
         format_layout.addStretch()
-        tabs.addTab(format_page, "解析度與 FPS")
+        format_scroll = QScrollArea()
+        format_scroll.setWidgetResizable(True)
+        format_scroll.setWidget(format_page)
+        tabs.addTab(format_scroll, "解析度與 FPS")
         image_page = QWidget()
         image_layout = QVBoxLayout(image_page)
         image_hint = QLabel("直接拖曳拉桿或輸入數值即可調整；曝光、白平衡與對焦可切換自動模式。")
@@ -110,6 +116,7 @@ class CameraDialog(QDialog):
         scroll.setWidget(image_page)
         tabs.addTab(scroll, "影像調整")
         self.state_label = QLabel("正在讀取攝影機設定…")
+        self.state_label.setWordWrap(True)
         layout.addWidget(self.state_label)
         self.feedback = QPlainTextEdit()
         self.feedback.setReadOnly(True)
@@ -128,15 +135,27 @@ class CameraDialog(QDialog):
         self.refresh.clicked.connect(lambda: self._request({}))
         self.discard.clicked.connect(self._discard)
         self.apply.clicked.connect(self._apply)
-        layout.addWidget(buttons)
+        outer = QVBoxLayout(self)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setWidget(content)
+        outer.addWidget(self.content_scroll, 1)
+        outer.addWidget(buttons)
         self._loading = False
         self._update_state()
+        install_readability_guard(self)
 
     @staticmethod
     def _headers(grid):
         for col, text in enumerate(("參數", "設備回報", "模式", "拉桿調整", "設定值")):
             grid.addWidget(QLabel(text), 0, col)
         grid.setColumnStretch(3, 1)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        available = self.parentWidget().size() if self.parentWidget() else self.screen().availableGeometry().size()
+        self.resize(min(self.width(), available.width() - 32),
+                    min(self.height(), available.height() - 32))
 
     def _add_control(self, key, grid, row):
         label, _ = PROPERTIES[key]

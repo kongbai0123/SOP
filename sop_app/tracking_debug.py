@@ -4,7 +4,7 @@ import os
 import time
 from pathlib import Path
 
-import cv2
+from .native_runtime import cv2
 
 
 class TrackingDebug:

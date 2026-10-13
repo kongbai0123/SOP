@@ -1,6 +1,7 @@
 """車把手快速設定：一次完成安裝位置命名、物件配對與流程建立。"""
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel,
                                QLineEdit, QVBoxLayout)
+from .workbench_widgets import install_readability_guard
 
 
 class QuickPositionDialog(QDialog):
@@ -9,6 +10,7 @@ class QuickPositionDialog(QDialog):
         self.setWindowTitle("新增車把手安裝位置")
         self.setMinimumWidth(430)
         title = QLabel("建立安裝位置並配對辨識物件")
+        title.setWordWrap(True)
         title.setStyleSheet("font-size:16px; font-weight:bold; color:#163f67")
         text = QLabel("儲存後會自動建立一道安裝流程；仍可在進階設定中調整信心度與持續時間。")
         text.setWordWrap(True)
@@ -36,6 +38,7 @@ class QuickPositionDialog(QDialog):
         self.name_edit.textChanged.connect(self._update_save)
         self.object_box.currentIndexChanged.connect(self._update_save)
         self._update_save()
+        install_readability_guard(self)
 
     def _update_save(self):
         self.save_button.setEnabled(bool(self.name_edit.text().strip()) and

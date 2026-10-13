@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-import cv2
+from .native_runtime import cv2
 import numpy as np
 
 from .detection import Detection
@@ -42,7 +42,8 @@ def _collect(classes, scores, labels, boxes, masks, width: int, height: int) -> 
                           int(np.clip(box[2], 0, width)), int(np.clip(box[3], 0, height)))
         if x2 <= x1 or y2 <= y1:
             continue
-        mask = masks[index] if masks is not None else None
+        # 只保留框內遮罩：整張畫面大小的遮罩每個物件要數 MB，會拖慢判定與畫面。
+        mask = np.ascontiguousarray(masks[index][y1:y2, x1:x2]) if masks is not None else None
         detections.append(Detection(classes[label], float(score), (x1, y1, x2, y2), mask))
     return detections
 

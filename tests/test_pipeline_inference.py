@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+from PySide6.QtCore import QCoreApplication
 
 from sop_app.inference_worker import InferenceWorkerClosed, InferenceWorkerError, ModelProgress
 from sop_app.pipeline import VideoPipeline
@@ -23,7 +24,7 @@ class PipelineInferenceTests(unittest.TestCase):
         self.status = []
         self.pipeline.model_loaded.connect(lambda info, device: self.loaded.append((info, device)))
         self.pipeline.error.connect(self.errors.append)
-        self.pipeline.model_progress.connect(self.progress.append)
+        self.pipeline.model_progress.connect(lambda stage, _path: self.progress.append(stage))
         self.pipeline.status.connect(self.status.append)
         self.read_info = self.enterContext(patch("sop_app.pipeline.read_model_info", return_value=self.info))
 
@@ -83,6 +84,11 @@ class PipelineInferenceTests(unittest.TestCase):
         with self.assertLogs("sop.launcher", level="ERROR") as captured:
             self.pipeline.load_model(self.path)
             self.pipeline._drain_commands(Mock())
+            self.pipeline._model_thread.join(3)
+            self.assertFalse(self.pipeline._model_thread.is_alive())
+            self.pipeline._drain_commands(Mock())
+            if QCoreApplication.instance():
+                QCoreApplication.processEvents()
         self.assertEqual(self.loaded, [(None, "")])
         self.assertIsNone(self.pipeline._detector)
         self.assertEqual(len(self.errors), 1)
@@ -124,6 +130,8 @@ class PipelineInferenceTests(unittest.TestCase):
         self.worker.load_model.side_effect = cancel
         with patch("sop_app.pipeline.logging.getLogger") as logger:
             self.pipeline._handle_command("model", self.path, Mock())
+            self.pipeline._model_thread.join(3)
+            self.assertFalse(self.pipeline._model_thread.is_alive())
         self.assertIsNone(self.pipeline._detector)
         self.assertEqual(self.loaded, [])
         self.assertEqual(self.errors, [])

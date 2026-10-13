@@ -11,7 +11,7 @@ from enum import Enum
 
 import numpy as np
 
-from .conditions import ConditionResult, evaluate_conditions
+from .conditions import ConditionResult, evaluate_condition_set
 from .detection import FrameResult
 from .sop_schema import SOPDefinition
 
@@ -32,6 +32,8 @@ class StepStatus(str, Enum):
 @dataclass
 class EngineEvent:
     kind: str      # cycle_started / step_started / step_completed / alarm / cycle_completed / cycle_aborted
+                   # position_lost / position_recovered；alarm 的 data["alarm"]：
+                   # violation / timeout / too_fast / sequence / skipped
     time: float
     cycle: int
     step_index: int = -1
@@ -93,10 +95,14 @@ class StepRuntime:
     manual: bool = False
     timeout_alarmed: bool = False
     violation_alarmed: bool = False
+    sequence_alarmed: bool = False
+    too_fast_alarmed: bool = False
+    skipped_alarmed: bool = False
 
     @property
     def has_alarm(self) -> bool:
-        return self.timeout_alarmed or self.violation_alarmed
+        return (self.timeout_alarmed or self.violation_alarmed or self.sequence_alarmed
+                or self.too_fast_alarmed or self.skipped_alarmed)
 
 
 @dataclass
@@ -136,6 +142,9 @@ class SOPEngine:
         self._position_blocked = False
         self._completion_invalid = False
         self._forbidden_invalid = False
+        # 跳步偵測：後續工序 index → [時間窗, 上一幀是否無法判斷]
+        self._sequence_windows: dict[int, list] = {}
+        self._sequence_alarmed: set[int] = set()
         self._position_pause_at: float | None = None
         self._last_valid_pose: np.ndarray | None = None
         self._last_valid_size: tuple[int, int] | None = None
@@ -178,11 +187,25 @@ class SOPEngine:
         """手動確認／跳過目前工序。有自動條件的工序被跳過時，本輪判定為 NG。"""
         if self.phase != Phase.RUNNING:
             return []
-        step = self.sop.steps[self.index]
-        if step.conditions:
-            self.cycle_ok = False
-            return self._finish_step(now, StepStatus.SKIPPED, manual=True)
+        if self.sop.steps[self.index].conditions:
+            return self.skip_step(now)
         return self._finish_step(now, StepStatus.DONE, manual=True)
+
+    def confirm_manual_step(self, now: float) -> list[EngineEvent]:
+        """只確認沒有自動條件的工序；有條件的工序不會因誤按而被跳過。"""
+        if self.phase != Phase.RUNNING or self.sop.steps[self.index].conditions:
+            return []
+        return self._finish_step(now, StepStatus.DONE, manual=True)
+
+    def skip_step(self, now: float) -> list[EngineEvent]:
+        """明確跳過目前工序：一律記為跳過、留下警報並判定本輪 NG。"""
+        if self.phase != Phase.RUNNING:
+            return []
+        self.cycle_ok = False
+        step = self.sop.steps[self.index]
+        self.runtimes[self.index].skipped_alarmed = True
+        events = [self._event("alarm", now, f"跳過：「{step.name}」由人工跳過", alarm="skipped")]
+        return events + self._finish_step(now, StepStatus.SKIPPED, manual=True)
 
     # ---- 每幀更新 -------------------------------------------------------------
     def update(self, frame: FrameResult) -> list[EngineEvent]:
@@ -191,8 +214,8 @@ class SOPEngine:
 
         if self.phase == Phase.RUNNING:
             step, runtime = self.sop.steps[self.index], self.runtimes[self.index]
-            met, self._results = evaluate_conditions(step.conditions, frame, self.rois, step.completion_mode)
-            invalid = any(r.error for r in self._results)
+            met, completion_blocked, self._results = evaluate_condition_set(step.conditions, frame, self.rois, step.completion_mode)
+            invalid = completion_blocked
             position_missing = (invalid and frame.detection_valid and frame.workpiece_transform is None and
                                 any(self.rois.get(c.roi) is not None and
                                     self.rois[c.roi].anchor == "workpiece" for c in step.conditions))
@@ -220,21 +243,22 @@ class SOPEngine:
                 self._last_valid_pose = pose.copy()
                 self._last_valid_size = (frame.width, frame.height)
 
+            forbidden_blocked = False
             if step.forbidden:
-                forbidden_met, self._forbidden_results = evaluate_conditions(step.forbidden, frame, self.rois)
-                invalid = any(r.error for r in self._forbidden_results)
-                if invalid or self._forbidden_invalid:
+                forbidden_met, forbidden_blocked, self._forbidden_results = evaluate_condition_set(
+                    step.forbidden, frame, self.rois, step.forbidden_mode)
+                if forbidden_blocked or self._forbidden_invalid:
                     self._forbidden_window.reset(now)
-                self._forbidden_invalid = invalid
+                self._forbidden_invalid = forbidden_blocked
                 self._forbidden_window.push(now, forbidden_met)
                 if not runtime.violation_alarmed and self._forbidden_window.satisfied(now):
                     runtime.violation_alarmed = True
                     self.cycle_ok = False
-                    detail = "、".join(r.condition.describe() for r in self._forbidden_results)
+                    detail = "、".join(r.condition.describe() for r in self._forbidden_results if r.met)
                     events.append(self._event("alarm", now, f"違規：進行「{step.name}」時偵測到 {detail}",
                                               alarm="violation"))
 
-            blocked = any(r.error for r in self._results + self._forbidden_results)
+            blocked = completion_blocked or forbidden_blocked
             if blocked != self._position_blocked:
                 self._position_blocked = blocked
                 events.append(self._event("position_lost" if blocked else "position_recovered", now,
@@ -248,13 +272,21 @@ class SOPEngine:
                                           alarm="timeout"))
 
             if step.conditions and not invalid and self._window.satisfied(now):
+                duration = now - runtime.started_at
+                if step.min_duration_sec > 0 and duration < step.min_duration_sec:
+                    runtime.too_fast_alarmed = True
+                    self.cycle_ok = False
+                    events.append(self._event(
+                        "alarm", now, f"工時過短：「{step.name}」{duration:.1f} 秒完成，"
+                                      f"低於最短 {step.min_duration_sec:g} 秒", alarm="too_fast"))
                 events += self._finish_step(now, StepStatus.DONE)
+            elif self.sop.cycle.detect_sequence:
+                events += self._check_sequence(frame, now)
 
         elif self.phase == Phase.CYCLE_DONE:
             cycle = self.sop.cycle
             if cycle.reset_conditions:
-                met, self._results = evaluate_conditions(cycle.reset_conditions, frame, self.rois)
-                invalid = any(r.error for r in self._results)
+                met, invalid, self._results = evaluate_condition_set(cycle.reset_conditions, frame, self.rois)
                 if invalid or self._completion_invalid:
                     self._window.reset(now)
                 self._completion_invalid = invalid
@@ -282,6 +314,37 @@ class SOPEngine:
         name = self.sop.steps[index].name if 0 <= index < len(self.sop.steps) else ""
         return EngineEvent(kind, now, self.cycle, index, name, message, data)
 
+    def _check_sequence(self, frame: FrameResult, now: float) -> list[EngineEvent]:
+        """後續工序的完成條件提前成立（同樣經過時間窗）→ 目前工序疑似被跳過。
+
+        只檢查含「出現」條件的後續工序：只有「消失」條件的工序一開始就可能成立，不能據此判斷跳步。
+        """
+        events = []
+        runtime = self.runtimes[self.index]
+        for later in range(self.index + 1, len(self.sop.steps)):
+            step = self.sop.steps[later]
+            if later in self._sequence_alarmed or not any(c.type == "appear" for c in step.conditions):
+                continue
+            slot = self._sequence_windows.get(later)
+            if slot is None:
+                slot = self._sequence_windows[later] = [SlidingWindow(), False]
+                slot[0].reset(now, step.hold_sec, step.ratio)
+            window, was_blocked = slot
+            met, blocked, _results = evaluate_condition_set(step.conditions, frame, self.rois, step.completion_mode)
+            if blocked or was_blocked:
+                window.reset(now)
+            slot[1] = blocked
+            window.push(now, met)
+            if window.satisfied(now):
+                self._sequence_alarmed.add(later)
+                runtime.sequence_alarmed = True
+                self.cycle_ok = False
+                events.append(self._event(
+                    "alarm", now, f"順序錯誤：進行「{self.sop.steps[self.index].name}」時，"
+                                  f"後續工序 {later + 1}「{step.name}」的條件已成立",
+                    alarm="sequence", later_index=later))
+        return events
+
     def _begin_cycle(self, now: float) -> list[EngineEvent]:
         self._position_blocked = False
         self._position_pause_at = None
@@ -293,6 +356,7 @@ class SOPEngine:
         self.cycle_ok = True
         self.cycle_started_at, self.cycle_ended_at = now, None
         self.runtimes = [StepRuntime() for _ in self.sop.steps]
+        self._sequence_alarmed.clear()
         return [self._event("cycle_started", now, f"第 {self.cycle} 輪開始", index=-1)] + self._activate(0, now)
 
     def _activate(self, index: int, now: float) -> list[EngineEvent]:
@@ -305,7 +369,10 @@ class SOPEngine:
         self.runtimes[index].status = StepStatus.ACTIVE
         self.runtimes[index].started_at = now
         self._window.reset(now, step.hold_sec, step.ratio)
-        self._forbidden_window.reset(now, step.hold_sec, step.ratio)
+        self._forbidden_window.reset(
+            now, step.hold_sec if step.forbidden_hold_sec is None else step.forbidden_hold_sec,
+            step.ratio if step.forbidden_ratio is None else step.forbidden_ratio)
+        self._sequence_windows.clear()   # 每道工序重新觀察後續工序，不沿用上一道的累積
         self._results, self._forbidden_results = [], []
         return [self._event("step_started", now, f"開始：{step.name}")]
 
@@ -322,7 +389,7 @@ class SOPEngine:
         self.phase = Phase.CYCLE_DONE
         self.cycle_ended_at = now
         cycle = self.sop.cycle
-        self._window.reset(now, cycle.reset_hold_sec, 0.8)
+        self._window.reset(now, cycle.reset_hold_sec, cycle.reset_ratio)
         self._results, self._forbidden_results = [], []
         result = "OK" if self.cycle_ok else "NG"
         return events + [self._event("cycle_completed", now, f"第 {self.cycle} 輪完成：{result}", index=-1,

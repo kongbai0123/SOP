@@ -6,7 +6,7 @@ import time
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication, QLabel, QProgressBar, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QLayout, QProgressBar, QVBoxLayout, QWidget
 
 from ..startup import read_progress_messages
 
@@ -15,12 +15,14 @@ class StartupWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SOP 工序監控 · 啟動中")
-        self.setFixedSize(520, 270)
+        self.resize(520, 270)
+        self.setMinimumSize(520, 270)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
         self.setStyleSheet("QWidget { background: #f6f8fb; color: #172b42; }"
                            "QProgressBar { border: 0; border-radius: 5px; background: #dde5ee; height: 10px; }"
                            "QProgressBar::chunk { background: #2879d0; border-radius: 5px; }")
         layout = QVBoxLayout(self)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
         layout.setContentsMargins(30, 25, 30, 25)
         title = QLabel("SOP 工序監控")
         title.setFont(QFont("Microsoft JhengHei UI", 20, QFont.Weight.Bold))
@@ -39,6 +41,7 @@ class StartupWindow(QWidget):
         self.elapsed = QLabel("已等待 0.0 秒 · 階段進度")
         layout.addWidget(self.elapsed)
         note = QLabel("主介面開啟後，AI 模型會繼續在背景載入。")
+        note.setWordWrap(True)
         note.setStyleSheet("color: #52677c;")
         layout.addWidget(note)
         self._started = time.monotonic()

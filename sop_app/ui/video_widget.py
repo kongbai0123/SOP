@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Iterable
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPointF, QRect, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
@@ -112,7 +112,9 @@ class VideoWidget(QWidget):
         if self._image is None:
             painter.setPen(QColor("#8a949e"))
             painter.setFont(QFont(self.font().family(), 13))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._placeholder)
+            painter.drawText(self.rect().adjusted(12, 12, -12, -12),
+                             Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere,
+                             self._placeholder)
             return
 
         rect = self._image_rect()
@@ -149,17 +151,20 @@ class VideoWidget(QWidget):
 
         if self._banner:
             banner_font = QFont(self.font().family(), 16, QFont.Weight.Bold)
+            bounds = QRectF(0, 0, rect.width(), self.height()).adjusted(12, 8, -12, -8)
+            banner_font, measured = self._fit_text(painter, self._banner, banner_font, bounds)
             painter.setFont(banner_font)
-            height = painter.fontMetrics().height() + 16
+            height = measured.height() + 16
             # 上方有黑邊時把橫幅放在黑邊裡，不遮住畫面內容
-            top = rect.y() - height if rect.y() >= height else rect.y()
+            top = rect.y() - height if rect.y() >= height else min(rect.y(), self.height() - height)
             band = QRectF(rect.x(), top, rect.width(), height)
             color = QColor(self._banner_color)
             color.setAlpha(220)
             painter.fillRect(band, color)
             painter.setPen(QColor("white"))
             painter.drawText(band.adjusted(12, 0, -12, 0),
-                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._banner)
+                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft |
+                             Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere, self._banner)
 
         if self._draw_mode:
             painter.setFont(label_font)
@@ -183,16 +188,33 @@ class VideoWidget(QWidget):
         painter.restore()
 
     @staticmethod
+    def _fit_text(painter, text, font, bounds):
+        font = QFont(font)
+        flags = Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere
+        while True:
+            painter.setFont(font)
+            measured = painter.fontMetrics().boundingRect(
+                QRect(0, 0, max(1, int(bounds.width())), 100000), flags, text)
+            if measured.height() <= bounds.height() or font.pointSizeF() <= 7:
+                return font, measured
+            font.setPointSizeF(max(7, font.pointSizeF() - .5))
+
+    @staticmethod
     def _draw_tag(painter: QPainter, origin: QPointF, text: str, color: QColor, font: QFont):
+        bounds = QRectF(painter.viewport()).adjusted(6, 6, -6, -6)
+        font, measured = VideoWidget._fit_text(painter, text, font, bounds.adjusted(6, 4, -6, -4))
         painter.setFont(font)
-        metrics = painter.fontMetrics()
-        box = QRectF(origin, QPointF(origin.x() + metrics.horizontalAdvance(text) + 10,
-                                     origin.y() + metrics.height() + 4))
+        width, height = min(bounds.width(), measured.width() + 12), measured.height() + 8
+        x = max(bounds.left(), min(origin.x(), bounds.right() - width))
+        y = max(bounds.top(), min(origin.y(), bounds.bottom() - height))
+        box = QRectF(x, y, width, height)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(0, 0, 0, 170))
         painter.drawRoundedRect(box, 3, 3)
         painter.setPen(color)
-        painter.drawText(box, Qt.AlignmentFlag.AlignCenter, text)
+        painter.drawText(box.adjusted(6, 4, -6, -4), Qt.AlignmentFlag.AlignLeft |
+                         Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere, text)
+        return box
 
     # ---- 框選 ------------------------------------------------------------------
     def mousePressEvent(self, event):
