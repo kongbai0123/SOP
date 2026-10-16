@@ -5,14 +5,17 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from PySide6.QtCore import QRect, Qt
 from PySide6.QtWidgets import QGroupBox, QPushButton, QStyle, QStyleOptionButton, QStyleOptionComboBox, QStyleOptionFrame, QStyleOptionGroupBox, QStyleOptionSpinBox
 
 import test_workbench as fixtures
 from sop_app.sop_schema import Condition, Step
+from sop_app.ui.main_window import MainWindow
 
 
 class UIComfortTests(unittest.TestCase):
@@ -25,9 +28,9 @@ class UIComfortTests(unittest.TestCase):
 
     def test_control_text_area_is_taller_than_font_line(self):
         editor = self.make_editor()
-        controls = [(editor.step_name_edit, "line"), (editor.completion_mode, "combo"),
+        controls = [(editor.step_editors[0].step_name_edit, "line"), (editor.step_editors[0].completion_mode, "combo"),
                     (editor.validation_mode, "combo")]
-        controls += [(editor.condition_table.field_widget(0, field), "spin" if field == "min_count" else "combo")
+        controls += [(editor.step_editors[0].condition_table.field_widget(0, field), "spin" if field == "min_count" else "combo")
                      for field in ("label", "type", "roi", "min_count")]
         for widget, kind in controls:
             if kind == "line":
@@ -65,8 +68,9 @@ class UIComfortTests(unittest.TestCase):
 
     def test_step_action_text_and_vector_icons_fit_completely(self):
         editor = self.make_editor()
-        buttons = editor.step_actions.findChildren(QPushButton)
-        self.assertEqual([button.text() for button in buttons], ["新增", "複製", "刪除", "上移", "下移"])
+        card = editor.step_editors[0]
+        buttons = [card.up_button, card.down_button, card.duplicate_button, card.delete_button, card.trial_button]
+        self.assertEqual(len(buttons), 5)
         for button in buttons:
             option = QStyleOptionButton()
             option.initFrom(button)
@@ -93,67 +97,83 @@ class UIComfortTests(unittest.TestCase):
         if artifact:
             directory = Path(artifact)
             directory.mkdir(parents=True, exist_ok=True)
-            self.assertTrue(editor.step_actions.grab().save(str(directory / "step-actions-fixed.png")))
+            self.assertTrue(editor.step_editors[0].grab().save(str(directory / "step-actions-fixed.png")))
 
-    def test_long_names_wrap_and_remain_available_in_full(self):
+    def test_long_names_remain_editable_and_summaries_wrap_in_one_page(self):
         name = "左側主要工件安裝與位置確認作業" * 2
         definition = fixtures.sop(Step(name, conditions=[Condition(label="grip")]))
         definition.name = "工序設定與試跑驗證介面字體完整顯示測試" * 2
         editor = self.make_editor(definition)
         self.app.processEvents()
-        self.assertTrue(editor.workspace_title.wordWrap())
-        self.assertTrue(editor.context_title.wordWrap())
-        self.assertTrue(editor.step_list.wordWrap())
-        self.assertIn(name, editor.step_list.item(0).toolTip())
-        for label in (editor.workspace_title, editor.context_title):
-            self.assertGreaterEqual(label.height(), label.heightForWidth(label.width()), label.text())
-        item = editor.step_list.item(0)
-        rect = editor.step_list.visualItemRect(item)
-        expected = editor.step_list.fontMetrics().boundingRect(
-            QRect(0, 0, rect.width() - 20, 10000), Qt.TextFlag.TextWordWrap, item.text()).height()
-        self.assertGreaterEqual(rect.height(), expected, (rect, expected))
+        self.assertEqual(editor.name_edit.text(), definition.name)
+        card = editor.step_editors[0]
+        self.assertEqual(card.step_name_edit.text(), name)
+        self.assertTrue(card.summary_label.wordWrap())
+        self.assertGreaterEqual(card.summary_label.height(), card.summary_label.heightForWidth(card.summary_label.width()))
+        self.assertEqual(editor.page_scroll.horizontalScrollBar().maximum(), 0)
 
-    def test_routine_hints_are_quiet_but_action_feedback_is_visible(self):
+    def test_action_feedback_is_directly_visible(self):
         editor = self.make_editor()
         editor._return_live()
-        self.assertFalse(editor.guide_label.isVisible())
         editor.guide_label.setText("找不到作業區域，請先建立或重新選擇。")
         self.assertTrue(editor.guide_label.isVisible())
-        self.assertFalse(editor.mode_hint.isVisible())
+        self.assertTrue(editor.guide_label.wordWrap())
 
-    def test_description_can_expand_without_changing_its_value(self):
+    def test_description_is_always_visible_and_edits_saved(self):
         editor = self.make_editor(fixtures.sop(Step("說明", instruction="請將工件放入指定位置。")))
-        self.assertFalse(editor.instruction_edit.isVisible())
-        editor.description_section.set_expanded(True)
-        self.app.processEvents()
-        self.assertTrue(editor.instruction_edit.isVisible())
-        self.assertEqual(editor.instruction_edit.toPlainText(), "請將工件放入指定位置。")
-        editor.description_section.set_expanded(False)
-        self.assertEqual(editor.sop.steps[0].instruction, "請將工件放入指定位置。")
+        instruction = editor.step_editors[0].instruction_edit
+        self.assertTrue(instruction.isVisible())
+        self.assertEqual(instruction.toPlainText(), "請將工件放入指定位置。")
+        instruction.setPlainText("請確認零件已安裝。")
+        self.assertEqual(editor.sop.steps[0].instruction, "請確認零件已安裝。")
 
-    def test_large_and_short_windows_use_appropriate_spacing(self):
-        editor = self.make_editor()
-        editor.resize(1300, 640)
-        self.app.processEvents()
-        self.assertTrue(editor._comfort_compact)
-        compact = editor.center_panel.layout().spacing()
-        editor.resize(1500, 900)
-        self.app.processEvents()
-        self.assertFalse(editor._comfort_compact)
-        self.assertGreater(editor.center_panel.layout().spacing(), compact)
+    def test_large_and_short_windows_never_scroll_sideways(self):
+        editor = self.make_editor(fixtures.sop(*[Step(f"工序 {index}", conditions=[Condition(label="grip")])
+                                                 for index in range(1, 5)]))
+        editor.expand_all_button.click()
+        for width, height in ((1300, 640), (1500, 900), (1000, 600)):
+            editor.resize(width, height)
+            self.app.processEvents()
+            self.assertEqual(editor.page_scroll.horizontalScrollBar().maximum(), 0)
+            self.assertGreater(editor.page_scroll.verticalScrollBar().maximum(), 0)
+            self.assertTrue(editor.video.isVisible())
+            line = editor.step_editors[0].step_name_edit.height()
+            for card in editor.step_editors:
+                self.assertLessEqual(abs(card.instruction_edit.height() - line), 8)
 
-    def test_document_badge_reflects_unsaved_changes(self):
+    def test_description_grows_with_its_text_instead_of_hiding_lines(self):
         editor = self.make_editor()
-        editor.set_document_state(False, saved=True)
-        self.assertIn("已儲存", editor.document_state.text())
-        editor.condition_table.field_widget(0, "min_count").setValue(2)
-        self.assertIn("未儲存變更", editor.document_state.text())
+        instruction = editor.step_editors[0].instruction_edit
+        single = instruction.height()
+        instruction.setPlainText("\n".join(("第一行", "第二行", "第三行")))
+        self.app.processEvents()
+        self.assertGreater(instruction.height(), single + 2 * instruction.fontMetrics().lineSpacing() - 4)
+        self.assertEqual(instruction.verticalScrollBar().maximum(), 0)
+
+    def test_header_has_no_name_badge_and_title_shows_unsaved_changes(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch("sop_app.ui.main_window.RECORDS_DIR", Path(folder)), \
+             patch.object(MainWindow, "_load_settings", return_value={}), \
+             patch.object(MainWindow, "_save_settings"), \
+             patch("sop_app.ui.main_window.VideoPipeline.start"), \
+             patch("sop_app.ui.main_window.cv2.require", return_value=Mock()):
+            window = MainWindow(defer_initial_sop=True)
+            self.addCleanup(window.close)
+            window._apply_sop(fixtures.sop(), Path(folder) / "saved.json")
+            self.assertFalse(hasattr(window, "header_title"))
+            self.assertEqual(window.windowTitle(), "SOP 工序監控 — 試跑測試（saved.json）")
+            window.editor.step_editors[0].condition_table.field_widget(0, "min_count").setValue(2)
+            self.assertTrue(window.windowTitle().endswith(" *"))
+            window.editor.name_edit.setText("新名稱")
+            window.editor.name_edit.textEdited.emit("新名稱")
+            self.assertIn("新名稱", window.windowTitle())
+            window.dirty = False
 
     def test_full_class_names_remain_accessible_when_combo_is_narrow(self):
         name = "主要工件安裝位置辨識模型類別名稱完整檢查"
         editor = self.make_editor(fixtures.sop(Step(conditions=[Condition(label=name)])))
         editor.set_classes([name, "工具"])
-        field = editor.condition_table.field_widget(0, "label")
+        field = editor.step_editors[0].condition_table.field_widget(0, "label")
         self.assertEqual(field.currentData(), name)
         self.assertEqual(field.toolTip(), name)
         field.setCurrentIndex(field.findData("工具"))
@@ -184,14 +204,14 @@ with tempfile.TemporaryDirectory() as directory, \
     editor=window.editor;editor.set_classes(['grip']);window.tabs.setCurrentWidget(editor)
     window.resize(1366,768);window.show();app.processEvents()
     assert window.devicePixelRatioF()>1
-    for widget in (editor.completion_mode,editor.validation_mode,editor.condition_table.field_widget(0,'label')):
+    for widget in (editor.step_editors[0].completion_mode,editor.validation_mode,editor.step_editors[0].condition_table.field_widget(0,'label')):
         option=QStyleOptionComboBox();option.initFrom(widget)
         rect=widget.style().subControlRect(QStyle.ComplexControl.CC_ComboBox,option,QStyle.SubControl.SC_ComboBoxEditField,widget)
         assert rect.height()>=widget.fontMetrics().height(),(rect,widget.fontMetrics().height())
-    widget=editor.step_name_edit;option=QStyleOptionFrame();option.initFrom(widget)
+    widget=editor.step_editors[0].step_name_edit;option=QStyleOptionFrame();option.initFrom(widget)
     rect=widget.style().subElementRect(QStyle.SubElement.SE_LineEditContents,option,widget)
     assert rect.height()>=widget.fontMetrics().height()
-    for button in editor.step_actions.findChildren(QPushButton):
+    for button in (editor.step_editors[0].up_button,editor.step_editors[0].down_button,editor.step_editors[0].duplicate_button,editor.step_editors[0].delete_button,editor.step_editors[0].trial_button):
         option=QStyleOptionButton();option.initFrom(button)
         rect=button.style().subElementRect(QStyle.SubElement.SE_PushButtonContents,option,button)
         required=button.fontMetrics().horizontalAdvance(button.text())

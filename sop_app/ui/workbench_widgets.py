@@ -1,66 +1,44 @@
-"""Small native widgets shared by the image-workbench editor."""
+"""Shared native widgets and the compact industrial style sheet."""
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QAbstractButton, QAbstractSpinBox, QComboBox, QLabel, QPushButton,
-                              QScrollArea, QSizePolicy, QTabWidget, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtCore import QEvent, QObject, QTimer
+from PySide6.QtWidgets import (QAbstractButton, QAbstractSpinBox, QApplication, QComboBox, QLabel, QStyle,
+                              QStyleOptionComboBox, QScrollArea, QStackedWidget, QWidget)
 
 
-class ActionHint(QLabel):
-    """Show actionable feedback without permanently repeating onboarding text."""
-    def __init__(self, text="", parent=None):
-        super().__init__(parent)
-        self.setWordWrap(True)
-        self.setObjectName("guideLabel")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
-        self.setText(text)
-
-    def setText(self, text):
-        super().setText(text)
-        routine = text.startswith(("即時畫面：設定", "按「開始引導設定」"))
-        self.setVisible(bool(text) and not routine)
+def _invalidate_tree(layout):
+    """Drop cached sizes of a widget's layout, including nested sub-layouts."""
+    for index in range(layout.count()):
+        item = layout.itemAt(index)
+        if item.layout() is not None:
+            _invalidate_tree(item.layout())
+        item.invalidate()
+    layout.invalidate()
 
 
-class CollapsibleSection(QWidget):
-    expanded_changed = Signal(bool)
-
-    def __init__(self, title: str, content: QWidget, expanded=False, parent=None):
-        super().__init__(parent)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
-        self.content = content
-        self.toggle = QToolButton()
-        self.toggle.setText(title)
-        self.toggle.setCheckable(True)
-        self.toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.toggle.setObjectName("sectionToggle")
-        self.toggle.toggled.connect(self.set_expanded)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
-        layout.addWidget(self.toggle)
-        layout.addWidget(content)
-        self.set_expanded(expanded)
-
-    def set_expanded(self, expanded: bool):
-        self.toggle.blockSignals(True)
-        self.toggle.setChecked(expanded)
-        self.toggle.blockSignals(False)
-        self.toggle.setArrowType(Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow)
-        self.content.setVisible(expanded)
-        self.expanded_changed.emit(expanded)
-
-
-def apply_action_icons(root: QWidget, dark: bool):
-    """Render action symbols independently of the text font's glyph bounds."""
-    variant = "dark" if dark else "light"
-    for button in root.findChildren(QPushButton):
-        name = button.property("actionIcon")
-        if name:
-            button.setIcon(QIcon(str(Path(__file__).parent / "assets" / f"{name}-{variant}.svg")))
-            button.setIconSize(QSize(12, 12))
+def relayout_ancestors(widgets, top):
+    """Settle the parents of resized widgets now, bottom-up, instead of one
+    event-loop pass per nesting level (which shows a squeezed frame meanwhile)."""
+    chains, seen = [], set()
+    for widget in widgets:
+        chain, current = [], widget.parentWidget()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            chain.append(current)
+            if current is top:
+                break
+            current = current.parentWidget()
+        chains.append(chain)
+    for chain in chains:
+        for ancestor in chain:
+            if ancestor.layout() is not None:
+                _invalidate_tree(ancestor.layout())
+                ancestor.layout().activate()
+            elif isinstance(ancestor, QScrollArea):
+                QApplication.sendEvent(ancestor, QEvent(QEvent.Type.LayoutRequest))
+            ancestor.updateGeometry()
 
 
 class ReadabilityGuard(QObject):
@@ -89,6 +67,7 @@ class ReadabilityGuard(QObject):
         return False
 
     def sync(self):
+        changed = []
         for widget in self.root.findChildren(QWidget):
             if widget.window() != self.root.window():
                 continue
@@ -101,6 +80,7 @@ class ReadabilityGuard(QObject):
                 height = max(widget.property("wrapBaseMinimum"), widget.heightForWidth(widget.width()))
                 if widget.minimumHeight() != height:
                     widget.setMinimumHeight(height)
+                    changed.append(widget)
                 continue
             if not isinstance(widget, (QAbstractButton, QComboBox, QAbstractSpinBox)):
                 continue
@@ -114,16 +94,27 @@ class ReadabilityGuard(QObject):
             widget.ensurePolished()
             hint = widget.sizeHint()
             width = hint.width()
-            if isinstance(widget, QComboBox):
-                # Some cards deliberately use AdjustToMinimumContentsLength.
-                # Still reserve enough width for the selected value + arrow.
-                width = max(width, widget.fontMetrics().horizontalAdvance(widget.currentText()) + 42)
+            if isinstance(widget, QComboBox) and not widget.property("allowValueElision"):
+                # Reserve the selected text plus the style's real padding and
+                # arrow area, measured at a probe width rather than assumed.
+                option = QStyleOptionComboBox()
+                widget.initStyleOption(option)
+                option.rect.setWidth(400)
+                field = widget.style().subControlRect(QStyle.ComplexControl.CC_ComboBox, option,
+                                                      QStyle.SubControl.SC_ComboBoxEditField, widget)
+                chrome = 400 - field.width() if 0 < field.width() < 400 else 52
+                width = max(width, widget.fontMetrics().horizontalAdvance(widget.currentText()) + chrome + 2)
+            before = (widget.minimumWidth(), widget.minimumHeight(), widget.maximumHeight())
             if widget.minimumWidth() != width:
                 widget.setMinimumWidth(width)
             if widget.maximumHeight() < hint.height():
                 widget.setMaximumHeight(hint.height())
             if widget.minimumHeight() < hint.height():
                 widget.setMinimumHeight(hint.height())
+            if before != (widget.minimumWidth(), widget.minimumHeight(), widget.maximumHeight()):
+                changed.append(widget)
+        if changed:
+            relayout_ancestors(changed, self.root)
 
 
 def install_readability_guard(root):
@@ -132,18 +123,32 @@ def install_readability_guard(root):
     return root._readability_guard
 
 
-class ScrollablePageTabs(QTabWidget):
-    """Keep the page API while allowing a high-DPI/small screen to scroll.
+class PageStack(QStackedWidget):
+    """Main pages without a tab strip; navigation lives in the window header.
 
-    A hidden settings page must not force the whole window beyond the display.
-    Ordinary desktop sizes have no extra scroll bars.
+    Pages that do not own a scroll are wrapped so a small or high-DPI screen can
+    still reach every control without forcing the window beyond the display.
     """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._labels: list[str] = []
+
     def addTab(self, page, label):
+        self._labels.append(label)
+        if page.property("ownsPageScroll"):
+            return self.addWidget(page)
         scroll = QScrollArea()
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         scroll.setWidgetResizable(True)
         scroll.setWidget(page)
-        return super().addTab(scroll, label)
+        return self.addWidget(scroll)
+
+    def tabText(self, index):
+        return self._labels[index]
+
+    def page(self, index):
+        widget = super().widget(index)
+        return widget.widget() if isinstance(widget, QScrollArea) else widget
 
     def currentWidget(self):
         widget = super().currentWidget()
@@ -152,61 +157,79 @@ class ScrollablePageTabs(QTabWidget):
     def setCurrentWidget(self, page):
         for index in range(self.count()):
             container = super().widget(index)
-            if isinstance(container, QScrollArea) and container.widget() is page:
-                return super().setCurrentWidget(container)
+            if container is page or (isinstance(container, QScrollArea) and container.widget() is page):
+                return super().setCurrentIndex(index)
         return super().setCurrentWidget(page)
 
 
 def workbench_palette(dark: bool) -> dict:
-    return (dict(bg="#171e28", panel="#232d3b", fg="#e2eaf5", muted="#a8b9ce", border="#3b4a60",
-                 blue="#91bfff", soft="#293f5d", button_text="#122238", warning="#ffd099", danger="#ff9f9f") if dark else
-            dict(bg="#f4f7fb", panel="#ffffff", fg="#263549", muted="#627287", border="#dce4ee",
-                 blue="#155fbc", soft="#edf4ff", button_text="#ffffff", warning="#885519", danger="#b42332"))
+    """Neutral surfaces; saturated colors are reserved for state and the main action."""
+    return (dict(variant="dark", bg="#1b2129", panel="#232b35", head="#2b3440", fg="#e3e9f0", muted="#a3b2c2",
+                 border="#3b4857", blue="#8db8f0", soft="#2a3b50", button_text="#0f1f33",
+                 ok="#8fd19e", warning="#f0c27a", danger="#ff9c94") if dark else
+            dict(variant="light", bg="#eceff3", panel="#ffffff", head="#e2e7ed", fg="#1d2733", muted="#56657a",
+                 border="#c3ccd6", blue="#1b5fad", soft="#e3edf8", button_text="#ffffff",
+                 ok="#1d7a35", warning="#8a5300", danger="#b3261e"))
 
 
 def _control_styles(colors):
-    variant = "dark" if colors["bg"] == "#171e28" else "light"
     icons = Path(__file__).parent / "assets"
-    colors = {**colors, "down": (icons / f"chevron-down-{variant}.svg").as_posix(),
-              "up": (icons / f"chevron-up-{variant}.svg").as_posix()}
+    colors = {**colors, "down": (icons / f"chevron-down-{colors['variant']}.svg").as_posix(),
+              "up": (icons / f"chevron-up-{colors['variant']}.svg").as_posix()}
     return """
-        QPushButton { font-size:13px; min-height:18px; padding:6px 10px; border:1px solid %(border)s;
-                      border-radius:6px; background:%(panel)s; color:%(fg)s; }
-        QPushButton:hover { border-color:%(blue)s; background:%(soft)s; }
-        QPushButton:checked { background:%(soft)s; color:%(blue)s; border-color:%(blue)s; }
-        QPushButton#primaryButton { background:%(blue)s; color:%(button_text)s; border-color:%(blue)s; }
-        QPushButton#primaryButton:disabled { background:%(soft)s; color:%(muted)s; border-color:%(border)s; }
-        QPushButton:disabled { color:%(muted)s; }
-        QPushButton#dangerButton { border-color:transparent; color:%(muted)s; padding:4px 7px; }
-        QPushButton#dangerButton:hover { color:%(danger)s; border-color:%(danger)s; }
-        QLineEdit, QComboBox, QAbstractSpinBox { font-size:14px; min-height:20px;
-              background:%(panel)s; color:%(fg)s; border:1px solid %(border)s; border-radius:5px; padding:5px 8px; }
-        QComboBox { padding-right:28px; }
-        QComboBox::drop-down { subcontrol-origin:padding; subcontrol-position:top right; width:24px; border:0; }
-        QComboBox::down-arrow { image:url("%(down)s"); width:12px; height:12px; }
+        QPushButton { font-size:13px; min-height:18px; padding:3px 9px; border:1px solid %(border)s;
+                      border-radius:2px; background:%(panel)s; color:%(fg)s; }
+        QPushButton:hover { border-color:%(blue)s; }
+        QPushButton:pressed, QPushButton:checked { background:%(soft)s; color:%(blue)s; border-color:%(blue)s; }
+        QPushButton#primaryButton { background:%(blue)s; color:%(button_text)s; border-color:%(blue)s; font-weight:600; }
+        QPushButton#primaryButton:disabled { background:%(head)s; color:%(muted)s; border-color:%(border)s; }
+        QPushButton:disabled { color:%(muted)s; background:%(bg)s; }
+        QPushButton#dangerButton { color:%(danger)s; }
+        QPushButton#dangerButton:hover { border-color:%(danger)s; }
+        QPushButton#dangerButton:disabled { color:%(muted)s; }
+        QLineEdit, QComboBox, QAbstractSpinBox { font-size:13px; min-height:18px;
+              background:%(panel)s; color:%(fg)s; border:1px solid %(border)s; border-radius:2px; padding:3px 6px; }
+        QComboBox { padding-right:24px; }
+        QComboBox::drop-down { subcontrol-origin:padding; subcontrol-position:top right; width:20px; border:0; }
+        QComboBox::down-arrow { image:url("%(down)s"); width:10px; height:10px; }
         QComboBox QAbstractItemView { background:%(panel)s; color:%(fg)s; selection-background-color:%(soft)s;
                                     selection-color:%(blue)s; border:1px solid %(border)s; }
-        QAbstractSpinBox { padding-right:26px; }
-        QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-origin:border; subcontrol-position:top right; width:20px; border:0; }
-        QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-origin:border; subcontrol-position:bottom right; width:20px; border:0; }
-        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image:url("%(up)s"); width:10px; height:10px; }
-        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image:url("%(down)s"); width:10px; height:10px; }
-        QDateEdit::drop-down { width:24px; border:0; }
-        QDateEdit::down-arrow { image:url("%(down)s"); width:12px; height:12px; }
+        QAbstractSpinBox { padding-right:20px; }
+        QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-origin:border; subcontrol-position:top right; width:18px; border:0; }
+        QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-origin:border; subcontrol-position:bottom right; width:18px; border:0; }
+        QSpinBox::up-arrow, QDoubleSpinBox::up-arrow { image:url("%(up)s"); width:9px; height:9px; }
+        QSpinBox::down-arrow, QDoubleSpinBox::down-arrow { image:url("%(down)s"); width:9px; height:9px; }
+        QDateEdit::drop-down { width:20px; border:0; }
+        QDateEdit::down-arrow { image:url("%(down)s"); width:10px; height:10px; }
         QPlainTextEdit { font-size:13px; background:%(panel)s; color:%(fg)s;
-                        border:1px solid %(border)s; border-radius:5px; padding:6px; }
+                        border:1px solid %(border)s; border-radius:2px; padding:3px 4px; }
         QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus {
               border-color:%(blue)s; }
-        QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled { color:%(muted)s; }
-        QListWidget { background:%(panel)s; color:%(fg)s; border:1px solid %(border)s; border-radius:6px; }
-        QListWidget::item { padding:10px 8px; margin:2px; border-radius:4px; }
+        QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QPlainTextEdit:disabled {
+              color:%(muted)s; background:%(bg)s; }
+        QCheckBox { font-size:13px; spacing:5px; }
+        QListWidget { background:%(panel)s; color:%(fg)s; border:1px solid %(border)s; border-radius:0; }
+        QListWidget::item { padding:5px 6px; }
         QListWidget::item:selected { background:%(soft)s; color:%(blue)s; }
         QScrollArea { border:0; background:transparent; }
         QScrollBar:vertical { background:%(bg)s; width:10px; margin:0; }
-        QScrollBar::handle:vertical { background:%(border)s; min-height:30px; border-radius:5px; }
+        QScrollBar::handle:vertical { background:%(border)s; min-height:30px; }
         QScrollBar::handle:vertical:hover { background:%(muted)s; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
         QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background:none; }
+        QScrollBar:horizontal { background:%(bg)s; height:10px; margin:0; }
+        QScrollBar::handle:horizontal { background:%(border)s; min-width:30px; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width:0; }
+        QLabel#sectionTitle { font-size:13px; font-weight:600; color:%(fg)s; }
+        QLabel#mutedLabel, QLabel#fieldLabel { color:%(muted)s; font-size:12px; }
+        QLabel#warningLabel { color:%(warning)s; font-size:12px; }
+        QLabel#columnTitle { color:%(muted)s; font-size:12px; font-weight:600; }
+        QWidget#columnHeader { background:%(head)s; border-bottom:1px solid %(border)s; }
+        QLabel[state="ok"] { color:%(ok)s; }
+        QLabel[state="ng"] { color:%(danger)s; }
+        QLabel[state="warning"] { color:%(warning)s; }
+        QLabel[state="running"] { color:%(blue)s; }
+        QLabel[state="neutral"] { color:%(muted)s; }
     """ % colors
 
 
@@ -214,47 +237,46 @@ def application_styles(dark: bool) -> str:
     colors = workbench_palette(dark)
     return _control_styles(colors) + """
         QMainWindow#sopMainWindow { background:%(bg)s; color:%(fg)s; }
-        QMenuBar { background:%(panel)s; color:%(fg)s; font-size:13px; padding:2px; }
-        QMenuBar::item { padding:4px 8px; } QMenuBar::item:selected { background:%(soft)s; }
-        QToolBar#sourceToolbar { background:%(panel)s; border:0; border-bottom:1px solid %(border)s; padding:4px; spacing:8px; }
-        QTabWidget#mainTabs::pane { border:0; background:%(bg)s; }
-        QTabBar#mainNavigation::tab { color:%(muted)s; background:%(panel)s; font-size:13px;
-                                    padding:9px 18px; border-bottom:2px solid transparent; }
-        QTabBar#mainNavigation::tab:selected { color:%(blue)s; background:%(soft)s; border-bottom-color:%(blue)s; }
+        QWidget#appHeader { background:%(panel)s; border-bottom:1px solid %(border)s; }
+        QPushButton#navButton { font-size:13px; padding:5px 18px; border:1px solid %(border)s; border-radius:0;
+                                background:%(bg)s; color:%(fg)s; }
+        QPushButton#navButton[segment="middle"], QPushButton#navButton[segment="last"] { border-left:0; }
+        QPushButton#navButton:checked { background:%(blue)s; color:%(button_text)s; border-color:%(blue)s; font-weight:600; }
+        QToolBar#sourceToolbar { background:%(bg)s; border:0; border-bottom:1px solid %(border)s; padding:2px 6px; spacing:6px; }
+        QToolBar#sourceToolbar QLabel { color:%(muted)s; font-size:12px; }
+        QStackedWidget#mainPages { background:%(bg)s; }
         QStatusBar { background:%(panel)s; color:%(muted)s; font-size:12px; border-top:1px solid %(border)s; }
         QStatusBar::item { border:0; }
-        QTableWidget { background:%(panel)s; color:%(fg)s; border:1px solid %(border)s; gridline-color:%(border)s; }
-        QHeaderView::section { background:%(bg)s; color:%(muted)s; font-size:13px; padding:6px; border:0; }
+        QStatusBar QLabel, StatusText { color:%(muted)s; font-size:12px; }
+        QTableWidget { background:%(panel)s; color:%(fg)s; border:1px solid %(border)s; gridline-color:%(border)s;
+                       font-size:13px; selection-background-color:%(soft)s; selection-color:%(fg)s; }
+        QHeaderView::section { background:%(head)s; color:%(muted)s; font-size:12px; font-weight:600; padding:3px 6px;
+                               border:0; border-right:1px solid %(border)s; border-bottom:1px solid %(border)s; }
+        QSplitter::handle { background:%(bg)s; }
     """ % colors
 
 
 def workbench_styles(dark: bool) -> str:
     colors = workbench_palette(dark)
     return """
-        QWidget#workbenchEditor { background:%(bg)s; color:%(fg)s; font-size:13px; }
-        QWidget#inspectorContent { background:%(bg)s; }
-        QTabWidget#workbenchInspector::pane { border:0; background:%(bg)s; }
-        QGroupBox { background:%(panel)s; border:1px solid %(border)s; border-radius:8px;
-                    margin-top:16px; padding:15px 10px 9px; color:%(fg)s; font-size:13px; }
-        QGroupBox::title { subcontrol-origin:margin; left:12px; color:%(fg)s; padding:0 3px; }
-        QGroupBox#validationBox { margin-top:14px; padding:12px 10px 8px; }
-        QFrame#conditionCard { background:%(panel)s; border:1px solid %(border)s; border-radius:7px; }
-        QFrame#conditionCard[selected="true"] { border:1px solid %(blue)s; background:%(soft)s; }
-        QLabel#workspaceTitle { font-size:20px; font-weight:600; color:%(fg)s; }
-        QLabel#contextTitle { font-size:14px; font-weight:500; color:%(fg)s; }
-        QLabel#mutedLabel { color:%(muted)s; font-size:12px; }
-        QLabel#fieldLabel { color:%(muted)s; font-size:12px; }
+        QWidget#workbenchEditor, QWidget#editorDocument, QWidget#toolsDocument { background:%(bg)s; color:%(fg)s; font-size:13px; }
+        QWidget#monitorPane { background:%(bg)s; }
+        QFrame#panel, QFrame#stepBlock { background:%(panel)s; border:1px solid %(border)s; border-radius:0; }
+        QWidget#stepHeader { background:%(head)s; }
+        QLabel#stepNumber { font-size:14px; font-weight:700; color:%(fg)s; }
+        QLabel#groupLabel { font-weight:600; color:%(fg)s; }
+        QLabel#groupLabel[role="violation"] { color:%(danger)s; }
+        QLabel#guideLabel { color:%(fg)s; background:%(soft)s; padding:3px 6px; font-size:12px; }
+        QLabel#setupSummary { color:%(fg)s; font-size:12px; }
+        QLabel#setupSummary[state="warning"] { color:%(warning)s; }
         QLabel#livePreview { font-size:12px; color:%(muted)s; }
-        QLabel#documentState { color:%(blue)s; background:%(soft)s; padding:4px 8px; border-radius:5px; font-size:12px; }
         QLabel#validationStatus { font-size:12px; color:%(muted)s; }
         QLabel#validationStatus[state="warning"] { color:%(warning)s; }
         QLabel#validationStatus[state="running"] { color:%(blue)s; }
-        QLabel#setupSummary { color:%(fg)s; background:%(panel)s; border:1px solid %(border)s;
-                              padding:7px 10px; border-radius:6px; font-size:12px; }
-        QLabel#guideLabel { color:%(blue)s; background:%(soft)s; padding:6px 8px; border-radius:5px; font-size:12px; }
-        QPushButton#workbenchNav { padding:7px 15px; border-color:transparent; }
-        QPushButton#workbenchNav:checked { border-color:%(blue)s; }
-        QToolButton#sectionToggle { border:0; color:%(muted)s; padding:4px; min-height:18px; font-size:12px; }
-        QSplitter::handle { background:transparent; }
-        QSplitter::handle:hover { background:%(soft)s; }
+        QFrame#conditionBlock { background:%(bg)s; border:1px solid %(border)s; }
+        QFrame#conditionBlock[selected="true"] { background:%(soft)s; border-color:%(blue)s; }
+        QLabel#conditionTitle { color:%(muted)s; font-size:12px; font-weight:600; }
+        QFrame#regionRow { border:0; border-bottom:1px solid %(border)s; }
+        QWidget#trackingBar { background:%(panel)s; border:1px solid %(border)s; }
+        QLabel#rulesSummary { color:%(fg)s; font-size:12px; }
     """ % colors + _control_styles(colors)

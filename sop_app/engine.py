@@ -13,7 +13,7 @@ import numpy as np
 
 from .conditions import ConditionResult, evaluate_condition_set
 from .detection import FrameResult
-from .sop_schema import SOPDefinition
+from .sop_schema import ROI, SOPDefinition, Step
 
 
 class Phase(str, Enum):
@@ -85,6 +85,30 @@ class SlidingWindow:
         coverage = 1.0 if self.span <= 0 else min(1.0, (now - self._started) / self.span)
         fill = 1.0 if self.ratio <= 0 else min(1.0, self._true_ratio() / self.ratio)
         return coverage * fill
+
+
+@dataclass(frozen=True)
+class StepFrame:
+    """單幀判定結果；正式引擎與編輯器預覽共用，確保全部／任一與門檻一致。"""
+    completion_met: bool
+    completion_blocked: bool
+    completion_results: list[ConditionResult]
+    forbidden_met: bool
+    forbidden_blocked: bool
+    forbidden_results: list[ConditionResult]
+
+
+def evaluate_step(step: Step, frame: FrameResult, rois: dict[str, ROI]) -> StepFrame:
+    met, blocked, results = evaluate_condition_set(step.conditions, frame, rois, step.completion_mode)
+    forbidden_met, forbidden_blocked, forbidden_results = evaluate_condition_set(
+        step.forbidden, frame, rois, step.forbidden_mode)
+    return StepFrame(met, blocked, results, forbidden_met, forbidden_blocked, forbidden_results)
+
+
+def violation_window(step: Step) -> tuple[float, float]:
+    """違規時間窗；未另外設定時沿用完成條件的觀察時間與成立比例。"""
+    return (step.hold_sec if step.forbidden_hold_sec is None else step.forbidden_hold_sec,
+            step.ratio if step.forbidden_ratio is None else step.forbidden_ratio)
 
 
 @dataclass
@@ -214,7 +238,9 @@ class SOPEngine:
 
         if self.phase == Phase.RUNNING:
             step, runtime = self.sop.steps[self.index], self.runtimes[self.index]
-            met, completion_blocked, self._results = evaluate_condition_set(step.conditions, frame, self.rois, step.completion_mode)
+            judged = evaluate_step(step, frame, self.rois)
+            met, completion_blocked, self._results = (judged.completion_met, judged.completion_blocked,
+                                                      judged.completion_results)
             invalid = completion_blocked
             position_missing = (invalid and frame.detection_valid and frame.workpiece_transform is None and
                                 any(self.rois.get(c.roi) is not None and
@@ -245,8 +271,8 @@ class SOPEngine:
 
             forbidden_blocked = False
             if step.forbidden:
-                forbidden_met, forbidden_blocked, self._forbidden_results = evaluate_condition_set(
-                    step.forbidden, frame, self.rois, step.forbidden_mode)
+                forbidden_met, forbidden_blocked, self._forbidden_results = (
+                    judged.forbidden_met, judged.forbidden_blocked, judged.forbidden_results)
                 if forbidden_blocked or self._forbidden_invalid:
                     self._forbidden_window.reset(now)
                 self._forbidden_invalid = forbidden_blocked
@@ -369,9 +395,7 @@ class SOPEngine:
         self.runtimes[index].status = StepStatus.ACTIVE
         self.runtimes[index].started_at = now
         self._window.reset(now, step.hold_sec, step.ratio)
-        self._forbidden_window.reset(
-            now, step.hold_sec if step.forbidden_hold_sec is None else step.forbidden_hold_sec,
-            step.ratio if step.forbidden_ratio is None else step.forbidden_ratio)
+        self._forbidden_window.reset(now, *violation_window(step))
         self._sequence_windows.clear()   # 每道工序重新觀察後續工序，不沿用上一道的累積
         self._results, self._forbidden_results = [], []
         return [self._event("step_started", now, f"開始：{step.name}")]

@@ -34,7 +34,7 @@ class MultiPositionTests(unittest.TestCase):
         self.app.processEvents()
         frame = np.zeros((480,640,3), np.uint8)
         editor.on_packet(FramePacket(frame, frame, FrameResult(640,480,0), None, 10,5))
-        editor.roi_list.setCurrentRow(0)
+        editor._select_roi('左')
         editor._begin_roi_edit()
         return editor
 
@@ -65,21 +65,26 @@ class MultiPositionTests(unittest.TestCase):
         editor._return_live()
         self.assertFalse(video._editable)
 
-    def test_duplicate_rename_apply_and_history(self):
+    def test_duplicate_rename_bind_and_history(self):
         editor = self.make_editor()
-        editor._duplicate_roi()
+        editor.roi_rows[0].duplicate_button.click()
         self.assertEqual(len(editor.sop.rois), 3)
-        editor.roi_list.currentItem().setText('第三位置')
-        with patch('sop_app.ui.editor_page.QInputDialog.getItem', return_value=('grip', True)):
-            editor._apply_roi()
-            editor._apply_roi()
+        row = editor.roi_rows[-1]
+        row.name_edit.setText('第三位置')
+        row.name_edit.editingFinished.emit()
+        cards = editor.step_editors[0].condition_table
+        cards.add_button.click()
+        field = cards.field_widget(1, 'roi')
+        field.setCurrentIndex(field.findData('第三位置'))
         self.assertEqual(len(editor.sop.steps[0].conditions), 2)
-        editor.roi_list.currentItem().setText('新名稱')
+        row = editor.roi_rows[-1]
+        row.name_edit.setText('新名稱')
+        row.name_edit.editingFinished.emit()
         self.assertEqual(editor.sop.steps[0].conditions[-1].roi, '新名稱')
         editor._undo_roi()
         self.assertEqual(editor.sop.steps[0].conditions[-1].roi, '第三位置')
         with patch('sop_app.ui.editor_page.QMessageBox.information') as info:
-            editor._delete_roi()
+            editor.roi_rows[-1].delete_button.click()
         self.assertIn('安裝', info.call_args.args[2])
         self.assertEqual(len(editor.sop.rois), 3)
         restored = SOPDefinition.from_dict(editor.sop.to_dict())
@@ -107,17 +112,18 @@ class MultiPositionTests(unittest.TestCase):
         editor = self.make_editor()
         editor._return_live()
         editor.sop.workpiece = Workpiece(points=[(0,0),(1,0),(1,1),(0,1)])
+        editor._locator = object()  # Isolate coordinate conversion from feature matching.
         matrix = np.array([[1.,0.,.05],[0.,1.,.1]])
         editor._preview_result = FrameResult(640,480,1,workpiece_transform=matrix)
         original = np.array(editor.sop.rois[0].points)
-        editor._anchor_selected_roi()
+        editor._change_roi_anchor(editor.sop.rois[0], 'workpiece')
         self.assertEqual(editor.sop.rois[0].anchor,'workpiece')
         transformed = np.array(editor.sop.rois[0].points) @ matrix[:,:2].T + matrix[:,2]
         np.testing.assert_allclose(transformed,original)
         editor._undo_roi()
         self.assertEqual(editor.sop.rois[0].anchor,'fixed')
         editor._preview_result = FrameResult(640,480,2)
-        editor._anchor_selected_roi()
+        editor._change_roi_anchor(editor.sop.rois[0], 'workpiece')
         self.assertEqual(editor.sop.rois[0].anchor,'fixed')
 
     def test_sequential_positions_do_not_skip(self):

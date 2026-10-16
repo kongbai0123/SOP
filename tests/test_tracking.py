@@ -8,6 +8,8 @@ from unittest.mock import patch
 
 import cv2
 import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from sop_app.tracking import WorkpieceLocator, capture_workpiece, transform_roi, workpiece_key
@@ -18,7 +20,6 @@ from sop_app.engine import SOPEngine, Phase
 from sop_app.pipeline import FramePacket, VideoPipeline
 from sop_app.recorder import Recorder, query
 from sop_app.ui.editor_page import EditorPage
-from sop_app.ui.quick_setup_dialog import QuickPositionDialog
 from sop_app.ui.run_page import RunPage
 from sop_app.ui.records_page import RecordsPage
 
@@ -265,39 +266,50 @@ class EditorTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_editor_uses_independent_task_modes(self):
+    def test_editor_expands_all_steps_and_regions_in_one_scrollable_page(self):
         editor = EditorPage()
         self.addCleanup(editor.close)
-        editor.set_sop(SOPDefinition(steps=[Step('安裝左握把')]))
-        editor._set_editor_mode('overview')
+        editor.set_classes(['grip'])
+        editor.set_sop(SOPDefinition(rois=[ROI('左側', TARGET)], steps=[
+            Step('安裝左握把', conditions=[Condition(label='grip', roi='左側')]),
+            Step('確認裝配')]))
+        editor.resize(1100, 850)
         editor.show()
         self.app.processEvents()
-        self.assertTrue(editor.tabs.isVisible())
-        self.assertFalse(editor.manual_tools.isVisible())
-        self.assertTrue(editor.step_actions.isVisible())
-        self.assertTrue(editor.left_panel.isVisible())
-        self.assertTrue(editor.step_list.isVisible())
+        self.assertTrue(editor.page_scroll.isVisible())
         self.assertTrue(editor.sop_box.isVisible())
-        self.assertIn('1 道', editor.steps_box.title())
-        self.assertTrue(editor.mode_buttons['overview'].isChecked())
-        self.assertIn('已設定工序', editor.setup_summary.text())
+        self.assertEqual(len(editor.step_editors), 2)
+        self.assertEqual(len(editor.roi_rows), 1)
+        self.assertTrue(editor.roi_rows[0].name_edit.isVisible())
         self.assertTrue(editor.validation_box.isVisible())
-        editor.mode_buttons['steps'].click()
+        # A loaded SOP is a compact list; each step still shows its name and full rule summary.
+        for form in editor.step_editors:
+            self.assertTrue(form.step_name_edit.isVisible())
+            self.assertIn(form.step.name, form.header_row.toolTip())
+            self.assertFalse(form.condition_table.isVisible())
+        self.assertIn('grip＠左側 出現', editor.step_editors[0].header_row.toolTip())
+        packet = FramePacket(scene(), scene(), FrameResult(640, 480, 0, detection_valid=True), None, 10, 5)
+        editor.on_packet(packet)
+        self.assertIn('左側（固定畫面）', editor.roi_rows[0].toolTip())
+        self.assertIn('條件本幀成立', editor.roi_rows[0].toolTip())
+        editor.expand_all_button.click()
         self.app.processEvents()
-        self.assertTrue(editor.tabs.isVisible())
-        self.assertFalse(editor.manual_tools.isVisible())
-        self.assertTrue(editor.step_actions.isVisible())
-        self.assertTrue(editor.left_panel.isVisible())
-        self.assertTrue(editor.step_list.isVisible())
-        self.assertFalse(editor.sop_box.isVisible())
-        self.assertEqual(editor.tabs.currentIndex(), 0)
-        self.assertTrue(editor.mode_buttons['steps'].isChecked())
-        editor.mode_buttons['positions'].click()
+        self.assertGreater(editor.page_scroll.verticalScrollBar().maximum(), 0)
+        for form in editor.step_editors:
+            for field in (form.step_name_edit, form.condition_table, form.forbidden_table,
+                          form.hold_spin, form.forbidden_hold_spin):
+                self.assertTrue(field.isVisible())
+        # Choosing a trial target only changes the trial; every form remains
+        # available and edits apply to the step being edited directly.
+        editor.validation_step.setCurrentIndex(1)
+        name = editor.step_editors[1].step_name_edit
+        name.setFocus()
+        QTest.keyClick(name, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
+        QTest.keyClicks(name, 'assembly-check')
         self.app.processEvents()
-        self.assertTrue(editor.left_panel.isVisible())
-        self.assertTrue(editor.step_list.isVisible())
-        self.assertTrue(editor.manual_tools.isVisible())
-        self.assertEqual(editor.tabs.currentIndex(), 1)
+        self.assertEqual(editor.sop.steps[0].name, '安裝左握把')
+        self.assertEqual(editor.sop.steps[1].name, 'assembly-check')
+        self.assertTrue(all(form.isVisible() for form in editor.step_editors))
 
     def test_monitor_idle_previews_regions_and_clears_lost_positions(self):
         frame = scene()
@@ -363,7 +375,7 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(texts, {'目前工序不使用工作區域'})
         self.assertNotIn('特徵', run.tracking_label.text())
 
-    def test_quick_handlebar_setup_creates_position_and_step(self):
+    def test_direct_handlebar_setup_binds_visible_condition_and_saves(self):
         editor = EditorPage()
         self.addCleanup(editor.close)
         editor.set_classes(['grip'])
@@ -371,26 +383,30 @@ class EditorTests(unittest.TestCase):
         frame = scene()
         packet = FramePacket(frame,frame.copy(),FrameResult(640,480,0),None,10,5)
         editor.on_packet(packet)
-        editor._start_quick_setup()
-        self.assertEqual(editor._quick_phase,'target')
+        editor.target_button.click()
         editor._on_roi_drawn(TARGET)
-        self.assertEqual(editor._quick_phase,'positions')
+        editor.draw_button.click()
         position = [(.4,.4),(.5,.4),(.5,.5),(.4,.5)]
-        with patch.object(QuickPositionDialog,'get_values',return_value=('左側安裝位置','grip',True)):
-            editor._on_roi_drawn(position)
+        editor._on_roi_drawn(position)
+        editor.roi_rows[-1].name_edit.setText('左側安裝位置')
+        editor.roi_rows[-1].name_edit.editingFinished.emit()
+        editor.add_step_button.click()
+        conditions = editor.step_editors[0].condition_table
+        conditions.add_button.click()
+        region = conditions.field_widget(0, 'roi')
+        region.setCurrentIndex(region.findData('左側安裝位置'))
         self.assertEqual(editor.sop.rois[0].anchor,'workpiece')
         self.assertEqual(editor.sop.steps[0].conditions[0].roi,'左側安裝位置')
         self.assertEqual(editor.sop.steps[0].conditions[0].label,'grip')
-        self.assertTrue(editor.video._draw_mode)
-        editor._finish_quick_positions()
-        self.assertEqual(editor._quick_phase,'verify')
-        saved = []
-        editor.save_requested.connect(lambda: saved.append(True))
-        editor._save_quick_setup()
-        self.assertEqual(saved,[True])
-        self.assertEqual(editor._quick_phase,'verify')
+        self.assertEqual(editor.roi_rows[0].name_edit.text(), '左側安裝位置')
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'handlebar.json'
+            save_sop(editor.sop, path)
+            restored = load_sop(path)
         editor.on_save_result('saved')
-        self.assertEqual(editor._quick_phase,'')
+        self.assertIn('已儲存', editor.guide_label.text())
+        self.assertEqual(restored.steps[0].conditions[0].roi, '左側安裝位置')
+        self.assertEqual(restored.rois[0].anchor, 'workpiece')
 
     def test_clear_workpiece_removes_dependent_positions_and_conditions(self):
         frame = scene()
@@ -412,7 +428,9 @@ class EditorTests(unittest.TestCase):
         self.assertEqual([roi.name for roi in editor.sop.rois], ['桌面'])
         self.assertEqual([c.roi for c in editor.sop.steps[0].conditions], ['桌面'])
         self.assertFalse(editor.reference_button.isEnabled())
-        self.assertIn('未設定', editor.setup_summary.text())
+        self.assertIn('作業區域 1 個', editor.setup_summary.text())
+        self.assertEqual([row.roi.name for row in editor.roi_rows], ['桌面'])
+        self.assertEqual(editor.step_editors[0].condition_table.conditions()[0].roi, '桌面')
 
     def test_following_position_can_be_outside_hidden_tracking_reference(self):
         frame = scene()
@@ -421,9 +439,11 @@ class EditorTests(unittest.TestCase):
         editor.set_classes(['grip'])
         editor.set_sop(SOPDefinition(workpiece=capture_workpiece(frame, TARGET), steps=[Step('安裝')]))
         editor.reference_button.setChecked(True)
+        editor.draw_button.click()
         outside = [(.05,.05),(.15,.05),(.15,.15),(.05,.15)]
-        with patch('sop_app.ui.editor_page.QInputDialog.getText', return_value=('左側位置', True)):
-            editor._on_roi_drawn(outside)
+        editor._on_roi_drawn(outside)
+        editor.roi_rows[-1].name_edit.setText('左側位置')
+        editor.roi_rows[-1].name_edit.editingFinished.emit()
         self.assertEqual(editor.sop.rois[0].points, outside)
         self.assertEqual(editor.sop.rois[0].anchor, 'workpiece')
         self.assertNotIn('車把手主工件', [roi.name for roi in editor.video._rois])
@@ -483,12 +503,19 @@ class EditorTests(unittest.TestCase):
         editor._begin_target()
         editor._on_roi_drawn(TARGET)
         self.assertTrue(editor.reference_button.isChecked())
+        self.assertFalse(editor.draw_button.isChecked())
+        editor.draw_button.click()
         self.assertTrue(editor.draw_button.isChecked())
         self.assertTrue(editor.video._draw_mode)
-        with patch("sop_app.ui.editor_page.QInputDialog.getText", return_value=("壓合位置", True)):
-            editor._on_roi_drawn([(0.4, 0.4), (0.5, 0.4), (0.5, 0.5), (0.4, 0.5)])
+        editor._on_roi_drawn([(0.4, 0.4), (0.5, 0.4), (0.5, 0.5), (0.4, 0.5)])
+        editor.roi_rows[-1].name_edit.setText('壓合位置')
+        editor.roi_rows[-1].name_edit.editingFinished.emit()
         self.assertEqual(editor.sop.rois[0].anchor, "workpiece")
-        editor.sop.steps[0].conditions = [Condition(label="tool", roi="壓合位置")]
+        conditions = editor.step_editors[0].condition_table
+        conditions.add_button.click()
+        region = conditions.field_widget(0, 'roi')
+        region.setCurrentIndex(region.findData('壓合位置'))
+        self.assertEqual(editor.sop.steps[0].conditions[0].roi, '壓合位置')
         editor.reference_button.setChecked(False)
         pipeline = PipelineTracking(editor.sop.workpiece)
         for _ in range(3):
@@ -535,7 +562,7 @@ class EditorTests(unittest.TestCase):
         self.assertIs(editor._packet, packet)
         editor.close()
 
-    def test_mouse_drag_reference_then_region_without_extra_mode_click(self):
+    def test_mouse_drag_reference_then_explicit_region_action(self):
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtTest import QTest
         editor = EditorPage()
@@ -557,9 +584,12 @@ class EditorTests(unittest.TestCase):
 
         drag(.25, .25, .7, .72)
         self.assertTrue(editor.reference_button.isChecked())
+        self.assertFalse(editor.video._draw_mode)
+        editor.draw_button.click()
         self.assertTrue(editor.video._draw_mode)
-        with patch("sop_app.ui.editor_page.QInputDialog.getText", return_value=("安裝位置", True)):
-            drag(.4, .4, .5, .5)
+        drag(.4, .4, .5, .5)
+        editor.roi_rows[-1].name_edit.setText('安裝位置')
+        editor.roi_rows[-1].name_edit.editingFinished.emit()
         self.assertEqual(editor.sop.rois[0].name, "安裝位置")
         self.assertEqual(editor.sop.rois[0].anchor, "workpiece")
         editor.live_button.click()
@@ -599,7 +629,10 @@ class EditorTests(unittest.TestCase):
             page = RecordsPage(Path(folder))
             page.refresh()
             page.cycles.selectRow(0)
-            self.assertEqual(page.positioning.rowCount(), 2)
+            self.assertEqual(len(query(Path(folder) / 'records.db', 'SELECT * FROM positioning_events')), 2)
+            self.assertEqual(page.positioning.rowCount(), 1)
+            self.assertIn('判定暫停 1 次', page.positioning_summary.text())
+            self.assertIn('已恢復 1 次', page.positioning_summary.text())
             page.close()
             pipe._handle_command("stop", None, recorder)
             self.assertIsNone(pipe._locator)

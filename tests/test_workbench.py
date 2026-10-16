@@ -11,19 +11,18 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
-from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QListWidget, QStackedWidget, QTabWidget, QToolButton
 
 from sop_app.detection import Detection, FrameResult
 from sop_app.engine import Phase, SOPEngine
 from sop_app.pipeline import FramePacket
 from sop_app.sop_schema import Condition, CycleSettings, ROI, SOPDefinition, Step
-from sop_app.ui.condition_cards import ConditionCards
+from sop_app.ui.condition_rows import ConditionRows
 from sop_app.ui.editor_page import EditorPage
 from sop_app.ui.editor_validation import EditorValidation
 from sop_app.ui.main_window import MainWindow
+
 
 
 def result(timestamp, *labels, valid=True):
@@ -34,6 +33,13 @@ def result(timestamp, *labels, valid=True):
 def packet(timestamp, *labels, valid=True):
     image = np.zeros((100, 200, 3), np.uint8)
     return FramePacket(image, image.copy(), result(timestamp, *labels, valid=valid), None, 10, 5)
+
+
+def shown_field(table, row, field):
+    """The input, or the reason shown in its place when the field does not apply."""
+    widget = table.field_widget(row, field)
+    note = table._fields[row].get(f"{field}_note")
+    return note if note is not None and note.isVisible() else widget
 
 
 def sop(*steps, **cycle):
@@ -181,22 +187,33 @@ class WorkbenchQtTests(unittest.TestCase):
         editor.on_packet(packet(0, "grip"))
         return editor
 
-    def test_no_automatic_trial_and_three_primary_workspaces(self):
-        editor = self.make_editor()
+    def test_no_automatic_trial_and_all_settings_share_one_scroll_page(self):
+        editor = self.make_editor(sop(Step("第一道"), Step("第二道")))
         self.assertIsNone(editor._validation.engine)
         self.assertFalse(editor._validation.running)
-        self.assertEqual([button.text() for button in editor.mode_group.buttons()],
-                         ["作業準備", "工序編輯", "循環設定"])
-        self.assertEqual(editor._editor_mode, "steps")
+        self.assertEqual(len(editor.step_editors), 2)
+        self.assertTrue(editor.page_scroll.widget().isVisible())
+        self.assertFalse(editor.findChildren(QTabWidget))
+        self.assertFalse(editor.findChildren(QStackedWidget))
+        self.assertFalse(editor.findChildren(QListWidget))
+        self.assertFalse(editor.findChildren(QToolButton))
+        for card in editor.step_editors:
+            self.assertTrue(card.step_name_edit.isVisible())
+            self.assertIn("完成", card.header_row.toolTip())
+        editor.expand_all_button.click()
+        for card in editor.step_editors:
+            self.assertTrue(card.instruction_edit.isVisible())
+            self.assertTrue(card.forbidden_table.isVisible())
 
-    def test_persistent_trial_survives_workspace_switches(self):
+    def test_persistent_trial_survives_scrolling_between_settings(self):
         editor = self.make_editor()
         editor.validation_start.click()
         engine = editor._validation.engine
-        for mode in ("overview", "positions", "cycle", "steps"):
-            editor._set_editor_mode(mode)
+        for index, widget in enumerate((editor.name_edit, editor.step_editors[0], editor.reset_table,
+                                        editor.validation_box)):
+            editor.page_scroll.ensureWidgetVisible(widget)
             self.app.processEvents()
-            editor.on_packet(packet(.1 + .1 * list(("overview", "positions", "cycle", "steps")).index(mode), "grip"))
+            editor.on_packet(packet(.1 + .1 * index, "grip"))
             self.assertTrue(editor.validation_box.isVisible())
             self.assertIs(editor._validation.engine, engine)
             self.assertTrue(editor._validation.running)
@@ -206,27 +223,28 @@ class WorkbenchQtTests(unittest.TestCase):
         editor.validation_start.click()
         editor.on_packet(packet(.1, "grip"))
         original_engine = editor._validation.engine
-        field = editor.condition_table.field_widget(0, "min_count")
+        field = editor.step_editors[0].condition_table.field_widget(0, "min_count")
         field.setValue(2)
         self.assertTrue(editor._validation.stale)
         self.assertIn("設定已變更", editor.validation_status.text())
         self.assertIn("—", editor.validation_ratio.text())
         self.assertEqual(original_engine.sop.steps[0].conditions[0].min_count, 1)
-        editor.validation_restart.click()
+        editor.validation_start.click()
         self.assertFalse(editor._validation.stale)
         self.assertEqual(editor._validation.engine.sop.steps[0].conditions[0].min_count, 2)
 
     def test_single_target_does_not_follow_editor_selection(self):
         editor = self.make_editor(sop(Step("一", conditions=[Condition(label="grip")]), Step("二")))
         editor.validation_start.click()
-        editor.step_list.setCurrentRow(1)
+        editor.step_editors[1].step_name_edit.setFocus()
+        self.app.processEvents()
         self.assertIn("工序 1", editor.validation_target.text())
         self.assertTrue(editor._validation.running)
-        self.assertEqual(editor._current_step().name, "二")
+        self.assertEqual(editor.step_editors[1].step_name_edit.text(), "二")
 
     def test_flow_starts_at_first_step_even_if_another_is_selected(self):
         editor = self.make_editor(sop(Step("一", conditions=[Condition(label="grip")]), Step("二")))
-        editor.step_list.setCurrentRow(1)
+        editor.validation_step.setCurrentIndex(1)
         editor.validation_mode.setCurrentIndex(1)
         editor.validation_start.click()
         self.assertEqual(editor._validation.original_indices, [0, 1])
@@ -238,14 +256,14 @@ class WorkbenchQtTests(unittest.TestCase):
         editor.validation_start.click()
         editor.on_packet(packet(.1, "grip"))
         self.assertTrue(editor._validation.completed)
-        editor.step_list.setCurrentRow(1)
-        editor.validation_restart.click()
+        editor.validation_step.setCurrentIndex(1)
+        editor.validation_start.click()
         self.assertIn("無法開始試跑", editor.validation_status.text())
         self.assertTrue(editor._validation.stale)
         self.assertIn("—", editor.validation_ratio.text())
-        label = editor.condition_table.field_widget(0, "label")
+        label = editor.step_editors[1].condition_table.field_widget(0, "label")
         label.setCurrentIndex(label.findData("grip"))
-        editor.validation_restart.click()
+        editor.validation_start.click()
         self.assertTrue(editor._validation.running)
         self.assertIn("工序 2", editor.validation_target.text())
 
@@ -255,7 +273,7 @@ class WorkbenchQtTests(unittest.TestCase):
         editor._start_validation()
         self.assertIsNone(editor._validation.engine)
         self.assertIn("模型尚未就緒", editor.validation_status.text())
-        editor.condition_table._add()
+        editor.step_editors[0].condition_table._add()
         self.assertEqual(len(editor.sop.steps[0].conditions), 2)
 
     def test_manual_confirmation_uses_engine_without_model(self):
@@ -275,11 +293,11 @@ class WorkbenchQtTests(unittest.TestCase):
         self.assertFalse(editor.validation_start.isEnabled())
         editor._return_live()
         editor.on_packet(packet(.1, "grip"))
-        editor.validation_restart.click()
+        editor.validation_start.click()
         editor.set_model_state("failed")
         self.assertTrue(editor._validation.stale)
         editor.set_model_state("available")
-        editor.validation_restart.click()
+        editor.validation_start.click()
         editor.clear_video("source ended")
         self.assertTrue(editor._validation.stale)
         self.assertFalse(editor.validation_start.isEnabled())
@@ -324,47 +342,43 @@ class WorkbenchQtTests(unittest.TestCase):
         self.assertIsNone(editor._validation.engine)
         self.assertIsNone(editor.video._image)
 
-    def test_details_and_user_pane_widths_are_preserved_across_workspaces(self):
+    def test_validation_details_are_always_available_on_the_same_page(self):
         editor = self.make_editor()
-        editor.splitter.setSizes([220, 650, 390])
-        self.app.processEvents()
-        widths = editor.splitter.sizes()
-        editor.validation_details_section.set_expanded(True)
-        editor._set_editor_mode("cycle")
-        self.app.processEvents()
         self.assertTrue(editor.validation_details.isVisible())
-        self.assertEqual(editor.splitter.sizes(), widths)
-
-    def test_top_status_and_hint_do_not_consume_image_space(self):
-        editor = self.make_editor()
-        self.assertLess(editor.setup_summary.height(), 65)
-        self.assertLess(editor.mode_hint.height(), 45)
-        self.assertGreater(editor.video.height(), 180)
-        self.assertLess(editor.splitter.geometry().top(), 180)
-
-    def test_condition_fields_keep_real_height_after_hidden_page_rebuild(self):
-        editor = self.make_editor()
-        editor._set_editor_mode("positions")
-        editor._refresh_options()
-        editor._set_editor_mode("steps")
+        self.assertFalse(editor.findChildren(QToolButton))
+        editor.page_scroll.ensureWidgetVisible(editor.validation_details)
         self.app.processEvents()
-        for field in ("label", "type", "roi", "min_count"):
-            widget = editor.condition_table.field_widget(0, field)
-            self.assertTrue(widget.isVisible())
-            self.assertGreaterEqual(widget.height(), 20)
-        self.assertGreaterEqual(editor.condition_table._cards[0].height(), 150)
+        self.assertGreater(editor.validation_details.height(), 60)
+        self.assertEqual(editor.page_scroll.horizontalScrollBar().maximum(), 0)
 
-    def test_single_click_opens_step_from_project_preparation(self):
+    def test_status_is_readable_and_preview_has_useful_height(self):
+        editor = self.make_editor()
+        self.assertLess(editor.setup_summary.height(), 100)
+        self.assertGreaterEqual(editor.video.height(), 180)
+        self.assertEqual(editor.page_scroll.horizontalScrollBar().maximum(), 0)
+
+    def test_option_refresh_keeps_all_fields_visible_with_real_height(self):
+        editor = self.make_editor()
+        table = editor.step_editors[0].condition_table
+        score = table.field_widget(0, "min_score")
+        editor._refresh_options()
+        self.app.processEvents()
+        self.assertIs(table.field_widget(0, "min_score"), score)
+        for field in ("label", "type", "roi", "min_count", "min_score", "roi_overlap"):
+            widget = shown_field(table, 0, field)
+            self.assertTrue(widget.isVisible())
+            self.assertGreaterEqual(widget.height(), 16)
+
+    def test_each_step_trial_button_uses_its_own_step(self):
         editor = self.make_editor(sop(Step("一"), Step("二")))
-        editor._set_editor_mode("overview")
-        rectangle = editor.step_list.visualItemRect(editor.step_list.item(1))
-        QTest.mouseClick(editor.step_list.viewport(), Qt.MouseButton.LeftButton, pos=rectangle.center())
-        self.assertEqual(editor._editor_mode, "steps")
-        self.assertEqual(editor._current_step().name, "二")
+        editor.step_editors[1].trial_button.click()
+        self.assertEqual(editor._validation.original_indices, [1])
+        self.assertIn("工序 2", editor.validation_target.text())
+        self.assertTrue(editor.step_editors[0].step_name_edit.isVisible())
+        self.assertTrue(editor.step_editors[1].step_name_edit.isVisible())
 
     def test_cycle_ui_explains_real_rules_instead_of_adding_manual_restart_mode(self):
         editor = self.make_editor()
-        editor._set_editor_mode("cycle")
         self.assertTrue(editor.auto_restart_spin.isEnabled())
         self.assertFalse(editor.reset_hold_spin.isEnabled())
         editor.reset_table._add()
@@ -373,36 +387,33 @@ class WorkbenchQtTests(unittest.TestCase):
         self.assertIn("80%", editor.cycle_rule_summary.text())
 
     def test_card_delete_undo_and_missing_object_are_explicit(self):
-        cards = ConditionCards()
+        cards = ConditionRows()
         self.addCleanup(cards.close)
         values = [Condition(), Condition(label="grip", min_count=2, min_score=.8)]
         cards.set_options(["grip"], [])
         cards.set_conditions(values)
         self.assertEqual(cards.conditions()[0].label, "")
-        self.assertFalse(cards.remove_button.isEnabled())
-        cards._remove()
-        self.assertEqual(cards.conditions(), values)
-        cards.select_condition(1)
-        cards._remove()
+        self.assertIn("尚未選擇", cards.field_widget(0, "error").text())
+        cards.field_widget(1, "remove").click()
         self.assertEqual(cards.conditions(), values[:1])
-        cards._undo_delete()
+        cards.undo_delete_button.click()
         self.assertEqual(cards.conditions(), values)
         cards.set_conditions([Condition(label="other")])
         cards._undo_delete()
         self.assertEqual(len(cards.conditions()), 1)
+        self.assertIn("目前模型沒有", cards.field_widget(0, "error").text())
 
-    def test_card_advanced_fields_remain_usable_when_expanded(self):
+    def test_condition_thresholds_are_immediately_editable(self):
         editor = self.make_editor()
-        section = editor.condition_table.field_widget(0, "advanced")
-        section.set_expanded(True)
-        self.app.processEvents()
-        score = editor.condition_table.field_widget(0, "min_score")
+        table = editor.step_editors[0].condition_table
+        score = table.field_widget(0, "min_score")
         self.assertTrue(score.isVisible())
         self.assertGreaterEqual(score.height(), 20)
         score.setValue(.75)
         self.assertEqual(editor.sop.steps[0].conditions[0].min_score, .75)
-        section.set_expanded(False)
-        self.assertFalse(score.isVisible())
+        self.assertTrue(shown_field(table, 0, "roi_overlap").isVisible())
+        self.assertEqual(table.field_widget(0, "roi_overlap_note").text(), "不適用")
+        self.assertFalse(editor.findChildren(QToolButton))
 
     def test_dark_palette_keeps_cards_and_validation_visible(self):
         editor = self.make_editor()
@@ -415,21 +426,21 @@ class WorkbenchQtTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(editor._theme_dark)
         self.assertTrue(editor.validation_box.isVisible())
-        self.assertGreater(editor.condition_table.field_widget(0, "label").height(), 20)
+        self.assertGreater(editor.step_editors[0].condition_table.field_widget(0, "label").height(), 20)
 
     def test_card_edits_preserve_focus_and_highlight_bound_region(self):
         definition = sop()
         definition.rois = [ROI("left", [(0, 0), (.5, 0), (.5, .5), (0, .5)])]
         definition.steps[0].conditions[0].roi = "left"
         editor = self.make_editor(definition)
-        widget = editor.condition_table.field_widget(0, "min_count")
+        widget = editor.step_editors[0].condition_table.field_widget(0, "min_count")
         widget.setFocus()
         widget.setValue(2)
         self.assertTrue(widget.hasFocus())
         self.assertEqual(editor.video._selected, "left")
         self.assertEqual(editor.sop.steps[0].conditions[0].min_count, 2)
 
-    def test_native_window_layout_at_both_resolutions_all_workspaces(self):
+    def test_native_window_layout_at_both_resolutions_throughout_single_page(self):
         with tempfile.TemporaryDirectory() as folder, \
              patch("sop_app.ui.main_window.RECORDS_DIR", Path(folder)), \
              patch.object(MainWindow, "_load_settings", return_value={}), \
@@ -445,32 +456,31 @@ class WorkbenchQtTests(unittest.TestCase):
                 window._apply_sop(definition, None)
                 editor = window.editor
                 editor.set_classes(["grip", "tool"])
+                editor.expand_all_button.click()
                 window.tabs.setCurrentWidget(editor)
                 window.show()
                 for width, height in ((1366, 768), (1920, 1080)):
-                    for mode in ("steps", "overview", "follow", "positions", "cycle"):
-                        editor._set_editor_mode(mode)
-                        window.resize(width, height)
+                    window.resize(width, height)
+                    self.app.processEvents()
+                    self.assertEqual((window.width(), window.height()), (width, height))
+                    self.assertTrue(editor.validation_details.isVisible())
+                    self.assertGreaterEqual(editor.video.height(), 180)
+                    self.assertEqual(editor.page_scroll.horizontalScrollBar().maximum(), 0)
+                    self.assertEqual(len(editor.step_editors), 4)
+                    for card in editor.step_editors:
+                        self.assertTrue(card.instruction_edit.isVisible())
+                        self.assertTrue(card.forbidden_table.isVisible())
+                        for field in ("label", "type", "roi", "min_count", "min_score", "roi_overlap"):
+                            self.assertGreaterEqual(shown_field(card.condition_table, 0, field).height(), 16)
+                    for location, target in (("top", editor.name_edit), ("bottom", editor.validation_details)):
+                        editor.page_scroll.ensureWidgetVisible(target)
                         self.app.processEvents()
-                        self.assertEqual((window.width(), window.height()), (width, height), mode)
-                        self.assertTrue(editor.validation_box.isVisible())
-                        self.assertGreater(editor.video.height(), 179)
-                        self.assertLess(editor.setup_summary.height(), 65)
-                        if mode == "steps":
-                            editor._refresh_options()
-                            self.app.processEvents()
-                            for field in ("label", "type", "roi", "min_count"):
-                                self.assertGreaterEqual(editor.condition_table.field_widget(0, field).height(), 20)
+                        self.assertEqual(editor.page_scroll.horizontalScrollBar().maximum(), 0)
                         artifact_directory = os.environ.get("SOP_EDITOR_TEST_ARTIFACT_DIR")
                         if artifact_directory:
                             directory = Path(artifact_directory)
                             directory.mkdir(parents=True, exist_ok=True)
-                            self.assertTrue(window.grab().save(str(directory / f"workbench-{width}x{height}-{mode}.png")))
-                    editor._set_editor_mode("steps")
-                    editor.validation_details_section.set_expanded(True)
-                    self.app.processEvents()
-                    self.assertEqual((window.width(), window.height()), (width, height), "details")
-                    editor.validation_details_section.set_expanded(False)
+                            self.assertTrue(window.grab().save(str(directory / f"workbench-{width}x{height}-{location}.png")))
             finally:
                 window.dirty = False
                 window.close()

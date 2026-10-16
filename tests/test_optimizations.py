@@ -360,13 +360,16 @@ class OperatorUiTests(unittest.TestCase):
     def test_editor_trial_consumes_every_background_frame(self):
         editor = EditorPage()
         self.addCleanup(editor.close)
-        editor.set_sop(SOPDefinition(steps=[Step("安裝", conditions=[Condition(label="a")], hold_sec=.4)]))
+        editor.set_sop(SOPDefinition(steps=[Step("前置檢查"),
+            Step("安裝", conditions=[Condition(label="a")], hold_sec=.4)]))
         editor.set_classes(["a"])
         editor.set_model_state("available")
         image = np.zeros((H, W, 3), np.uint8)
         editor.on_packet(FramePacket(image, image, frame(0, det("a")), None, 10, 5))
-        editor._start_validation()
+        editor.step_editors[1].trial_button.click()
         self.assertTrue(editor._validation.running)
+        self.assertEqual(editor.validation_step.currentIndex(), 1)
+        self.assertEqual(editor.validation_mode.currentData(), "single")
         # 介面只收到一個封包，但背景處理了 6 幀；試跑應以全部 6 幀累積時間窗。
         results = tuple(frame(t / 10, det("a")) for t in range(1, 7))
         editor.on_packet(FramePacket(image, image, results[-1], None, 10, 5, results=results))

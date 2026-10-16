@@ -12,8 +12,9 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QFont, QKeySequence
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QLabel, QMainWindow, QMessageBox,
-                               QProgressBar, QPushButton, QSizePolicy, QTabWidget, QToolBar)
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+                               QGridLayout, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+                               QToolBar, QWidget)
 
 from ..model_bundle import ModelBundleError, ModelInfo, read_model_info
 from ..model_eta import ModelETA, ModelLoadProgress, model_key, stage_key
@@ -25,8 +26,9 @@ from ..sop_schema import SOPDefinition, Step, load_sop, save_sop
 from ..startup import initial_sop_path
 from .editor_page import EditorPage
 from .records_page import RecordsPage
+from .compact_layout import StatusText
 from .run_page import RunPage
-from .workbench_widgets import ScrollablePageTabs, application_styles, install_readability_guard
+from .workbench_widgets import PageStack, application_styles, install_readability_guard
 
 VIDEO_FILTER = "影片 (*.mp4 *.avi *.mov *.mkv *.wmv);;所有檔案 (*)"
 
@@ -46,6 +48,7 @@ class MainWindow(QMainWindow):
         self.settings = self._load_settings()
         self.sop_path: Path | None = None
         self.dirty = False
+        self._save_pending = False
         self.model_info: ModelInfo | None = None
         self.model_ready = False
         self._requested_model: str | None = None
@@ -88,26 +91,23 @@ class MainWindow(QMainWindow):
         self.editor.workpiece_changed.connect(self.pipeline.set_workpiece)
         self.editor.modified.connect(self._on_modified)
         self.editor.model_selected.connect(self._load_model)
-        self.editor.save_requested.connect(self._save)
         self.save_finished.connect(self.editor.on_save_result)
         self.records_page = RecordsPage(RECORDS_DIR)
 
-        self.tabs = ScrollablePageTabs()
-        self.tabs.setObjectName("mainTabs")
-        self.tabs.tabBar().setObjectName("mainNavigation")
+        self.tabs = PageStack()
+        self.tabs.setObjectName("mainPages")
         self.tabs.addTab(self.run_page, "執行監控")
         self.tabs.addTab(self.editor, "工序編輯")
         self.tabs.addTab(self.records_page, "作業紀錄")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(self.tabs)
 
-        self._build_menu()
+        self._build_header()
         self._build_toolbar()
         self.pipeline.camera_available.connect(self.camera_button.setEnabled)
-        self.model_status = QLabel("模型：未載入")
-        self.model_status.setWordWrap(True)
-        self.model_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Maximum)
-        self.model_status.setMinimumWidth(120)
+        # One compact line: progress, processing rate, then model and compute device.
+        self.statusBar().setSizeGripEnabled(False)
+        self.model_status = StatusText("模型：未載入")
         self.model_progress = QProgressBar()
         self.model_progress.setRange(0, 100)
         self.model_progress.setFixedWidth(170)
@@ -121,7 +121,7 @@ class MainWindow(QMainWindow):
         self.pipeline.model_timing.connect(self._on_model_timing)
         self.fps_status = QLabel("")
         self.statusBar().addPermanentWidget(self.fps_status)
-        self.statusBar().addPermanentWidget(self.model_status, 1)
+        self.statusBar().addPermanentWidget(self.model_status)
         if self._vision_error:
             self.runtime_warning = QLabel("影像功能不可用：OpenCV 載入失敗。仍可編輯 SOP 與查看紀錄。")
             self.runtime_warning.setStyleSheet("color:#b71c1c; font-weight:bold")
@@ -144,27 +144,63 @@ class MainWindow(QMainWindow):
             self._chrome_dark = dark
             self.setStyleSheet(application_styles(dark))
 
-    def _build_menu(self):
-        menu = self.menuBar().addMenu("檔案(&F)")
-        for text, shortcut, handler in [("新增 SOP", QKeySequence.StandardKey.New, self._new_sop),
-                                        ("開啟 SOP…", QKeySequence.StandardKey.Open, self._open_sop),
-                                        ("儲存", QKeySequence.StandardKey.Save, self._save),
-                                        ("另存新檔…", QKeySequence.StandardKey.SaveAs, self._save_as)]:
-            action = QAction(text, self)
+    def _build_header(self):
+        """Page switcher in the centre and file actions on the right of the single top header.
+
+        The SOP name and version are edited in the editor's project section; the
+        window title shows the file and an asterisk for unsaved changes.
+        """
+        header = QWidget()
+        header.setObjectName("appHeader")
+        header.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.nav_buttons = QButtonGroup(self)
+        self.nav_buttons.setExclusive(True)
+        navigation = QHBoxLayout()
+        navigation.setSpacing(0)
+        for index in range(self.tabs.count()):
+            button = QPushButton(self.tabs.tabText(index))
+            button.setObjectName("navButton")
+            button.setCheckable(True)
+            button.setProperty("segment", "first" if index == 0 else
+                               "last" if index == self.tabs.count() - 1 else "middle")
+            self.nav_buttons.addButton(button, index)
+            navigation.addWidget(button)
+        self.nav_buttons.idClicked.connect(self.tabs.setCurrentIndex)
+        self.nav_buttons.button(self.tabs.currentIndex()).setChecked(True)
+        files = QHBoxLayout()
+        files.setSpacing(4)
+        files.addStretch(1)
+        self.new_button, self.open_button = QPushButton("新增"), QPushButton("開啟…")
+        self.save_button, self.save_as_button = QPushButton("儲存"), QPushButton("另存新檔…")
+        self.save_button.setObjectName("primaryButton")
+        for button, handler in ((self.new_button, self._new_sop), (self.open_button, self._open_sop),
+                                (self.save_button, self._request_save), (self.save_as_button, self._request_save_as)):
+            button.clicked.connect(lambda _checked=False, h=handler: h())
+            files.addWidget(button)
+        layout = QGridLayout(header)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setHorizontalSpacing(12)
+        layout.addLayout(navigation, 0, 1)
+        layout.addLayout(files, 0, 2)
+        layout.setColumnStretch(0, 1)
+        layout.setColumnStretch(2, 1)
+        self.setMenuWidget(header)
+        # Keyboard shortcuts stay available without a separate menu bar.
+        for shortcut, handler in ((QKeySequence.StandardKey.New, self._new_sop),
+                                  (QKeySequence.StandardKey.Open, self._open_sop),
+                                  (QKeySequence.StandardKey.Save, self._request_save),
+                                  (QKeySequence.StandardKey.SaveAs, self._request_save_as)):
+            action = QAction(self)
             action.setShortcut(shortcut)
-            action.triggered.connect(handler)
-            menu.addAction(action)
-        menu.addSeparator()
-        exit_action = QAction("離開", self)
-        exit_action.triggered.connect(self.close)
-        menu.addAction(exit_action)
+            action.triggered.connect(lambda _checked=False, h=handler: h())
+            self.addAction(action)
 
     def _build_toolbar(self):
         toolbar = QToolBar("影像來源")
         toolbar.setObjectName("sourceToolbar")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
-        toolbar.addWidget(QLabel(" 影像來源 "))
+        toolbar.addWidget(QLabel("影像來源"))
         self.source_combo = QComboBox()
         for index in range(4):
             self.source_combo.addItem(f"攝影機 {index}", f"camera:{index}")
@@ -181,14 +217,14 @@ class MainWindow(QMainWindow):
         self.camera_button.setEnabled(False)
         self.camera_button.clicked.connect(self._camera_settings)
         toolbar.addWidget(self.camera_button)
-        self.source_status = QLabel("  未連線")
+        self.source_status = QLabel("未連線")
         toolbar.addWidget(self.source_status)
         toolbar.addSeparator()
         self.mask_check = QCheckBox("顯示遮罩")
         self.mask_check.setChecked(True)
         self.mask_check.toggled.connect(self._apply_display)
         toolbar.addWidget(self.mask_check)
-        toolbar.addWidget(QLabel("  最低顯示信心度 "))
+        toolbar.addWidget(QLabel("最低顯示信心度"))
         self.display_score = QDoubleSpinBox()
         self.display_score.setRange(0.3, 1.0)
         self.display_score.setSingleStep(0.05)
@@ -303,7 +339,7 @@ class MainWindow(QMainWindow):
         self._source_label = label
         self.run_page.clear_video("影像來源已變更，等待影像" if label else "影像來源已中斷")
         self.editor.clear_video("影像來源已變更，等待影像")
-        self.source_status.setText(f"  {label}" if label else "  未連線")
+        self.source_status.setText(label or "未連線")
         if not label:
             self.fps_status.setText("")
             self.editor.clear_video("影像來源已中斷")
@@ -313,8 +349,11 @@ class MainWindow(QMainWindow):
         try:
             if not self.model_ready:
                 # Do not preview stale detections while clear/load commands are queued.
-                packet = replace(packet, result=replace(packet.result, detections=[], detection_valid=False),
-                                 display=packet.frame, classes=())
+                # Trials read every pending result, so clear those the same way as the preview frame.
+                cleared = replace(packet.result, detections=[], detection_valid=False)
+                packet = replace(packet, result=cleared, display=packet.frame, classes=(),
+                                 results=tuple(replace(result, detections=[], detection_valid=False)
+                                               for result in packet.results))
             page = self.tabs.currentWidget()
             if page is self.run_page:
                 self.run_page.on_packet(packet)
@@ -336,7 +375,10 @@ class MainWindow(QMainWindow):
         if not running:
             self.run_page.set_sop(self.editor.sop)
 
-    def _on_tab_changed(self, _index: int):
+    def _on_tab_changed(self, index: int):
+        button = self.nav_buttons.button(index) if hasattr(self, "nav_buttons") else None
+        if button is not None and not button.isChecked():
+            button.setChecked(True)
         if self.tabs.currentWidget() is self.run_page:
             self.run_page.set_sop(self.editor.sop)     # 未執行時同步編輯後的內容
 
@@ -488,7 +530,7 @@ class MainWindow(QMainWindow):
             self, "尚未儲存", "SOP 有尚未儲存的變更，要先儲存嗎？",
             QMessageBox.StandardButton.Save | QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel)
         if answer == QMessageBox.StandardButton.Save:
-            return self._save()
+            return self._request_save()
         return answer == QMessageBox.StandardButton.Discard
 
     def _new_sop(self):
@@ -506,6 +548,23 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "開啟 SOP", str(SOPS_DIR), "SOP 設定檔 (*.json)")
         if path:
             self._open_path(Path(path))
+
+    def _request_save(self, save_as=False) -> bool:
+        """A modal file dialog runs a nested event loop; ignore repeated clicks meanwhile."""
+        if self._save_pending:
+            return False
+        self._save_pending = True
+        for button in (self.save_button, self.save_as_button):
+            button.setEnabled(False)
+        try:
+            return self._save_as() if save_as else self._save()
+        finally:
+            self._save_pending = False
+            for button in (self.save_button, self.save_as_button):
+                button.setEnabled(True)
+
+    def _request_save_as(self) -> bool:
+        return self._request_save(save_as=True)
 
     def _save(self) -> bool:
         if self.sop_path is None:
@@ -543,14 +602,13 @@ class MainWindow(QMainWindow):
         return True
 
     def _on_modified(self):
-        if not self.dirty:
-            self.dirty = True
-            self._update_title()
+        self.dirty = True
+        self._update_title()
 
     def _update_title(self):
         name = self.sop_path.name if self.sop_path else "未儲存"
-        self.setWindowTitle(f"SOP 工序監控 — {self.editor.sop.name}（{name}）{' *' if self.dirty else ''}")
-        self.editor.set_document_state(self.dirty, saved=self.sop_path is not None)
+        sop = self.editor.sop
+        self.setWindowTitle(f"SOP 工序監控 — {sop.name}（{name}）{' *' if self.dirty else ''}")
 
     # ---- 開始作業 --------------------------------------------------------------
     def _start_run(self):
@@ -562,7 +620,7 @@ class MainWindow(QMainWindow):
                 self, "尚未儲存", "SOP 有尚未儲存的變更。要先儲存再開始嗎？\n（選「否」會直接用目前內容開始）",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel)
             if answer == QMessageBox.StandardButton.Cancel or (answer == QMessageBox.StandardButton.Yes
-                                                               and not self._save()):
+                                                               and not self._request_save()):
                 return
         sop = self.editor.sop
         errors, warnings = sop.validate(self.model_info.classes if self.model_info else None)

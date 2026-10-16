@@ -133,7 +133,6 @@ class EditorPreviewAndSummaryTests(QtTests):
         editor = self.widget(EditorPage())
         editor.set_sop(sop or SOPDefinition(steps=[Step("install", conditions=[Condition(label="grip")])]))
         editor.set_classes(["grip"])
-        editor._set_editor_mode("steps")
         return editor
 
     def test_brief_flash_is_only_one_frame_not_engine_completion(self):
@@ -144,10 +143,10 @@ class EditorPreviewAndSummaryTests(QtTests):
         frame = packet(.1)
         editor.on_packet(frame)
         events = engine.update(frame.result)
-        self.assertIn("本幀成立，尚未代表工序完成", editor.live_label.text())
-        self.assertIn("時間窗", editor.live_label.text())
-        self.assertIn("80%", editor.live_label.text())
-        self.assertIn("未累積時間", editor.live_label.text())
+        self.assertIn("本幀成立，尚未代表工序完成", editor.step_editors[0].live_label.text())
+        self.assertIn("時間窗", editor.step_editors[0].live_label.text())
+        self.assertIn("80%", editor.step_editors[0].live_label.text())
+        self.assertIn("未累積時間", editor.step_editors[0].live_label.text())
         self.assertNotIn("step_completed", [event.kind for event in events])
 
     def test_sustained_detection_uses_engine_hold_but_preview_never_claims_completion(self):
@@ -160,20 +159,22 @@ class EditorPreviewAndSummaryTests(QtTests):
             editor.on_packet(frame)
             events.extend(engine.update(frame.result))
         self.assertIn("step_completed", [event.kind for event in events])
-        self.assertIn("尚未代表工序完成", editor.live_label.text())
+        self.assertIn("尚未代表工序完成", editor.step_editors[0].live_label.text())
 
     def test_invalid_detection_shows_unavailable_not_disappearance(self):
         editor = self.make_editor(SOPDefinition(steps=[Step(conditions=[Condition("disappear", "grip")])]))
         editor.on_packet(packet(detected=False, valid=False))
-        self.assertIn("本幀條件未成立", editor.live_label.text())
-        self.assertIn("模型尚未就緒", editor.live_label.text())
+        # Same state as the engine: the frame blocks accumulation instead of meeting "disappear".
+        self.assertIn("無法判斷", editor.step_editors[0].live_label.text())
+        self.assertNotIn("本幀成立", editor.step_editors[0].live_label.text())
+        self.assertIn("模型尚未就緒", editor.step_editors[0].live_label.text())
 
     def test_manual_step_is_explicit_not_missing_condition_error(self):
         editor = self.make_editor(SOPDefinition(steps=[Step("manual")]))
-        self.assertIn("人工確認", editor.step_list.item(0).text())
-        self.assertNotIn("⚠", editor.step_list.item(0).text())
+        self.assertIn("人工確認", editor.step_editors[0].manual_label.text())
+        self.assertNotIn("⚠", editor.step_editors[0].summary_label.text())
         editor.on_packet(packet())
-        self.assertIn("需手動確認", editor.live_label.text())
+        self.assertIn("需手動確認", editor.step_editors[0].live_label.text())
 
     def test_summary_checks_every_step_and_referenced_fields(self):
         editor = self.make_editor(SOPDefinition(steps=[
@@ -184,35 +185,35 @@ class EditorPreviewAndSummaryTests(QtTests):
         ]))
         self.assertIn("2/4", editor.setup_summary.text())
         self.assertIn("待修正 2", editor.setup_summary.text())
-        self.assertIn("未選物件", editor.step_list.item(2).text())
-        self.assertIn("模型無類別 wrong", editor.step_list.item(3).text())
-        self.assertIn("區域不存在", editor.step_list.item(3).text())
+        self.assertIn("未選物件", editor.step_editors[2].summary_label.text())
+        self.assertIn("模型無類別 wrong", editor.step_editors[3].summary_label.text())
+        self.assertIn("區域不存在", editor.step_editors[3].summary_label.text())
 
     def test_following_region_without_reference_is_marked_incomplete(self):
         region = ROI("left", [(0, 0), (.5, 0), (.5, .5), (0, .5)], "workpiece")
         editor = self.make_editor(SOPDefinition(rois=[region], steps=[
             Step(conditions=[Condition(label="grip", roi="left")])]))
-        self.assertIn("區域缺少參考工件", editor.step_list.item(0).text())
+        self.assertIn("區域缺少參考工件", editor.step_editors[0].summary_label.text())
         self.assertIn("待修正 1", editor.setup_summary.text())
 
-    def test_apply_roi_updates_list_and_summary_without_losing_selection(self):
+    def test_region_binding_updates_the_visible_step_without_navigation(self):
         region = ROI("left", [(0, 0), (.5, 0), (.5, .5), (0, .5)])
         editor = self.make_editor(SOPDefinition(rois=[region], steps=[Step("install")]))
-        editor.roi_list.setCurrentRow(0)
-        with patch("sop_app.ui.editor_page.QInputDialog.getItem", return_value=("grip", True)):
-            editor._apply_roi()
+        cards = editor.step_editors[0].condition_table
+        cards.add_button.click()
+        field = cards.field_widget(0, "roi")
+        field.setCurrentIndex(field.findData("left"))
         self.assertEqual(editor.sop.steps[0].conditions[0].roi, "left")
-        self.assertIn("自動 · 1 條件", editor.step_list.item(0).text())
+        self.assertIn("自動", editor.step_editors[0].manual_label.text())
         self.assertIn("自動 1", editor.setup_summary.text())
-        self.assertEqual(editor.step_list.currentRow(), 0)
 
     def test_delete_and_restore_synchronize_sop_list_and_summary(self):
         editor = self.make_editor()
-        editor.condition_table.select_condition(0)
-        editor.condition_table.remove_button.click()
+        editor.step_editors[0].condition_table.select_condition(0)
+        editor.step_editors[0].condition_table._remove_row(0)
         self.assertEqual(editor.sop.steps[0].conditions, [])
         self.assertIn("人工確認 1", editor.setup_summary.text())
-        editor.condition_table.undo_delete_button.click()
+        editor.step_editors[0].condition_table.undo_delete_button.click()
         self.assertEqual(editor.sop.steps[0].conditions[0].label, "grip")
         self.assertIn("自動 1", editor.setup_summary.text())
 
@@ -232,21 +233,8 @@ class EditorPreviewAndSummaryTests(QtTests):
         editor = self.make_editor(SOPDefinition(steps=[Step(conditions=[Condition(label="grip")],
                                                           forbidden=[Condition(label="grip")])]))
         editor.on_packet(packet())
-        self.assertIn("本幀違規條件成立", editor.live_label.text())
+        self.assertIn("本幀違規條件成立", editor.step_editors[0].live_label.text())
 
-    def test_pending_save_does_not_finish_or_emit_duplicate_request(self):
-        editor = self.make_editor()
-        editor._set_quick_phase("verify")
-        requests = []
-        editor.save_requested.connect(lambda: requests.append(True))
-        editor._save_quick_setup()
-        editor._save_quick_setup()
-        self.assertEqual(requests, [True])
-        self.assertEqual(editor._quick_phase, "verify")
-        self.assertFalse(editor.quick_save_button.isEnabled())
-        editor.on_save_result("cancelled")
-        self.assertEqual(editor._quick_phase, "verify")
-        self.assertTrue(editor.quick_save_button.isEnabled())
 
 
 class MainWindowBatchOneTests(QtTests):
@@ -270,7 +258,6 @@ class MainWindowBatchOneTests(QtTests):
         self.window._apply_sop(SOPDefinition(name="draft", version=3,
                                            steps=[Step("install", conditions=[Condition(label="grip")])]), None)
         self.window._on_modified()
-        self.window.editor._set_quick_phase("verify")
         self.results = []
         self.window.save_finished.connect(self.results.append)
 
@@ -278,12 +265,29 @@ class MainWindowBatchOneTests(QtTests):
         self.window.dirty = False
         self.window.close()
 
+    def test_pending_save_ignores_repeated_requests_while_dialog_is_open(self):
+        calls = []
+
+        def dialog(*_args, **_kwargs):
+            calls.append(True)
+            self.assertTrue(self.window._save_pending)
+            self.assertFalse(self.window.save_button.isEnabled())
+            self.assertFalse(self.window._request_save())   # e.g. Ctrl+S during the modal dialog
+            return "", ""
+
+        with patch("sop_app.ui.main_window.QFileDialog.getSaveFileName", side_effect=dialog):
+            self.window.save_button.click()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.results, ["cancelled"])
+        self.assertFalse(self.window._save_pending)
+        self.assertTrue(self.window.save_button.isEnabled())
+
     def test_cancel_save_as_keeps_guide_content_dirty_and_path(self):
         before = copy.deepcopy(self.window.editor.sop)
         with patch("sop_app.ui.main_window.QFileDialog.getSaveFileName", return_value=("", "")):
-            self.window.editor.quick_save_button.click()
+            self.window.save_button.click()
         self.assertEqual(self.results, ["cancelled"])
-        self.assertEqual(self.window.editor._quick_phase, "verify")
+        self.assertFalse(self.window._save_pending)
         self.assertEqual(self.window.editor.sop, before)
         self.assertTrue(self.window.dirty)
         self.assertIsNone(self.window.sop_path)
@@ -296,30 +300,30 @@ class MainWindowBatchOneTests(QtTests):
         original_object = self.window.editor.sop
         with patch("sop_app.sop_schema.os.replace", side_effect=PermissionError("test denied")), \
              patch("sop_app.ui.main_window.QMessageBox.warning"):
-            self.window.editor.quick_save_button.click()
+            self.window.save_button.click()
         self.assertEqual(self.results, ["failed"])
         self.assertEqual(self.window.editor.sop.version, 3)
         self.assertEqual(load_sop(path).version, 3)
         self.assertEqual(self.window.editor.version_label.text(), "3")
-        self.assertEqual(self.window.editor._quick_phase, "verify")
+        self.assertFalse(self.window._save_pending)
         self.assertTrue(self.window.dirty)
-        self.window.editor.quick_save_button.click()
+        self.window.save_button.click()
         self.assertEqual(self.results, ["failed", "saved"])
         self.assertIs(self.window.editor.sop, original_object)
         self.assertEqual(self.window.editor.sop.version, 4)
         self.assertEqual(load_sop(path).version, 4)
         self.assertEqual(self.window.editor.version_label.text(), "4")
-        self.assertEqual(self.window.editor._quick_phase, "")
+        self.assertFalse(self.window._save_pending)
         self.assertFalse(self.window.dirty)
 
     def test_new_save_succeeds_without_bumping_version(self):
         path = self.root / "new.json"
         with patch("sop_app.ui.main_window.QFileDialog.getSaveFileName", return_value=(str(path), "")):
-            self.window.editor.quick_save_button.click()
+            self.window.save_button.click()
         self.assertEqual(load_sop(path).version, 3)
         self.assertEqual(self.window.sop_path, path)
         self.assertEqual(self.results, ["saved"])
-        self.assertEqual(self.window.editor._quick_phase, "")
+        self.assertFalse(self.window._save_pending)
         self.assertFalse(self.window.dirty)
 
     def test_failed_save_as_never_replaces_current_path(self):
@@ -435,75 +439,60 @@ class MainWindowBatchOneTests(QtTests):
         acknowledge.assert_called_once()
 
     def editing_workflow(self, width, height):
-        """Mouse/keyboard acceptance flow at both target window sizes (synthetic vision)."""
-        sop = SOPDefinition(name="workflow", steps=[
+        """Edit two expanded steps, draw/bind a region, and save the actual UI draft."""
+        definition = SOPDefinition(name="workflow", steps=[
             Step(f"step {index}", conditions=[Condition(label="grip")]) for index in range(1, 5)])
-        self.window._apply_sop(sop, None)
+        self.window._apply_sop(definition, None)
         editor = self.window.editor
         editor.sop.model_path = str(self.root)
-        info = model_info(self.root, ("grip", "part"))
-        self.window._on_model_loaded(info, "CPU (simulated)", str(self.root))
+        self.window._on_model_loaded(model_info(self.root, ("grip", "part")), "CPU (simulated)", str(self.root))
         self.window.tabs.setCurrentWidget(editor)
         self.window.resize(width, height)
         self.window.show()
         self.app.processEvents()
-        QTest.mouseClick(editor.mode_buttons["steps"], Qt.MouseButton.LeftButton)
+        editor.page_scroll.ensureWidgetVisible(editor.step_editors[0].duplicate_button)
+        QTest.mouseClick(editor.step_editors[0].duplicate_button, Qt.MouseButton.LeftButton)
         self.app.processEvents()
-
-        def button(text):
-            return next(widget for widget in editor.findChildren(QPushButton) if widget.text() == text)
-
-        QTest.mouseClick(button("複製"), Qt.MouseButton.LeftButton)
         self.assertEqual(len(editor.sop.steps), 5)
-        self.assertEqual(editor.step_list.currentRow(), 1)
-        label = editor.condition_table.field_widget(0, "label")
-        label.setFocus()
-        QTest.keyClick(label, Qt.Key.Key_End)
+        target = editor.step_editors[1]
+        field = target.condition_table.field_widget(0, "label")
+        editor.page_scroll.ensureWidgetVisible(field)
+        field.setFocus()
+        QTest.keyClick(field, Qt.Key.Key_End)
         self.assertEqual(editor.sop.steps[1].conditions[0].label, "part")
-
+        self.assertEqual(editor.sop.steps[0].conditions[0].label, "grip")
         editor.on_packet(packet())
-        QTest.mouseClick(editor.mode_buttons["positions"], Qt.MouseButton.LeftButton)
+        editor.page_scroll.ensureWidgetVisible(editor.video)
+        editor.freeze_check.setChecked(True)
+        editor.draw_button.click()
         self.app.processEvents()
-        QTest.mouseClick(editor.freeze_check, Qt.MouseButton.LeftButton)
-        QTest.mouseClick(editor.draw_button, Qt.MouseButton.LeftButton)
-        self.app.processEvents()
-        image_rect = editor.video._image_rect()
-        start = editor.video._to_widget(image_rect, .05, .1).toPoint()
-        end = editor.video._to_widget(image_rect, .25, .5).toPoint()
-        with patch("sop_app.ui.editor_page.QInputDialog.getText", return_value=("new position", True)):
-            QTest.mousePress(editor.video, Qt.MouseButton.LeftButton, pos=start)
-            QTest.mouseMove(editor.video, end)
-            QTest.mouseRelease(editor.video, Qt.MouseButton.LeftButton, pos=end)
+        start = editor.video._to_widget(editor.video._image_rect(), .05, .1).toPoint()
+        end = editor.video._to_widget(editor.video._image_rect(), .25, .5).toPoint()
+        QTest.mousePress(editor.video, Qt.MouseButton.LeftButton, pos=start)
+        QTest.mouseMove(editor.video, end)
+        QTest.mouseRelease(editor.video, Qt.MouseButton.LeftButton, pos=end)
         self.assertEqual(len(editor.sop.rois), 1)
-        QTest.mouseClick(editor.roi_more_button, Qt.MouseButton.LeftButton)
-        self.app.processEvents()
-        with patch("sop_app.ui.editor_page.QInputDialog.getItem", return_value=("part", True)):
-            QTest.mouseClick(button("套用到工序…"), Qt.MouseButton.LeftButton)
-        self.assertEqual(editor.sop.steps[1].conditions[-1].roi, "new position")
+        row = editor.roi_rows[0]
+        row.name_edit.setText("new position")
+        row.name_edit.editingFinished.emit()
+        field = editor.step_editors[1].condition_table.field_widget(0, "roi")
+        field.setCurrentIndex(field.findData("new position"))
+        self.assertEqual(editor.sop.steps[1].conditions[0].roi, "new position")
         editor._return_live()
         frame = packet()
         frame.result.detections = [Detection("part", .9, (10, 10, 30, 30))]
         editor.on_packet(frame)
         self.app.processEvents()
-        self.assertEqual(editor.step_list.currentRow(), 1)
-        self.assertIn("本幀成立", editor.live_label.text(), str((editor._preview_result, editor.sop.to_dict())))
+        self.assertIn("本幀成立", editor.step_editors[1].live_label.text())
         self.assertEqual((self.window.width(), self.window.height()), (width, height))
-
-        artifact_directory = os.environ.get("SOP_EDITOR_TEST_ARTIFACT_DIR")
-        if artifact_directory:
-            destination = Path(artifact_directory)
-            destination.mkdir(parents=True, exist_ok=True)
-            self.assertTrue(self.window.grab().save(str(destination / f"editor-{width}x{height}.png")))
-        editor._set_quick_phase("verify")
-        self.app.processEvents()
         saved_path = self.root / "workflow.json"
         with patch("sop_app.ui.main_window.QFileDialog.getSaveFileName", return_value=(str(saved_path), "")):
-            QTest.mouseClick(editor.quick_save_button, Qt.MouseButton.LeftButton)
+            self.window.save_button.click()
         restored = load_sop(saved_path)
         self.assertEqual(len(restored.steps), 5)
-        self.assertEqual(restored.steps[1].conditions[-1].roi, "new position")
+        self.assertEqual(restored.steps[1].conditions[0].roi, "new position")
         self.assertFalse(self.window.dirty)
-        self.assertEqual(editor._quick_phase, "")
+        self.assertFalse(self.window._save_pending)
 
     def test_mouse_keyboard_workflow_at_1366x768(self):
         self.editing_workflow(1366, 768)

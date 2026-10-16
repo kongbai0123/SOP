@@ -158,20 +158,23 @@ class WholeUIAuditTests(unittest.TestCase):
         self.assertEqual(errors, [], f"{name}: {errors}")
 
     def test_all_editor_workspaces_and_expanded_controls(self):
-        for mode in ("steps", "overview", "follow", "positions", "cycle"):
-            self.editor._set_editor_mode(mode)
-            self.check(self.window, "editor-" + mode)
-        self.editor._set_editor_mode("steps")
-        self.editor.description_section.set_expanded(True)
-        self.editor.step_advanced.set_expanded(True)
-        self.editor.forbidden_section.set_expanded(True)
-        for cards in (self.editor.condition_table, self.editor.forbidden_table):
-            cards.field_widget(0, "advanced").set_expanded(True)
-        self.editor.validation_details_section.set_expanded(True)
-        self.check(self.window, "editor-expanded")
-        self.editor._set_editor_mode("positions")
-        self.editor.roi_more_button.setChecked(True)
-        self.check(self.window, "editor-position-tools")
+        """Collapsed summaries and every expanded field fit without clipping."""
+        self.assertFalse(self.editor.findChildren(QTabWidget))
+        self.check(self.window, "editor-collapsed")
+        self.editor.expand_all_button.click()
+        self.assertGreater(self.editor.page_scroll.verticalScrollBar().maximum(), 0)
+        for index, step in enumerate(self.editor.step_editors):
+            for control in (step.instruction_edit, step.hold_spin, step.forbidden_mode,
+                            step.condition_table, step.forbidden_table):
+                self.assertTrue(control.isVisible())
+            self.editor.page_scroll.ensureWidgetVisible(step)
+            self.check(self.window, "editor-step-" + str(index))
+        self.editor.page_scroll.ensureWidgetVisible(self.editor.validation_box)
+        self.check(self.window, "editor-validation")
+        self.assertEqual(self.editor.page_scroll.horizontalScrollBar().maximum(), 0)
+        self.editor.focus_button.click()
+        self.check(self.window, "editor-large-image")
+        self.editor.focus_button.click()
 
     def test_monitor_idle_running_alarm_and_long_names(self):
         page = self.window.run_page
@@ -189,10 +192,13 @@ class WholeUIAuditTests(unittest.TestCase):
         page = self.window.records_page
         self.window.tabs.setCurrentWidget(page)
         page.use_dates.setChecked(True)
-        _fill(page.cycles, [(1, "左側主要工件安裝作業", 1, "辨識模型", "2026-10-13 10:20:00", 12, "完成",
-                            "工站一", "測試作業員", "工單-TEST", "SN-00001")])
-        _fill(page.steps, [(1, "左側工作區安裝位置確認", "完成", 5, "", "", "2026-10-13 10:20:05", "")])
-        _fill(page.alarms, [("2026-10-13 10:20:02", 1, "順序錯誤", "後續工序提前成立，請檢查作業順序。", "未確認", "")])
+        # Exercise the current table geometry without relying on removed columns.
+        for table in (page.cycles, page.steps, page.alarms, page.positioning):
+            table.blockSignals(True)
+            values = ["左側工作區安裝與位置確認" if column % 2 else "2026-10-16 10:20:00"
+                      for column in range(table.columnCount())]
+            _fill(table, [tuple(values)])
+            table.blockSignals(False)
         self.check(self.window, "records")
         for table in (page.cycles, page.steps, page.alarms, page.positioning):
             self.assertFalse(table.horizontalHeader().stretchLastSection())
