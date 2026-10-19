@@ -2,11 +2,13 @@
 
 此流程為現有 Python／PySide6 程式建立 Windows x64 自包含安裝包。版本讀取 `sop_app/__init__.py`，不另外維護一份應用程式版本。產品識別固定為 `SOP.WorkInstruction`。
 
-版本可為三段日期或加上第四段同日修訂號，例如 `2026.10.19.1`。三段版本的 PE／NSIS 檔案版本補零，四段版本直接沿用。GitHub 原始碼版本更新不代表已重新建置安裝成品；本次 `2026.10.19.1` 發行未附 Windows 安裝包。
+版本可為三段日期或加上第四段同日修訂號，例如 `2026.10.19.1`。三段版本的 PE／NSIS 檔案版本補零，四段版本直接沿用。[v2026.10.19.1 Release](https://github.com/kongbai0123/SOP/releases/tag/v2026.10.19.1) 提供由該標籤乾淨原始碼建置的 Windows 安裝包；其他版本是否附安裝檔，請看各版資產。
 
 ## 使用者安裝
 
-在本機交付資料夾內，將 `SOP-版本-windows-x64-Setup.exe` 與同名的 `.payload.zip` 放在一起，雙擊 **Setup.exe**。資料包供安裝器讀取，不必自行解壓縮。
+從 Release 下載 `SOP-2026.10.19.1-windows-x64-Setup.exe`、`.payload.zip.part01` 至 `.part04` 四個分片，以及 `Assemble.cmd`，全部放在同一資料夾。先雙擊 **Assemble.cmd**；它以 Windows 內建工具核對 Setup、各分片及重組後完整 ZIP 的大小與 SHA-256，完成後再雙擊 **Setup.exe**。重組工具不會自動安裝或更動系統政策。
+
+四個分片是完整 ZIP 的二進位切片，請勿分別解壓縮。GitHub 每個 Release 資產須小於 2 GiB，因此約 3.44 GB 的資料包以分片交付；重組後的 `.payload.zip` 供安裝器讀取，保留與 Setup 同一目錄，不必自行解壓。詳細下載步驟與校驗值見 Release 的 `README-zh-TW.md`、`delivery-manifest.json` 及 `SHA256SUMS.txt`。
 
 精靈依序為「歡迎 → 安裝位置 → 捷徑 → 安裝進度 → 完成」，提供繁體中文及英文資源，預設採系統語言；繁中系統顯示繁中。
 
@@ -15,7 +17,8 @@
 - 只安裝給目前使用者，使用 HKCU 登錄，不要求管理員權限。
 - 內含 Python、Qt、OpenCV 及目前 CUDA 版推論執行環境；使用者不必安裝 Python 或 pip。GPU 使用仍需適合的 NVIDIA 驅動；未提供辨識模型，請在程式內選取自己的模型包。
 - CUDA 執行環境體積較大，因此採 Setup 與離線資料包配對交付。安裝時不下載依賴、模型或更新。
-- 本次離線資料包約 3.44 GB，安裝後程式約 5.39 GB；安裝時還需 staging 空間，升級時可能另需舊檔備份空間，請先確認目標磁碟容量。
+- 本次離線資料包約 3.44 GB，安裝後程式約 5.39 GB；保留分片、重組 ZIP、安裝 staging 與程式檔時，建議預留至少 20 GB 可用空間。大型原生套件的逐檔校驗及安裝可能需要數分鐘。
+- 本版交付的預設 SOP 為空白，沒有本機工站 SOP、工序、參考圖片、作業紀錄、截圖、設定、備份或私有模型。官方執行套件的標準資源與範例資料另保留於 runtime。
 
 沒有提供本產品正式授權條款，因此沒有虛構 EULA 同意頁。第三方 notices 與授權文字位於安裝目錄的 `_internal\notices`；本機試裝不代表已完成商業散布授權審查，特別是 Ultralytics 的 AGPL 條款。
 
@@ -68,6 +71,8 @@ powershell.exe -NoProfile -File .\tools\build_installer.ps1 -SkipPayload -Rebuil
 
 本次 2026-10-19 產生的 `2026.10.16` 版最終 `SOP.exe` 曾以 WinError 4551 被拒絕；CodeIntegrity 3077 的平面 SHA-256 與該程式相符，事件政策名稱為 `VerifiedAndReputableDesktop`。因此這份成品還不能宣稱已完成最終啟動驗收。完整資料包的直接部署／移除測試已通過，範圍見 `verification.json`；這不等於完整 NSIS 一般解除安裝或跨 PC 驗收通過。後續版本依各自的報告判定，不沿用本次結果。
 
+`2026.10.19.1` 的獨立驗證已完成實際完整資料包重組、中文及空白路徑安裝、已安裝程式的 Qt／OpenCV／AI 原生套件啟動、一般 NSIS 靜默解除安裝、未知檔案保留與測試登錄清除，詳見該版 Release 的 `verification.json`。這是本機 Windows x64 的結果，尚未在乾淨 Windows VM、其他 PC、實體攝影機或私有模型上重新驗收；精靈互動、捷徑與完整大型升降版也不在這次驗證範圍。
+
 轉交廠商時，將整個交付資料夾複製過去，保留 Setup 與 payload ZIP 同一目錄。先由廠商在其核准的測試環境檢查完整性與實際安裝、啟動、功能、捷徑及一般解除安裝。如被政策拒絕，交由有權限的 IT 依流程核准具體成品；沒有憑證時也可由企業建立允許規則，但是否准許及規則形式由該企業決定。每版成品改動後應重新核對，交付用整檔 SHA-256 不可直接當作 App Control 的 PE／Authenticode hash。
 
 若日後使用公開受信任簽章，簽章不會綁定安裝 PC，接收者不需要私鑰；自簽憑證不會自動被其他 PC 信任。即使有有效簽章，新版本仍可能出現 SmartScreen 提示或不符合企業政策；本專案不會自行產生／匯入自簽信任或關閉防護。參考：[Microsoft SmartScreen](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation)、[App Control 規則](https://learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/design/select-types-of-rules-to-create)、[PowerShell 與 App Control](https://learn.microsoft.com/en-us/powershell/scripting/security/app-control/how-app-control-works)。
@@ -81,7 +86,7 @@ Uninstall.exe /S
 
 `/S` 必須大寫。`/DESKTOP` 與 `/STARTMENU` 只接受 `0` 或 `1`，可省略；首次預設皆為 `1`，重裝沿用前次選擇。`/D=` 必須放最後，其值依 NSIS 規則不加引號；從其他程式啟動時仍需正確處理整條命令列。靜默安裝不啟動主程式。
 
-成功退出碼為 `0`，失敗為非零；NSIS 取消也不算成功。詳細日誌位於 `%TEMP%\SOP.WorkInstruction-install.log` 或 `-uninstall.log`。GUI 與靜默安裝使用相同的寫入前驗證。
+成功退出碼為 `0`，失敗為非零；NSIS 取消也不算成功。一般解除安裝入口會從暫存位置啟動另一個程序，入口結束不表示移除已完成；自動驗收還須等待日誌及最終檔案、marker、登錄狀態。詳細日誌位於 `%TEMP%\SOP.WorkInstruction-install.log` 或 `-uninstall.log`。GUI 與靜默安裝使用相同的寫入前驗證。
 
 ## 驗證範圍
 

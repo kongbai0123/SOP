@@ -31,8 +31,10 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install --no-deps ultralytics==8.4.150 ultralytics-thop ultralytics-platform
 ```
 
-執行 `sop.bat` 啟動程式。Windows 安裝包的建置方式與部署說明見 [安裝文件](installer/README.md)；
-GitHub 原始碼發行不代表已附帶安裝檔。
+執行 `sop.bat` 啟動程式。
+
+Windows 安裝版可從 [GitHub Release](https://github.com/kongbai0123/SOP/releases/tag/v2026.10.19.1) 下載 Setup、四個資料包分片及 `Assemble.cmd`，放在同一資料夾，先執行 `Assemble.cmd` 校驗並重組，再執行 Setup。
+建置方式與部署說明見 [安裝文件](installer/README.md)。
 
 ## 使用流程
 
