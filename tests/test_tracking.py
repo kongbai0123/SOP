@@ -439,6 +439,7 @@ class EditorTests(unittest.TestCase):
         editor.set_classes(['grip'])
         editor.set_sop(SOPDefinition(workpiece=capture_workpiece(frame, TARGET), steps=[Step('安裝')]))
         editor.reference_button.setChecked(True)
+        editor.original_frame_button.click()  # No live pose: explicitly choose canonical reference.
         editor.draw_button.click()
         outside = [(.05,.05),(.15,.05),(.15,.15),(.05,.15)]
         editor._on_roi_drawn(outside)

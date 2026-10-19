@@ -3,7 +3,7 @@
 以攝影機與 AI 辨識協助檢查作業是否依照 SOP 順序完成的 Windows 桌面程式。
 適用於單機工站，可在介面管理工站、編輯工序與作業區域，並查閱作業結果及歷史截圖。
 
-[版本 v2026.10.19.1](https://github.com/kongbai0123/SOP/releases/tag/v2026.10.19.1) · [操作與維護指南](docs/user-guide.md) · [版本紀錄](CHANGELOG.md)
+[Windows 安裝版 v2026.10.19.1](https://github.com/kongbai0123/SOP/releases/tag/v2026.10.19.1) · [操作與維護指南](docs/user-guide.md) · [版本紀錄](CHANGELOG.md)
 
 ## 功能
 
