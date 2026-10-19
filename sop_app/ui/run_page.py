@@ -6,20 +6,22 @@ from datetime import datetime
 
 import numpy as np
 
-from PySide6.QtCore import QEvent, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QLayout,
+from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QSplitter,
                                QScrollArea, QSizePolicy, QStyle, QVBoxLayout, QWidget)
 
 from ..conditions import combine_results
-from ..engine import EngineEvent, EngineSnapshot, Phase, StepStatus
+from ..engine import EngineEvent, EngineSnapshot, Phase
 from ..pipeline import FramePacket
 from ..overlay import draw_detections
 from ..sop_schema import SOPDefinition
 from ..tracking import WorkpieceLocator, display_rois, workpiece_key
 from ..tracking_debug import TrackingDebug
 from .video_widget import VideoWidget
+from .compact_layout import StatusText
+from .step_overview import StepOverview
 from .workbench_widgets import install_readability_guard, workbench_palette
 
 
@@ -35,6 +37,18 @@ def run_palette(dark: bool) -> dict:
     return colors
 
 
+class _MonitorControlsScroll(QScrollArea):
+    """Use the controls' natural height, but allow a short screen to shrink it."""
+
+    def sizeHint(self):
+        content = self.widget()
+        height = content.sizeHint().height() if content is not None else 155
+        return QSize(380, min(155, max(32, height)))
+
+    def minimumSizeHint(self):
+        return QSize(0, 32)
+
+
 class RunPage(QWidget):
     start_requested = Signal()
     stop_requested = Signal()
@@ -46,6 +60,7 @@ class RunPage(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setProperty("ownsPageScroll", True)
         self.sop: SOPDefinition | None = None
         self._running = False
         self._transform = None
@@ -63,6 +78,7 @@ class RunPage(QWidget):
         self._flash_on = False
         self._dark = None
         self._colors = run_palette(False)
+        self._start_appearance = None
         self._build()
         self._apply_theme()
         install_readability_guard(self)
@@ -70,10 +86,14 @@ class RunPage(QWidget):
     def _build(self):
         self.video = VideoWidget()
 
-        self.step_title = QLabel("待機中")
-        self.step_title.setTextFormat(Qt.TextFormat.PlainText)
-        self.step_title.setFont(QFont(self.font().family(), 18, QFont.Weight.Bold))
-        self.step_title.setWordWrap(True)
+        self.step_title = StatusText("目前：待機中")
+        self.step_title.setObjectName("currentStepTitle")
+        self.step_title.setAccessibleName("目前工序")
+        self.step_title.setFont(QFont(self.font().family(), 15, QFont.Weight.Bold))
+        self.next_step_label = StatusText("下一道：—")
+        self.next_step_label.setObjectName("nextStepTitle")
+        self.next_step_label.setAccessibleName("下一道工序")
+        self.instruction_preview = StatusText()
         self.instruction = QLabel("")
         self.instruction.setTextFormat(Qt.TextFormat.PlainText)
         self.instruction.setWordWrap(True)
@@ -81,23 +101,16 @@ class RunPage(QWidget):
         self.tracking_label = QLabel("")
         self.tracking_label.setWordWrap(True)
         self.progress = QProgressBar()
-        self.progress.setMinimumHeight(26)
+        self.progress.setMinimumHeight(22)
         self.progress.setRange(0, 100)
         self.progress.setFormat("條件累積 %p%")
         self.condition_label = QLabel("")
         self.condition_label.setTextFormat(Qt.TextFormat.RichText)
         self.condition_label.setWordWrap(True)
 
-        self.step_list = QListWidget()
-        self.step_list.setFont(QFont(self.font().family(), 11))
-        self.step_list.setWordWrap(True)
-        self.step_list.setTextElideMode(Qt.TextElideMode.ElideNone)
-        self.step_list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.step_list.setMinimumHeight(100)
-        self.cycle_label = QLabel("")
-        self.stats_label = QLabel("")
-        self.cycle_label.setWordWrap(True)
-        self.stats_label.setWordWrap(True)
+        self.step_overview = StepOverview()
+        self.cycle_label = StatusText()
+        self.stats_label = StatusText()
         self.log = QListWidget()
         self.log.setWordWrap(True)
         self.log.setTextElideMode(Qt.TextElideMode.ElideNone)
@@ -110,9 +123,17 @@ class RunPage(QWidget):
         details_layout = QVBoxLayout(self.details_panel)
         details_layout.setContentsMargins(0, 0, 0, 0)
         self.details_panel.hide()
+        self.log_button = QPushButton("顯示事件紀錄")
+        self.log_button.setCheckable(True)
+        self.log_button.toggled.connect(self._toggle_log)
+        self.log_panel = QWidget()
+        log_layout = QVBoxLayout(self.log_panel)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_layout.addWidget(self.log)
+        self.log_panel.hide()
 
         self.start_button = QPushButton("開始作業")
-        self.start_button.setMinimumHeight(48)
+        self.start_button.setMinimumHeight(36)
         self.start_button.setToolTip("可直接開始作業；位置尚未確認時，跟隨位置的條件會暫停累積。")
         self.start_button.clicked.connect(self._on_start_clicked)
         self.display_mode = QComboBox()
@@ -131,7 +152,7 @@ class RunPage(QWidget):
         # 人工確認與跳過分開：確認只對人工工序有效；跳過必定判 NG，需再次確認。
         self.confirm_button = QPushButton("人工確認完成")
         self.confirm_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton))
-        self.confirm_button.setMinimumHeight(40)
+        self.confirm_button.setMinimumHeight(32)
         self.confirm_button.setToolTip("只有「未設自動條件」的人工工序可以確認完成")
         self.confirm_button.clicked.connect(lambda: self.confirm_requested.emit())
         self.skip_button = QPushButton("跳過本工序（判 NG）")
@@ -163,57 +184,100 @@ class RunPage(QWidget):
         # 警報需人工確認；未確認前持續閃爍，避免只響一聲就被忽略。
         self.alarm_panel = QFrame()
         self.alarm_panel.setObjectName("alarmPanel")
-        self.alarm_text = QLabel("")
-        self.alarm_text.setTextFormat(Qt.TextFormat.PlainText)
-        self.alarm_text.setWordWrap(True)
+        self.alarm_text = StatusText()
+        self.alarm_text.setAccessibleName("未確認警報，完整內容可查看提示或事件紀錄")
         self.alarm_text.setFont(QFont(self.font().family(), 13, QFont.Weight.Bold))
         self.alarm_ack_button = QPushButton("確認警報")
-        self.alarm_ack_button.setMinimumHeight(36)
+        self.alarm_ack_button.setMinimumHeight(28)
         self.alarm_ack_button.clicked.connect(self.acknowledge_alarms)
         alarm_layout = QHBoxLayout(self.alarm_panel)
+        alarm_layout.setContentsMargins(6, 2, 6, 2)
         alarm_layout.addWidget(self.alarm_text, 1)
         alarm_layout.addWidget(self.alarm_ack_button)
         self.alarm_panel.hide()
+        self.alarm_slot = QWidget()
+        self.alarm_slot.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        alarm_slot_layout = QVBoxLayout(self.alarm_slot)
+        alarm_slot_layout.setContentsMargins(0, 0, 0, 0)
+        alarm_slot_layout.addWidget(self.alarm_panel)
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(500)
         self._flash_timer.timeout.connect(self._flash_alarm)
 
         panel = QWidget()
+        self.monitor_panel = panel
+        panel.setMinimumWidth(380)
         layout = QVBoxLayout(panel)
-        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setSpacing(3)
         layout.addWidget(self.start_button)
-        layout.addLayout(trace)
-        layout.addWidget(self.alarm_panel)
+        layout.addWidget(self.alarm_slot)
         layout.addWidget(self.step_title)
-        layout.addWidget(self.instruction)
+        layout.addWidget(self.next_step_label)
         layout.addWidget(self.progress)
+        details_layout.addWidget(self.instruction)
         details_layout.addWidget(self.condition_label)
-        layout.addLayout(buttons)
+        controls = QWidget()
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(3)
+        controls_layout.addLayout(trace)
+        controls_layout.addWidget(self.instruction_preview)
+        controls_layout.addLayout(buttons)
+        controls_layout.addWidget(self.cycle_label)
+        controls_layout.addWidget(self.stats_label)
+        # On a short/high-DPI screen, only the secondary controls scroll. The
+        # current/next headings and paged cards keep their own fixed area.
+        self.controls_scroll = _MonitorControlsScroll()
+        self.controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setMinimumHeight(32)
+        self.controls_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.controls_scroll.setWidget(controls)
+        self.controls_scroll.setMaximumHeight(155)
+        layout.addWidget(self.controls_scroll)
         details_layout.addWidget(self.tracking_label)
         layout.addWidget(self._section("工序進度"))
-        layout.addWidget(self.step_list, 2)
-        layout.addWidget(self.cycle_label)
-        layout.addWidget(self.stats_label)
+        layout.addWidget(self.step_overview, 1)
         display_row = QHBoxLayout()
         display_row.addWidget(QLabel("畫面顯示"))
         display_row.addWidget(self.display_mode, 1)
         details_layout.addLayout(display_row)
         details_layout.addWidget(self.display_summary)
-        layout.addWidget(self.details_button)
-        layout.addWidget(self.details_panel)
-        layout.addWidget(self._section("事件紀錄"))
-        layout.addWidget(self.log, 1)
+        toggles = QHBoxLayout()
+        toggles.addWidget(self.details_button)
+        toggles.addWidget(self.log_button)
+        layout.addLayout(toggles)
 
         for label in panel.findChildren(QLabel):
             label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         self.monitor_scroll = QScrollArea()
-        self.monitor_scroll.setMinimumWidth(380)
+        self.monitor_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.monitor_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.monitor_scroll.setWidgetResizable(True)
-        self.monitor_scroll.setWidget(panel)
+        self.monitor_scroll.setMinimumHeight(0)
+        self.monitor_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.monitor_scroll.setMaximumHeight(220)
+        auxiliary = QWidget()
+        auxiliary_layout = QVBoxLayout(auxiliary)
+        auxiliary_layout.setContentsMargins(6, 4, 6, 4)
+        auxiliary_layout.addWidget(self.details_panel)
+        auxiliary_layout.addWidget(self.log_panel)
+        self.monitor_scroll.setWidget(auxiliary)
+        self.monitor_scroll.hide()
+
+        self.monitor_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.monitor_splitter.setChildrenCollapsible(False)
+        self.monitor_splitter.addWidget(panel)
+        self.monitor_splitter.addWidget(self.monitor_scroll)
+        self.monitor_splitter.setStretchFactor(0, 1)
+        self.monitor_splitter.setStretchFactor(1, 0)
+        self.monitor_splitter.setSizes([600, 140])
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self.video)
-        splitter.addWidget(self.monitor_scroll)
+        splitter.addWidget(self.monitor_splitter)
         splitter.setStretchFactor(0, 1)
         splitter.setSizes([1000, 420])
         root = QHBoxLayout(self)
@@ -230,6 +294,18 @@ class RunPage(QWidget):
     def _toggle_details(self, visible):
         self.details_panel.setVisible(visible)
         self.details_button.setText("隱藏判定詳情" if visible else "顯示判定詳情")
+        self._toggle_auxiliary()
+
+    def _toggle_log(self, visible):
+        self.log_panel.setVisible(visible)
+        self.log_button.setText("隱藏事件紀錄" if visible else "顯示事件紀錄")
+        self._toggle_auxiliary()
+
+    def _toggle_auxiliary(self):
+        visible = self.details_button.isChecked() or self.log_button.isChecked()
+        self.monitor_scroll.setVisible(visible)
+        if visible:
+            self.monitor_splitter.setSizes([max(1, self.monitor_splitter.height() - 140), 140])
 
     # ---- 主題 ------------------------------------------------------------------
     def changeEvent(self, event):
@@ -244,7 +320,11 @@ class RunPage(QWidget):
             return
         self._dark = dark
         self._colors = c = run_palette(dark)
+        self.step_overview.set_colors(c)
+        self.alarm_text.setStyleSheet(f"color:{c['alarm_fg']};")
         self.setStyleSheet(f"""
+            QWidget#currentStepTitle {{ color:{c['active']}; font-size:16px; font-weight:bold; }}
+            QWidget#nextStepTitle {{ color:{c['muted']}; font-size:13px; }}
             QLabel#instructionLabel {{ color:{c['fg']}; font-size:15px; }}
             QLabel#displaySummary {{ padding:6px; background:{c['soft']}; color:{c['fg']}; border-radius:4px; }}
             QLabel#sectionLabel {{ font-weight:bold; margin-top:6px; color:{c['fg']}; }}
@@ -276,6 +356,7 @@ class RunPage(QWidget):
         suffix = f"\n（共 {count} 筆未確認警報）" if count > 1 else ""
         self.alarm_text.setText(f"警報：{message}{suffix}")
         self.alarm_panel.show()
+        self._sync_alarm_slot()
         if not self._flash_timer.isActive():
             self._flash_timer.start()
 
@@ -293,7 +374,15 @@ class RunPage(QWidget):
         self._flash_on = False
         self.alarm_panel.setProperty("flash", "false")
         self.alarm_panel.hide()
+        self._sync_alarm_slot()
         self.alarm_ack_requested.emit()
+
+    def _sync_alarm_slot(self):
+        # A normal alarm/ack must not repaginate an active SOP before its last
+        # visible step finishes. Reserve the same strip throughout the run.
+        self.alarm_panel.ensurePolished()
+        height = self.alarm_panel.sizeHint().height() if self._running or self._pending_alarms else 0
+        self.alarm_slot.setMinimumHeight(max(0, height))
 
     def set_today_stats(self, stats: dict):
         self._today = dict(stats)
@@ -307,6 +396,7 @@ class RunPage(QWidget):
         self._flash_timer.stop()
         self._flash_on = False
         self.alarm_panel.hide()
+        self._sync_alarm_slot()
         self.clear_video("已切換工站，請連線影像來源")
         self._update_stats()
 
@@ -329,9 +419,7 @@ class RunPage(QWidget):
                 WorkpieceLocator(self.sop.workpiece)   # 只檢查設定；逐幀定位由背景管線執行
             except ValueError as exc:
                 self._locator_error = str(exc)
-        self.step_list.clear()
-        for index, step in enumerate(self.sop.steps, 1):
-            self.step_list.addItem(QListWidgetItem(f"○  {index}. {step.name}"))
+        self.step_overview.set_steps([step.name for step in self.sop.steps])
         self.video.set_rois(display_rois(self.sop.rois, self._transform))
         self._show_idle()
         self._update_start_availability()
@@ -341,6 +429,8 @@ class RunPage(QWidget):
             self._transform = None
             self._tracking_misses = 0
         self._running = running
+        self._sync_alarm_slot()
+        self.step_overview.set_running(running)
         self.confirm_button.setEnabled(False)
         self.skip_button.setEnabled(running)
         self.restart_button.setEnabled(running)
@@ -394,6 +484,10 @@ class RunPage(QWidget):
 
     def _update_start_availability(self):
         color = self._colors["stop" if self._running else "start"]
+        appearance = (self._running, color)
+        if appearance == self._start_appearance:
+            return
+        self._start_appearance = appearance
         self.start_button.setEnabled(True)
         self.start_button.setText("停止作業" if self._running else "開始作業")
         self.start_button.setIcon(self.style().standardIcon(
@@ -425,10 +519,14 @@ class RunPage(QWidget):
     def _monitor_frame(self, packet, snapshot):
         mode = self.display_mode.currentData()
         if mode == "all" or not packet.classes:
-            return packet.display
+            return packet.preview_display
         _context, _rois, labels = self._step_context(snapshot)
         detections = [d for d in packet.result.detections if d.label in labels]
         return draw_detections(packet.frame, detections, packet.classes, packet.min_score, packet.show_masks)
+
+    def set_regions_visible(self, visible):
+        self.video.set_regions_visible(visible)
+        self._refresh_regions(self._tracking_status, self._snapshot)
 
     def _refresh_regions(self, status="等待影像定位", snapshot=None):
         if self.sop is None:
@@ -475,6 +573,9 @@ class RunPage(QWidget):
         else:
             self.tracking_label.setText(f"{mode_text}｜已顯示 {len(visible)} 個固定區域" if visible else
                                         f"{mode_text}｜目前工序未指定區域")
+        if not self.video.regions_visible:
+            detail = self.tracking_label.text().replace("已顯示", "已設定").replace("顯示最後位置", "保留最後位置")
+            self.tracking_label.setText(f"區域框線已隱藏｜{detail}")
 
     def _on_display_mode_changed(self, _index):
         self._refresh_regions(self._tracking_status, self._snapshot)
@@ -504,36 +605,32 @@ class RunPage(QWidget):
         self._update_stats()
 
     # ---- 繪製 ------------------------------------------------------------------
+    def _set_instruction(self, text):
+        self.instruction.setText(text)
+        self.instruction_preview.setText(text)
+        # Keep its line even when empty so advancing to another instruction
+        # cannot resize the list and move its page boundary mid-operation.
+        self.instruction_preview.setVisible(True)
+
+    def _set_next_step(self, index, suffix=""):
+        if self.sop and 0 <= index < len(self.sop.steps):
+            self.next_step_label.setText(f"下一道：{index + 1}. {self.sop.steps[index].name}{suffix}")
+        else:
+            self.next_step_label.setText("下一道：無（本輪最後一道）" if self.sop and self.sop.steps else "下一道：尚未設定工序")
+
     def _show_idle(self):
-        self.video.set_banner("待機中 · 按「開始作業」開始監控", self._colors["pending"])
-        self.step_title.setText("待機中")
-        self.instruction.setText(f"SOP：{self.sop.name}（共 {len(self.sop.steps)} 道工序）" if self.sop else "")
+        self.video.set_banner("待機中 · 按「開始作業」開始監控", self._colors["pending"], single_line=True)
+        self.step_title.setText("目前：待機中")
+        self._set_next_step(0)
+        self._set_instruction(f"SOP：{self.sop.name}（共 {len(self.sop.steps)} 道工序）" if self.sop else "")
+        self.step_overview.set_snapshot(None)
         self.progress.setValue(0)
         self.condition_label.setText("")
         self.cycle_label.setText("")
         self._refresh_regions()
 
     def _render_steps(self, snapshot: EngineSnapshot):
-        for index, (step, runtime) in enumerate(zip(self.sop.steps, snapshot.steps)):
-            if runtime.status == StepStatus.ACTIVE:
-                text = f"進行中｜{index + 1}. {step.name}   {snapshot.now - runtime.started_at:.1f}s"
-            elif runtime.status == StepStatus.DONE:
-                manual = "（手動）" if runtime.manual else ""
-                text = f"已完成｜{index + 1}. {step.name}   {runtime.ended_at - runtime.started_at:.1f}s{manual}"
-            elif runtime.status == StepStatus.SKIPPED:
-                text = f"已跳過｜{index + 1}. {step.name}"
-            else:
-                text = f"○  {index + 1}. {step.name}"
-            if runtime.has_alarm:
-                text += "   有警報"
-            item = self.step_list.item(index)
-            color = self._colors["ng"] if runtime.has_alarm else self._colors[
-                {StepStatus.PENDING: "pending", StepStatus.ACTIVE: "active",
-                 StepStatus.DONE: "ok", StepStatus.SKIPPED: "warn"}[runtime.status]]
-            if item is not None and (item.text() != text or item.foreground().color() != QColor(color)):
-                item.setText(text)
-                item.setForeground(QColor(color))
-
+        self.step_overview.set_snapshot(snapshot)
         elapsed = snapshot.now - snapshot.cycle_started_at if snapshot.cycle_started_at is not None else 0
         state = "OK" if snapshot.cycle_ok else "NG（有警報或跳過）"
         self.cycle_label.setText(f"第 {snapshot.cycle} 輪 · 已進行 {elapsed:.0f} 秒 · 目前判定 {state}")
@@ -542,8 +639,9 @@ class RunPage(QWidget):
         index = snapshot.current_index
         step, runtime = self.sop.steps[index], snapshot.steps[index]
         title = f"工序 {index + 1} / {len(self.sop.steps)}：{step.name}"
-        self.step_title.setText(title)
-        self.instruction.setText(step.instruction)
+        self.step_title.setText(f"目前 {index + 1} / {len(self.sop.steps)}：{step.name}")
+        self._set_next_step(index + 1)
+        self._set_instruction(step.instruction)
         self.progress.setFormat("條件累積 %p%")
         self.progress.setValue(round(snapshot.progress * 100))
         self.confirm_button.setEnabled(not step.conditions)
@@ -555,7 +653,7 @@ class RunPage(QWidget):
             banner_color = "#ef6c00"
         else:
             banner_color = "#1565c0"
-        self.video.set_banner(f"進行中｜{title}", banner_color)
+        self.video.set_banner(f"進行中｜{title}", banner_color, single_line=True)
 
         lines = []
         if not step.conditions:
@@ -576,34 +674,35 @@ class RunPage(QWidget):
         if combine_results(snapshot.results, step.completion_mode)[1]:
             self.progress.setFormat("判定暫停")
         self.condition_label.setText("<br>".join(lines))
-        self._refresh_regions(self._tracking_status, snapshot)
 
     def _render_cycle_done(self, snapshot: EngineSnapshot):
         ok = snapshot.cycle_ok
         result = "OK" if ok else "NG"
         self.confirm_button.setEnabled(False)
         self.video.set_banner(f"第 {snapshot.cycle} 輪完成：{result}",
-                              self._colors["start"] if ok else "#ef6c00")
+                              self._colors["start"] if ok else "#ef6c00", single_line=True)
         self.step_title.setText(f"本輪完成：{result}")
         cycle = self.sop.cycle
         if not cycle.enabled:
-            self.instruction.setText("本輪已完成；自動開始下一輪已停用")
+            self.next_step_label.setText("下一道：無（自動開始下一輪已停用）")
+            self._set_instruction("本輪已完成；自動開始下一輪已停用")
             self.progress.setFormat("")
             self.progress.setValue(0)
             self.condition_label.setText("")
         elif cycle.reset_conditions:
-            self.instruction.setText("等待重置條件成立後開始下一輪")
+            self._set_next_step(0, "（下一輪）")
+            self._set_instruction("等待重置條件成立後開始下一輪")
             self.progress.setFormat("重置條件 %p%")
             self.progress.setValue(round(snapshot.progress * 100))
             lines = [f"{'成立' if r.met else '未成立'} {r.condition.describe()}" for r in snapshot.results]
             self.condition_label.setText("<br>".join(lines))
         else:
+            self._set_next_step(0, "（下一輪）")
             remaining = cycle.auto_restart_sec - (snapshot.now - snapshot.cycle_ended_at)
-            self.instruction.setText(f"{max(0, remaining):.0f} 秒後開始下一輪")
+            self._set_instruction(f"{max(0, remaining):.0f} 秒後開始下一輪")
             self.progress.setFormat("")
             self.progress.setValue(0)
             self.condition_label.setText("")
-        self._refresh_regions(self._tracking_status, snapshot)
 
     def _update_stats(self):
         total = sum(self._stats.values())

@@ -12,7 +12,8 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from PySide6.QtCore import QDate, QPoint, Qt
+from PySide6.QtCore import QDate, QPoint, Qt, QTimer
+from PySide6.QtTest import QTest
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage
 from PySide6.QtWidgets import QApplication
 
@@ -67,6 +68,12 @@ class RecordsPageTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    @staticmethod
+    def dispose(page):
+        page.close()
+        for timer in page.findChildren(QTimer):
+            timer.stop()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -98,7 +105,7 @@ class RecordsPageTests(unittest.TestCase):
             image.fill(QColor(color))
             self.assertTrue(image.save(str(snapshots / name)))
         self.page = RecordsPage(self.root)
-        self.addCleanup(self.page.close)
+        self.addCleanup(self.dispose, self.page)
         self.page.resize(1280, 800)
         self.page.refresh()
 
@@ -198,6 +205,84 @@ class RecordsPageTests(unittest.TestCase):
         self.select_cycle(2)
         self.page._export_records(self.root / "readonly.csv")
         self.assertEqual(before, hashlib.sha256(self.db_path.read_bytes()).digest())
+
+    def test_continuous_notifications_coalesce_without_postponing_refresh(self):
+        self.page.show()
+        self.app.processEvents()
+        self.page._refresh_timer.setInterval(40)
+        notifications = []
+        timer = QTimer()
+        timer.setInterval(5)
+        timer.timeout.connect(lambda: (notifications.append(1), self.page.mark_stale()))
+        with patch.object(self.page, "_refresh_records", wraps=self.page._refresh_records) as refresh:
+            timer.start()
+            QTest.qWait(180)
+            timer.stop()
+            during = refresh.call_count
+            QTest.qWait(80)
+            self.assertGreaterEqual(during, 2, "ongoing writes must not starve the refresh timer")
+            self.assertLess(refresh.call_count, len(notifications))
+            self.assertFalse(self.page._stale)
+
+    def test_manual_refresh_and_hide_cancel_scheduled_work(self):
+        self.page.show()
+        self.app.processEvents()
+        self.page._refresh_timer.setInterval(40)
+        with patch.object(self.page, "_refresh_records", wraps=self.page._refresh_records) as refresh:
+            self.page.mark_stale()
+            self.page.refresh()
+            QTest.qWait(80)
+            self.assertEqual(refresh.call_count, 1)
+            self.page.mark_stale()
+            self.page.hide()
+            QTest.qWait(80)
+            self.assertEqual(refresh.call_count, 1)
+            self.assertTrue(self.page._stale)
+            self.page.show()
+            self.assertEqual(refresh.call_count, 2)
+            self.assertFalse(self.page._refresh_timer.isActive())
+
+    def test_appending_round_and_details_preserves_event_image_and_reuses_cells(self):
+        with connect(self.db_path) as db:
+            db.execute("INSERT INTO step_records(cycle_id,step_index,step_name,status,snapshot) "
+                       "VALUES(1,2,'檢查','done','alarm.png')")
+        db.close()
+        self.page.refresh()
+        self.select_cycle(1)
+        self.page.steps.selectRow(1)
+        caption = self.page.preview_caption.text()
+        image_key = self.page.preview.original.cacheKey()
+        item = self.page.cycles.item(self.page.cycles.currentRow(), 0)
+        with connect(self.db_path) as db:
+            db.execute("INSERT INTO cycles(id,sop_name,sop_version,started_at,result) "
+                       "VALUES(4,'新輪次',1,'2026-10-16 13:00:00','RUNNING')")
+            db.execute("INSERT INTO step_records(cycle_id,step_index,step_name,status,snapshot) "
+                       "VALUES(1,3,'新明細','done','complete.png')")
+        db.close()
+        self.page.refresh()
+        self.assertEqual(self.page._selected_cycle_id(), 1)
+        self.assertEqual(self.page.steps.currentRow(), 1)
+        self.assertEqual(self.page.preview_caption.text(), caption)
+        self.assertEqual(self.page.preview.original.cacheKey(), image_key)
+        self.assertIs(self.page.cycles.item(self.page.cycles.currentRow(), 0), item)
+        self.assertEqual(self.page.steps.rowCount(), 3)
+
+    def test_unchanged_detail_refresh_keeps_image_and_station_switch_clears_pending(self):
+        self.select_cycle(1)
+        with patch.object(self.page.preview, "show_image", wraps=self.page.preview.show_image) as show:
+            self.page.refresh()
+            self.assertFalse(show.called)
+        self.page.show()
+        self.app.processEvents()
+        self.page.mark_stale()
+        second = self.root / "second"
+        second.mkdir()
+        connect(second / "records.db").close()
+        self.page.set_records_directory(second)
+        self.assertFalse(self.page._refresh_timer.isActive())
+        self.assertIsNone(self.page._selected_cycle_id())
+        self.assertTrue(self.page.preview.original.isNull())
+        self.assertEqual(self.page.db_path, second / "records.db")
 
     def test_main_window_shows_details_and_caption_without_outer_scroll_at_900_height(self):
         from sop_app.ui.main_window import MainWindow

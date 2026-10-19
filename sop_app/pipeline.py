@@ -8,7 +8,7 @@ from __future__ import annotations
 import copy
 import logging
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import queue
 import threading
@@ -20,9 +20,11 @@ from PySide6.QtCore import QThread, Signal
 
 from .detection import FrameResult
 from .engine import EngineSnapshot, Phase, SOPEngine
+from .frame_pacing import InferencePacer
 from .inference_worker import InferenceWorker, InferenceWorkerClosed
 from .model_bundle import read_model_info
 from .overlay import draw_detections
+from .performance import PerformanceWindow, observed_mapping
 from .recorder import AsyncRecorder
 from .sop_schema import SOPDefinition, Workpiece
 from .tracking import WorkpieceLocator, display_rois, workpiece_key
@@ -47,6 +49,13 @@ class FramePacket:
         return self.results or (self.result,)
     processing_ms: float = 0.
     capture_age_ms: float | None = None  # 僅攝影機，從 read 完成到送出；不含曝光與 GUI 繪製
+    stage_ms: dict = field(default_factory=dict)  # 每幀觀測；巢狀階段不能加總成總延遲
+    inference_runtime: dict = field(default_factory=dict)
+    model_display: np.ndarray | None = None  # 模型預覽，不含證據影像上的工件區域線
+
+    @property
+    def preview_display(self):
+        return self.model_display if self.model_display is not None else self.display
 
     @property
     def tracking_load_ms(self):
@@ -60,16 +69,27 @@ class CameraSource:
 
     ended = False
 
-    def __init__(self, index: int, width: int = 1280, height: int = 720):
+    def __init__(self, index: int, width: int = 1280, height: int = 720, *,
+                 preferences=None, settings_token=None):
+        from .camera_controls import apply_controls, read_controls, saved_camera_changes
         self.label = f"攝影機 {index}"
+        self.source_key = f"camera:{index}"
+        self.settings_token = settings_token
         self.capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not self.capture.isOpened():
             self.capture.release()
             self.capture = cv2.VideoCapture(index)
         if not self.capture.isOpened():
+            self.capture.release()
             raise RuntimeError(f"無法開啟攝影機 {index}")
-        self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        try:
+            self.requested_changes = saved_camera_changes(preferences or {})
+            self.requested_changes.setdefault("resolution", ("manual", (width, height)))
+            self.startup_messages = apply_controls(self.capture, self.requested_changes)
+            self.reported_controls = read_controls(self.capture)
+        except Exception:
+            self.capture.release()
+            raise
         self._lock = threading.Lock()
         self._capture_lock = threading.Lock()
         self._latest: tuple[np.ndarray, float] | None = None
@@ -109,7 +129,7 @@ class CameraSource:
         from .camera_controls import apply_controls, read_controls
         with self._capture_lock:
             messages = apply_controls(self.capture, changes)
-            if "fps" in changes or "resolution" in changes:
+            if {"fps", "resolution", "pixel_format"}.intersection(changes):
                 with self._lock:
                     self._latest = None
                     self._frame_times.clear()
@@ -180,6 +200,8 @@ class VideoPipeline(QThread):
     source_changed = Signal(str)           # 來源名稱，空字串 = 已中斷
     camera_available = Signal(bool)
     camera_controls_ready = Signal(object, object)
+    camera_configuration_ready = Signal(object)  # source identity + accepted changes + final readback
+    inference_fps_ready = Signal(float)
     engine_state = Signal(bool)            # 作業是否進行中
     records_changed = Signal()             # 紀錄已寫入資料庫
     maintenance_finished = Signal(str, str, str)  # action, result, error
@@ -214,11 +236,16 @@ class VideoPipeline(QThread):
         self._now = time.monotonic()
         self._show_masks, self._min_score = True, 0.5
         self._last_display: np.ndarray | None = None
+        self._last_model_display: np.ndarray | None = None
         self._fps, self._last_frame_at = 0.0, None
+        self._performance = PerformanceWindow()
+        self._pacer = InferencePacer()
 
     # ---- 介面執行緒呼叫 --------------------------------------------------------
-    def open_camera(self, index: int):
-        self._commands.put(("source", lambda: CameraSource(index)))
+    def open_camera(self, index: int, preferences=None, settings_token=None):
+        preferences = copy.deepcopy(preferences or {})
+        self._commands.put(("source", lambda: CameraSource(index, preferences=preferences,
+                                                         settings_token=settings_token)))
 
     def open_file(self, path: str, loop: bool = True):
         self._commands.put(("source", lambda: FileSource(path, loop)))
@@ -228,6 +255,11 @@ class VideoPipeline(QThread):
 
     def camera_controls(self, changes=None):
         self._commands.put(("camera_controls", copy.deepcopy(changes or {})))
+
+    def set_inference_fps(self, fps):
+        # Validate on the caller too, without mutating the pipeline's clock state.
+        InferencePacer(fps)
+        self._commands.put(("inference_fps", float(fps)))
 
     def load_model(self, path: str | Path):
         self._commands.put(("model", str(path)))
@@ -270,6 +302,10 @@ class VideoPipeline(QThread):
         """介面處理完一個畫面後呼叫；介面忙碌時背景執行緒就不會塞更多畫面進佇列。"""
         self._gui_ready.set()
 
+    def performance_snapshot(self):
+        """Last 300 processed frames, including frames the busy GUI did not draw."""
+        return self._performance.snapshot()
+
     def shutdown(self):
         with self._worker_lock:
             self._alive = False
@@ -300,7 +336,13 @@ class VideoPipeline(QThread):
                     time.sleep(0.03)
                     continue
                 try:
+                    remaining = self._pacer.remaining(time.monotonic())
+                    if remaining > 0:
+                        time.sleep(min(remaining, 0.01))
+                        continue
+                    read_started = time.perf_counter()
                     got = self._source.read()
+                    read_ms = (time.perf_counter() - read_started) * 1000
                     if got is None:
                         if self._source.ended:
                             self.status.emit(f"{self._source.label} 播放結束")
@@ -308,7 +350,8 @@ class VideoPipeline(QThread):
                         else:
                             time.sleep(0.003)
                         continue
-                    self._process(*got, recorder)
+                    self._pacer.mark_started(time.monotonic())
+                    self._process(*got, recorder, source_read_ms=read_ms)
                 except Exception as exc:     # 單幀失敗不能讓整條影像管線停止
                     self._report_frame_error(exc)
         finally:
@@ -327,7 +370,7 @@ class VideoPipeline(QThread):
             self._error_times[message] = now
             self.error.emit(message)
 
-    def _process(self, frame: np.ndarray, timestamp: float, recorder):
+    def _process(self, frame: np.ndarray, timestamp: float, recorder, *, source_read_ms=0.):
         self._now = timestamp
         started = time.perf_counter()
         detections = []
@@ -344,6 +387,17 @@ class VideoPipeline(QThread):
                     self.error.emit(f"模型推論失敗，已停用模型：{exc}")
                 self.model_loaded.emit(None, "", failed_source)
         inference_ms = (time.perf_counter() - started) * 1000
+        stages = {"source_read_ms": source_read_ms, "inference_rpc_ms": inference_ms}
+        runtime = {}
+        if self._detector is not None:
+            metrics = observed_mapping(self._detector, "last_metrics")
+            stages.update({f"inference_{key}": value for key, value in metrics.items()
+                           if isinstance(value, (int, float))})
+            observed_runtime = metrics.get("runtime", {})
+            runtime = (observed_runtime.copy() if isinstance(observed_runtime, dict) else {})
+            if not runtime:
+                runtime = observed_mapping(self._detector, "runtime_info")
+        tracking_started = time.perf_counter()
 
         result = FrameResult(frame.shape[1], frame.shape[0], timestamp, detections)
         result.detection_valid = self._detector is not None
@@ -356,6 +410,12 @@ class VideoPipeline(QThread):
             except Exception as exc:
                 result.workpiece_transform, result.tracking_status = None, f"位置跟隨失敗：{exc}"
             result.workpiece_key = self._locator_key
+        stages["tracking_ms"] = (time.perf_counter() - tracking_started) * 1000
+        for key, value in result.tracking_metrics.get("stages_ms", {}).items():
+            stages[f"tracking_{key}_ms"] = value
+        for key, value in result.tracking_metrics.get("components_ms", {}).items():
+            stages[f"tracking_component_{key}_ms"] = value
+        engine_started = time.perf_counter()
         events = []
         if self._engine is not None:
             try:
@@ -365,21 +425,37 @@ class VideoPipeline(QThread):
                 self._engine = None
                 self._sync_locator()
                 self.engine_state.emit(False)
+        stages["engine_ms"] = (time.perf_counter() - engine_started) * 1000
+        if isinstance(self._source, CameraSource):
+            stages["capture_to_decision_ms"] = max(0., (time.monotonic() - timestamp) * 1000)
 
         # 只讀一次：介面可能在本函式執行途中確認上一個畫面，前後判斷必須一致。
         ready = self._gui_ready.is_set()
         classes = tuple(self._detector.classes) if self._detector is not None else ()
+        display_started = time.perf_counter()
         if events or ready or self._last_display is None:
             display = draw_detections(frame, detections, classes, self._min_score, self._show_masks)
+            self._last_model_display = display
             if self._engine is not None:
                 anchored = {r.name for r in self._engine.sop.rois if r.anchor == "workpiece"}
-                for roi in display_rois(self._engine.sop.rois, result.workpiece_transform):
-                    if roi.name in anchored:
+                evidence_rois = [roi for roi in display_rois(self._engine.sop.rois, result.workpiece_transform)
+                                 if roi.name in anchored]
+                if evidence_rois:
+                    # Keep existing evidence pixels independent of preview visibility.
+                    display = display.copy()
+                    for roi in evidence_rois:
                         polygon = np.int32(np.asarray(roi.points) * [result.width, result.height])
                         cv2.polylines(display, [polygon], True, (0, 220, 255), 2)
             self._last_display = display
+        stages["overlay_ms"] = (time.perf_counter() - display_started) * 1000
+        record_started = time.perf_counter()
         if events:
-            self._emit_events(events, recorder)
+            accepted = self._emit_events(events, recorder)
+            enqueue = observed_mapping(recorder, "last_enqueue_metrics") if accepted else {}
+            if isinstance(enqueue, dict):
+                stages.update({f"record_{key}": value for key, value in enqueue.items()
+                               if isinstance(value, (int, float))})
+        stages["record_accept_ms"] = (time.perf_counter() - record_started) * 1000
 
         now = time.perf_counter()
         if self._last_frame_at is not None:
@@ -388,31 +464,43 @@ class VideoPipeline(QThread):
         self._last_frame_at = now
 
         self._pending_results.append(result)
+        packet_started = time.perf_counter()
         if ready:
             self._gui_ready.clear()
             snapshot = self._engine.snapshot() if self._engine is not None else None
             camera_fps = self._source.capture_fps if isinstance(self._source, CameraSource) else None
             results = tuple(self._pending_results)
             self._pending_results.clear()
+        stages["packet_prepare_ms"] = (time.perf_counter() - packet_started) * 1000
+        stages["processing_ms"] = (time.perf_counter() - started) * 1000
+        capture_age = (max(0., (time.monotonic() - timestamp) * 1000)
+                       if isinstance(self._source, CameraSource) else None)
+        if capture_age is not None:
+            stages["capture_to_packet_ms"] = capture_age
+        self._performance.observe(stages)
+        if ready:
             self.packet_ready.emit(FramePacket(frame, self._last_display, result, snapshot,
                                                self._fps, inference_ms, camera_fps,
                                                classes, self._min_score, self._show_masks, results,
-                                               processing_ms=(time.perf_counter() - started) * 1000,
-                                               capture_age_ms=max(0., (time.monotonic() - timestamp) * 1000)
-                                               if isinstance(self._source, CameraSource) else None))
+                                               processing_ms=stages["processing_ms"],
+                                               capture_age_ms=capture_age, stage_ms=stages,
+                                               inference_runtime=runtime, model_display=self._last_model_display))
 
     def _emit_events(self, events, recorder):
         sop = self._engine.sop
         model_version = self._detector.info.model_version_id if self._detector is not None else ""
+        accepted = True
         try:
             snapshot = sop.to_dict() if any(e.kind == "cycle_started" for e in events) else None
             recorder.handle(events, sop.name, sop.version, model_version, self._last_display, self._context,
                             sop_snapshot=snapshot)
         except Exception as exc:
+            accepted = False
             self._engine.stop(self._now)
             self.engine_state.emit(False)
             self.error.emit(f"無法持久保存作業事件，已停止作業，請排除磁碟問題後再開始：{exc}")
         self.events_ready.emit(events)
+        return accepted
 
     def _drain_commands(self, recorder: Recorder):
         while self._alive:
@@ -468,6 +556,7 @@ class VideoPipeline(QThread):
         self._locator_key = ""
         self._pending_results.clear()
         self._last_display = None
+        self._last_model_display = None
         target._on_written = self.records_changed.emit
         target._on_error = self.error.emit
         target._on_status = self.recording_status.emit
@@ -508,6 +597,13 @@ class VideoPipeline(QThread):
             self._detector = None
         elif command == "display":
             self._show_masks, self._min_score = payload
+        elif command == "inference_fps":
+            if self._engine is not None and self._engine.phase != Phase.IDLE:
+                self.status.emit("請先停止作業，再變更辨識 FPS 上限")
+            else:
+                self._pacer.set_fps(payload)
+                self._fps, self._last_frame_at = 0.0, None
+            self.inference_fps_ready.emit(self._pacer.fps)
         elif command == "workpiece":
             self._preview_workpiece, self._preview_key = payload
             self._sync_locator()
@@ -522,19 +618,22 @@ class VideoPipeline(QThread):
                 changes = dict(payload)
                 blocked = []
                 if self._engine is not None and self._engine.phase != Phase.IDLE:
-                    for key in ("resolution", "fps"):
+                    for key in ("resolution", "fps", "pixel_format"):
                         if key in changes:
                             changes.pop(key)
-                            blocked.append("解析度" if key == "resolution" else "攝影機 FPS")
+                            blocked.append({"resolution": "解析度", "fps": "攝影機 FPS",
+                                            "pixel_format": "像素格式"}[key])
                 try:
                     values, messages = self._source.controls(changes)
-                    if "fps" in changes or "resolution" in changes:
+                    if {"fps", "resolution", "pixel_format"}.intersection(changes):
                         self._fps, self._last_frame_at = 0.0, None
                 except Exception as exc:
                     values, messages = {}, [f"未完成：讀取／設定攝影機失敗（{exc}）"]
                 if blocked:
                     messages.insert(0, f"{'、'.join(blocked)}：未完成（請先停止作業，再變更影像格式）")
                 self.camera_controls_ready.emit(values, messages)
+                if changes:
+                    self._emit_camera_configuration(changes, values, messages)
         elif command == "start":
             self._stop_engine(recorder)
             self._engine = SOPEngine(payload)
@@ -568,7 +667,7 @@ class VideoPipeline(QThread):
         self._locator, self._locator_key = None, key
         if workpiece is not None:
             try:
-                self._locator = WorkpieceLocator(workpiece)
+                self._locator = WorkpieceLocator(workpiece, adaptive_budget=True)
             except (ValueError, TypeError) as exc:
                 self.status.emit(f"工件定位設定無效：{exc}")
 
@@ -590,9 +689,12 @@ class VideoPipeline(QThread):
             self._locator.reset()
         self._pending_results.clear()
         self._last_display = None
+        self._last_model_display = None
         self.camera_available.emit(False)
         self.source_changed.emit("")
         self._fps, self._last_frame_at = 0.0, None
+        self._performance.clear()
+        self._pacer.reset()
         if factory is None:
             return
         self.status.emit("正在開啟影像來源…")
@@ -600,6 +702,18 @@ class VideoPipeline(QThread):
         self._now = time.monotonic()
         self.source_changed.emit(self._source.label)
         self.camera_available.emit(isinstance(self._source, CameraSource))
+        if isinstance(self._source, CameraSource):
+            self._emit_camera_configuration(self._source.requested_changes,
+                                            self._source.reported_controls, self._source.startup_messages)
+
+    def _emit_camera_configuration(self, changes, values, messages):
+        source = self._source
+        self.camera_configuration_ready.emit({
+            "source_key": getattr(source, "source_key", None),
+            "settings_token": getattr(source, "settings_token", None),
+            "changes": copy.deepcopy(changes), "values": copy.deepcopy(values),
+            "messages": list(messages),
+        })
 
     # ---- 模型 ------------------------------------------------------------------
     def _start_model_load(self, path: str):
@@ -675,6 +789,7 @@ class VideoPipeline(QThread):
         return detector, info
 
     def _install_model(self, detector, info, path: str):
+        self._performance.clear()
         self._detector = detector
         self.model_loaded.emit(info, detector.device_name, path)
         self.status.emit(f"模型 {info.model_version_id} 已載入（{detector.device_name}）")

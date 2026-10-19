@@ -2,6 +2,8 @@
 
 此流程為現有 Python／PySide6 程式建立 Windows x64 自包含安裝包。版本讀取 `sop_app/__init__.py`，不另外維護一份應用程式版本。產品識別固定為 `SOP.WorkInstruction`。
 
+版本可為三段日期或加上第四段同日修訂號，例如 `2026.10.19.1`。三段版本的 PE／NSIS 檔案版本補零，四段版本直接沿用。GitHub 原始碼版本更新不代表已重新建置安裝成品；本次 `2026.10.19.1` 發行未附 Windows 安裝包。
+
 ## 使用者安裝
 
 在本機交付資料夾內，將 `SOP-版本-windows-x64-Setup.exe` 與同名的 `.payload.zip` 放在一起，雙擊 **Setup.exe**。資料包供安裝器讀取，不必自行解壓縮。
@@ -96,8 +98,10 @@ SOP.exe --installer-runtime-test REPORT.json
 
 驗證完整資料包的解壓縮、逐檔校驗、換路徑啟動與移除，可執行：
 
+下列版本路徑為建置後的示例，須先產生對應版本的交付資料夾。
+
 ```powershell
-.venv\Scripts\python.exe tools\verify_installer_payload.py --release installer/releases/test/2026.10.19/windows-x64
+.venv\Scripts\python.exe tools\verify_installer_payload.py --release installer/releases/test/2026.10.19.1/windows-x64
 ```
 
 此工具採新建的隔離目錄及產品識別，不建立登錄或捷徑。它驗證真實大型資料包與 deployment helper；不取代 NSIS 自身的 GUI／解除安裝程式自刪測試。
@@ -109,7 +113,7 @@ SOP.exe --installer-runtime-test REPORT.json
 在允許執行專案診斷腳本的 Windows 環境中，可對交付資料夾執行以下命令。此工具不啟動 Setup 或 SOP，不解除封鎖，也不變更登錄、應用程式控制政策或憑證存放區；唯一寫入為明確指定的 JSON 報告。
 
 ```powershell
-powershell.exe -NoProfile -File .\tools\check_windows_trust.ps1 -ReleaseDirectory .\installer\releases\test\2026.10.19\windows-x64 -OutputPath .\installer\releases\test\2026.10.19\windows-x64\windows-trust-report.json
+powershell.exe -NoProfile -File .\tools\check_windows_trust.ps1 -ReleaseDirectory .\installer\releases\test\2026.10.19.1\windows-x64 -OutputPath .\installer\releases\test\2026.10.19.1\windows-x64\windows-trust-report.json
 ```
 
 交付資料夾也附有同一工具；在該資料夾開啟 PowerShell 時可執行 `powershell.exe -NoProfile -File .\check_windows_trust.ps1 -ReleaseDirectory . -OutputPath .\windows-trust-report.json`。原附報告來自建置機；若取得允許重新檢查，工具會更新自己的舊報告，請另指定檔名以保留歷史。退出 `0` 只代表完整性相符，仍需看政策事件並實際驗收。

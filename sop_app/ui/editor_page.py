@@ -121,6 +121,7 @@ class ROIEditorRow(QFrame):
 
 
 class EditorPage(QWidget):
+    LIVE_PREVIEW_INTERVAL_SEC = .2
     modified = Signal()
     model_selected = Signal(str)
     workpiece_changed = Signal(object)
@@ -138,9 +139,11 @@ class EditorPage(QWidget):
         self.sop, self.classes = SOPDefinition(), []
         self._loading, self._production_running = False, False
         self._packet = self._preview_result = self._packet_arrived_at = None
+        self._last_live_preview_at = None
         self._locator = self._reference_frame = None
         self._workpiece_key = ""
         self._capture_target = False
+        self._regions_visible = True
         self._roi_undo, self._roi_redo = [], []
         self._selected_roi_name = self._highlighted_condition_roi = None
         self._model_state, self._model_detail = "unselected", ""
@@ -549,6 +552,7 @@ class EditorPage(QWidget):
 
     # ---- SOP ---------------------------------------------------------------
     def set_sop(self, sop):
+        self._last_live_preview_at = None
         self._validation.stop()
         self._validation = EditorValidation()
         self._loading = True
@@ -827,7 +831,7 @@ class EditorPage(QWidget):
             self._preview_result = self._tracked(packet.result)
             if self._locator:
                 self.tracking_label.setText(self._preview_result.tracking_status)
-            self.video.set_frame(packet.display)
+            self.video.set_frame(packet.preview_display)
             self._refresh_video_rois()
             if self._validation.running:
                 try:
@@ -837,7 +841,12 @@ class EditorPage(QWidget):
                             break
                 except Exception as exc:
                     self._invalidate_validation(f"試跑發生錯誤：{exc}")
-        self._update_live()
+        # Only the explanatory one-frame text is sampled. Trial accumulation
+        # above still consumes every background result in packet.all_results().
+        now = time.monotonic()
+        if self._last_live_preview_at is None or now - self._last_live_preview_at >= self.LIVE_PREVIEW_INTERVAL_SEC:
+            self._update_live()
+            self._last_live_preview_at = now
         self._update_validation_view()
 
     @staticmethod
@@ -987,10 +996,17 @@ class EditorPage(QWidget):
             rois = display_rois(self.sop.rois, matrix)
         used = {c.roi for c in self._all_conditions() if c.roi}
         self.video.set_rois(rois, used, selected)
+        self.video.set_regions_visible(self._regions_visible or self._editing_rois
+                                       or self.reference_button.isChecked() or self.draw_button.isChecked()
+                                       or self._capture_target)
         editable = [r.name for r in self.sop.rois if
                     (r.anchor == "workpiece" and self.reference_button.isChecked()) or
                     (r.anchor == "fixed" and self.freeze_check.isChecked() and not self.reference_button.isChecked())]
         self.video.set_editable(editable if self._editing_rois and not self._capture_target and not self._production_running else [])
+
+    def set_regions_visible(self, visible):
+        self._regions_visible = bool(visible)
+        self._refresh_video_rois()
 
     def _roi_snapshot(self):
         return copy.deepcopy(self.sop.rois), [c.roi for c in self._all_conditions()]
@@ -1175,11 +1191,13 @@ class EditorPage(QWidget):
                 return
             self.freeze_check.setChecked(True)
         self.video.set_draw_mode(enabled)
+        self._refresh_video_rois()
         if enabled:
             self._focus_image()
             self.guide_label.setText("畫面已暫停並放大。拖曳框選區域，放開後在「作業區域」直接修改名稱；完成後按「返回即時影像」。")
 
     def _on_freeze(self, frozen):
+        self._last_live_preview_at = None
         if frozen:
             self._invalidate_validation("畫面已凍結，請返回即時後重新試跑")
         else:
@@ -1302,13 +1320,14 @@ class EditorPage(QWidget):
             self.freeze_check.setEnabled(True)
             self.freeze_check.setChecked(False)
             if self._packet:
-                self.video.set_frame(self._packet.display)
+                self.video.set_frame(self._packet.preview_display)
             else:
                 self.video.clear_frame("等待即時影像")
         self._refresh_video_rois()
         self._update_live()
 
     def _return_live(self):
+        self._last_live_preview_at = None
         self.reference_button.setChecked(False)
         self.freeze_check.setEnabled(True)
         self.freeze_check.setChecked(False)
@@ -1316,6 +1335,7 @@ class EditorPage(QWidget):
         self.draw_button.setChecked(False)
         self.video.set_draw_mode(False)
         self.video.set_editable([])
+        self._refresh_video_rois()
         self.target_button.setText("框選參考工件")
         self._release_auto_focus()
         self.guide_label.setText("即時影像：可框選參考工件與區域，所有工序的判定預覽同時更新。")
@@ -1430,6 +1450,7 @@ class EditorPage(QWidget):
         return result
 
     def clear_video(self, text: str):
+        self._last_live_preview_at = None
         self._invalidate_validation("影像來源已變更或中斷，請重新試跑")
         self._return_live()
         self._packet = None

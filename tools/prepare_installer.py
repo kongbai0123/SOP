@@ -15,6 +15,11 @@ import urllib.request
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from sop_app.release_version import parse_release_version, windows_file_version
+
 INSTALLER = ROOT / "installer"
 
 
@@ -27,7 +32,9 @@ def app_version():
     tree = ast.parse((ROOT / "sop_app/__init__.py").read_text(encoding="utf-8"))
     for node in tree.body:
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets):
-            return ast.literal_eval(node.value)
+            version = ast.literal_eval(node.value)
+            parse_release_version(version)
+            return version
     raise ValueError("Application version is missing")
 
 
@@ -62,6 +69,7 @@ def write_json(path, value):
 
 
 def prepare(args, config, version):
+    file_version = windows_file_version(version)
     payload = args.payload.resolve()
     if not (payload / config["entryExe"]).is_file():
         raise ValueError(f"Frozen entry point missing: {payload / config['entryExe']}")
@@ -105,15 +113,12 @@ def prepare(args, config, version):
     archive_hash = digest(archive)
     write_json(inventory_path, manifest)
     write_json(cache_path, {"archive": str(archive), "sha256": archive_hash})
-    parts = version.split(".")
-    if len(parts) != 3 or not all(part.isdigit() and int(part) <= 65535 for part in parts):
-        raise ValueError("A release version with three numeric parts is required")
     icon = INSTALLER / ".build/generated/SOP.ico"
     if not icon.exists():
         raise ValueError("Product icon missing; first run tools/build_payload.py")
     defines = {
         "PRODUCT_ID": config["productId"], "PRODUCT_NAME": config["productName"],
-        "PRODUCT_VERSION": version, "FILE_VERSION": version + ".0", "PUBLISHER": config["publisher"],
+        "PRODUCT_VERSION": version, "FILE_VERSION": file_version, "PUBLISHER": config["publisher"],
         "ENTRY_EXE": config["entryExe"], "OUTPUT_EXE": setup, "PAYLOAD_NAME": archive.name,
         "PAYLOAD_HASH": archive_hash, "PAYLOAD_MANIFEST": inventory_path,
         "ICON_FILE": icon, "DEPLOY_SCRIPT": INSTALLER / "deploy.ps1",
@@ -135,7 +140,7 @@ def prepare(args, config, version):
             tools[package] = "not available"
     deliverables = [{"path": path.name, "size": path.stat().st_size, "sha256": digest(path)} for path in (setup, archive)]
     release = {key: config[key] for key in ("productId", "productName", "architecture", "installScope", "channel", "signingPolicy", "updateMode", "distribution")}
-    release.update({"version": version, "fileVersion": version + ".0", "artifacts": deliverables, "tools": tools,
+    release.update({"version": version, "fileVersion": file_version, "artifacts": deliverables, "tools": tools,
                     "signingStatus": "NotSigned", "verification": {"status": "build-only", "report": "verification.json"}})
     release["builtAtUtc"] = datetime.now(timezone.utc).isoformat()
     try:

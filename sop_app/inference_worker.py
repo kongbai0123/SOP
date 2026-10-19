@@ -1,6 +1,6 @@
 """Keep the model and its CUDA context in one process, separate from Qt.
 
-This module deliberately imports only the standard library at module scope so
+This module imports only standard-library-based helpers at module scope so
 the GUI can start while the spawned process imports PyTorch. Calls are serial;
 frames share one reusable memory buffer and boolean masks travel packed as bits.
 """
@@ -15,6 +15,8 @@ from pathlib import Path
 import threading
 import time
 import traceback
+
+from .performance import observed_mapping
 
 
 _POLL_SECONDS = 0.05
@@ -77,9 +79,16 @@ class RemoteDetector:
         self.info = metadata["info"]
         self.classes = tuple(metadata["classes"])
         self.device_name = metadata["device_name"]
+        runtime = metadata.get("runtime", {})
+        self.runtime_info = runtime.copy() if isinstance(runtime, dict) else {}
+        self.last_metrics = {}
 
     def detect(self, frame):
-        return self._worker._detect(frame, self._generation)
+        detections, metrics = self._worker._detect(frame, self._generation, with_metrics=True)
+        self.last_metrics = metrics
+        runtime = metrics.get("runtime", self.runtime_info)
+        self.runtime_info = runtime.copy() if isinstance(runtime, dict) else {}
+        return detections
 
 
 class InferenceWorker:
@@ -223,10 +232,11 @@ class InferenceWorker:
                     self._responses.pop(preload_id, None)
             return RemoteDetector(self, metadata)
 
-    def _detect(self, frame, generation):
+    def _detect(self, frame, generation, *, with_metrics=False):
         import numpy as np
         from .detection import Detection
 
+        started = time.perf_counter()
         frame = np.asarray(frame)
         if frame.dtype != np.uint8 or frame.ndim != 3 or frame.shape[2] != 3 or not frame.size:
             raise ValueError("辨識影像必須是非空的 uint8 BGR 影像")
@@ -240,12 +250,19 @@ class InferenceWorker:
                     self._frame_memory = shared_memory.SharedMemory(create=True, size=frame.nbytes)
                 shared_frame = np.ndarray(frame.shape, dtype=frame.dtype,
                                           buffer=self._frame_memory.buf)
+                copy_started = time.perf_counter()
                 np.copyto(shared_frame, frame)
+                copied_at = time.perf_counter()
                 del shared_frame
                 request_id = self._send("detect", generation=generation,
                                         memory=self._frame_memory.name,
                                         shape=frame.shape, dtype=frame.dtype.str)
-            packed = self._receive(request_id)
+            sent_at = time.perf_counter()
+            response = self._receive(request_id)
+            received_at = time.perf_counter()
+            # Accept old test/third-party workers that return the original list.
+            packed = response["detections"] if isinstance(response, dict) else response
+            metrics = dict(response.get("timings_ms", {})) if isinstance(response, dict) else {}
             detections = []
             for label, score, box, mask_shape, mask_bytes in packed:
                 mask = None
@@ -254,7 +271,12 @@ class InferenceWorker:
                     mask = np.unpackbits(np.frombuffer(mask_bytes, dtype=np.uint8),
                                          count=count, bitorder="little").reshape(mask_shape).astype(bool)
                 detections.append(Detection(label, score, tuple(box), mask))
-            return detections
+            metrics.update(input_copy_ms=(copied_at - copy_started) * 1000,
+                           client_prepare_ms=(sent_at - started) * 1000,
+                           worker_roundtrip_ms=(received_at - sent_at) * 1000,
+                           result_unpack_ms=(time.perf_counter() - received_at) * 1000,
+                           runtime=response.get("runtime", {}) if isinstance(response, dict) else {})
+            return (detections, metrics) if with_metrics else detections
 
     def _release_frame_memory(self):
         memory, self._frame_memory = self._frame_memory, None
@@ -340,6 +362,7 @@ def _serve(connection, cancelled, load_detector, *, bootstrap=None):
                                              lambda message: report(request_id, message))
                     result = {"info": detector.info, "classes": tuple(detector.classes),
                               "device_name": detector.device_name, "generation": generation,
+                              "runtime": observed_mapping(detector, "runtime_info"),
                               "completed_at": time.perf_counter(),
                               "load_mode": "startup" if generation == 1 else "reload"}
                 elif request["operation"] == "detect":
@@ -363,12 +386,15 @@ def _serve(connection, cancelled, load_detector, *, bootstrap=None):
 def _detect_shared_frame(detector, request):
     import numpy as np
 
+    started = time.perf_counter()
     memory = shared_memory.SharedMemory(name=request["memory"])
     frame = None
     try:
         frame = np.ndarray(request["shape"], dtype=np.dtype(request["dtype"]), buffer=memory.buf)
+        detected = detector.detect(frame)
+        detected_at = time.perf_counter()
         packed = []
-        for detection in detector.detect(frame):
+        for detection in detected:
             shape, mask_bytes = None, None
             if detection.mask is not None:
                 mask = np.asarray(detection.mask, dtype=bool)
@@ -376,7 +402,11 @@ def _detect_shared_frame(detector, request):
                 mask_bytes = np.packbits(mask.reshape(-1), bitorder="little").tobytes()
             packed.append((detection.label, float(detection.score), tuple(detection.box),
                            shape, mask_bytes))
-        return packed
+        metrics = observed_mapping(detector, "last_metrics")
+        metrics.update(worker_detect_ms=(detected_at - started) * 1000,
+                       result_pack_ms=(time.perf_counter() - detected_at) * 1000)
+        return {"detections": packed, "timings_ms": metrics,
+                "runtime": observed_mapping(detector, "runtime_info")}
     finally:
         del frame
         memory.close()

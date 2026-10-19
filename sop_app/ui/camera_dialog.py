@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QDoubleSpin
                                QGridLayout, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
                                QScrollArea, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
-from ..camera_controls import AUTO_PROPERTIES, PROPERTIES
+from ..camera_controls import AUTO_PROPERTIES, FORMAT_KEYS, PROPERTIES, control_label
 from .video_widget import VideoWidget
 from .workbench_widgets import install_readability_guard
 
@@ -39,7 +39,7 @@ class CameraDialog(QDialog):
         self.format_status = QLabel("正在讀取設備格式…")
         self.format_status.setWordWrap(True)
         summary.addWidget(self.format_status)
-        help_text = QLabel("調整後按「套用變更」，在左側查看效果。\n已套用的設定不會因關閉視窗而復原。")
+        help_text = QLabel("調整後按「套用變更」，在左側查看效果。\n設備接受的設定會保留於目前工站，重新連線時套用；被拒絕的項目不會覆蓋原設定。")
         help_text.setWordWrap(True)
         summary.addWidget(help_text)
         summary.addStretch()
@@ -49,7 +49,7 @@ class CameraDialog(QDialog):
         layout.addWidget(tabs, 1)
         format_page = QWidget()
         format_layout = QVBoxLayout(format_page)
-        self.format_hint = QLabel("解析度決定影像細節；FPS 決定每秒擷取張數。變更時畫面可能短暫停頓。")
+        self.format_hint = QLabel("解析度、FPS 與像素格式需由設備共同支援。變更時畫面可能短暫停頓。")
         self.format_hint.setWordWrap(True)
         format_layout.addWidget(self.format_hint)
         grid = QGridLayout()
@@ -71,6 +71,16 @@ class CameraDialog(QDialog):
                                      QLabel("高"), self.height_input)):
             grid.addWidget(widget, 0, col)
         grid.addWidget(self.resolution_current, 1, 1, 1, 5)
+        self.pixel_format_combo = QComboBox()
+        self.pixel_format_combo.addItem("依設備設定", "keep")
+        for code in ("MJPG", "YUY2", "NV12"):
+            self.pixel_format_combo.addItem(code, code)
+        self.pixel_format_combo.setToolTip("MJPG 可降低 USB 傳輸量；可選項不代表設備一定支援。套用後以設備回報為準。")
+        self.pixel_format_current = QLabel("設備回報：讀取中…")
+        grid.addWidget(QLabel("像素格式"), 2, 0)
+        grid.addWidget(self.pixel_format_combo, 2, 1, 1, 2)
+        grid.addWidget(self.pixel_format_current, 2, 3, 1, 3)
+        self.pixel_format_combo.currentIndexChanged.connect(self._pixel_format_edited)
         self.resolution_preset.currentIndexChanged.connect(self._choose_resolution)
         format_layout.addLayout(grid)
         fps_grid = QGridLayout()
@@ -95,7 +105,7 @@ class CameraDialog(QDialog):
         format_scroll = QScrollArea()
         format_scroll.setWidgetResizable(True)
         format_scroll.setWidget(format_page)
-        tabs.addTab(format_scroll, "解析度與 FPS")
+        tabs.addTab(format_scroll, "解析度、FPS 與格式")
         image_page = QWidget()
         image_layout = QVBoxLayout(image_page)
         image_hint = QLabel("直接拖曳拉桿或輸入數值即可調整；曝光、白平衡與對焦可切換自動模式。")
@@ -121,7 +131,7 @@ class CameraDialog(QDialog):
         self.feedback = QPlainTextEdit()
         self.feedback.setReadOnly(True)
         self.feedback.setMaximumHeight(90)
-        self.feedback.setPlaceholderText("套用結果會顯示在這裡。參數只作用於目前連線，本程式不保存設定。")
+        self.feedback.setPlaceholderText("套用結果會顯示在這裡。只保留設備接受的設定；要求值與設備最終回報可能不同。")
         layout.addWidget(self.feedback)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.button(QDialogButtonBox.StandardButton.Close).setText("關閉")
@@ -240,6 +250,15 @@ class CameraDialog(QDialog):
         self._dirty.add("resolution")
         self._update_state()
 
+    def _pixel_format_edited(self):
+        if self._loading:
+            return
+        if self.pixel_format_combo.currentData() == "keep":
+            self._dirty.discard("pixel_format")
+        else:
+            self._dirty.add("pixel_format")
+        self._update_state()
+
     def _match_resolution(self):
         size = f"{self.width_input.value()}x{self.height_input.value()}"
         blocked = self.resolution_preset.blockSignals(True)
@@ -252,8 +271,8 @@ class CameraDialog(QDialog):
 
     def set_running(self, running):
         self._running = running
-        self.format_hint.setText("作業進行中：請先停止作業，再調整解析度與 FPS。" if running else
-                                 "解析度決定影像細節；FPS 決定每秒擷取張數。變更時畫面可能短暫停頓。")
+        self.format_hint.setText("作業進行中：請先停止作業，再調整解析度、FPS 與像素格式。" if running else
+                                 "解析度、FPS 與像素格式需由設備共同支援。變更時畫面可能短暫停頓。")
         self._update_state()
 
     def _update_state(self):
@@ -261,13 +280,14 @@ class CameraDialog(QDialog):
             return
         self.refresh.setEnabled(not self._waiting)
         self.discard.setEnabled(not self._waiting and bool(self._dirty))
-        blocked_format = self._running and bool(self._dirty & {"fps", "resolution"})
+        blocked_format = self._running and bool(self._dirty & FORMAT_KEYS)
         self.apply.setEnabled(not self._waiting and bool(self._dirty) and not blocked_format)
         self.apply.setText(f"套用 {len(self._dirty)} 項變更" if self._dirty else "套用變更")
         self.state_label.setText("正在與攝影機通訊…" if self._waiting else
                                  f"{len(self._dirty)} 項變更尚未套用" if self._dirty else "設定已讀取，可直接調整")
         format_enabled = not self._waiting and not self._running
-        for control in (self.resolution_preset, self.width_input, self.height_input, *self.fps_presets):
+        for control in (self.resolution_preset, self.width_input, self.height_input,
+                        self.pixel_format_combo, *self.fps_presets):
             control.setEnabled(format_enabled)
         for key, (_, mode, value) in self.rows.items():
             enabled = not self._waiting and (key != "fps" or not self._running)
@@ -286,6 +306,8 @@ class CameraDialog(QDialog):
         changes = {}
         if "resolution" in self._dirty:
             changes["resolution"] = ("manual", (self.width_input.value(), self.height_input.value()))
+        if "pixel_format" in self._dirty:
+            changes["pixel_format"] = ("manual", self.pixel_format_combo.currentData())
         for key, (_, mode, value) in self.rows.items():
             if key in self._dirty:
                 changes[key] = (mode.currentData(), value.value())
@@ -301,9 +323,12 @@ class CameraDialog(QDialog):
                     self.width_input.setValue(actual[0])
                     self.height_input.setValue(actual[1])
                     self._match_resolution()
+            elif key == "pixel_format":
+                self.pixel_format_combo.setCurrentIndex(0)
             else:
                 _, mode, value = self.rows[key]
-                mode.setCurrentIndex(0)
+                actual_mode = (self._last_values.get("control_modes") or {}).get(key)
+                mode.setCurrentIndex(max(0, mode.findData(actual_mode)))
                 if actual is not None:
                     value.setValue(actual)
         finally:
@@ -318,13 +343,17 @@ class CameraDialog(QDialog):
     def update_controls(self, values, messages):
         self._last_values.update(values)
         for key in self._submitted:
-            label = "解析度" if key == "resolution" else PROPERTIES[key][0]
+            label = control_label(key)
             if any(message.startswith(label + "：") and "未完成" not in message for message in messages):
                 self._dirty.discard(key)
         self._submitted = {}
         for key, (current, _, _) in self.rows.items():
             actual = values.get(key)
-            current.setText(f"{actual:g}" if actual is not None else "無法讀取")
+            actual_mode = (values.get("control_modes") or {}).get(key)
+            mode_text = "（自動）" if actual_mode == "auto" else "（手動）" if actual_mode == "manual" else ""
+            if key in AUTO_PROPERTIES and actual_mode is None:
+                mode_text = "（模式無法讀取）"
+            current.setText((f"{actual:g}" if actual is not None else "無法讀取") + mode_text)
             if key not in self._dirty:
                 self._restore_value(key)
         size = values.get("resolution")
@@ -332,9 +361,13 @@ class CameraDialog(QDialog):
         fps = values.get("fps")
         fps_text = f"{fps:g} FPS" if fps is not None else "無法讀取 FPS"
         self.resolution_current.setText(f"設備回報：{size_text}")
-        self.format_status.setText(f"設備設定回報\n{size_text} · {fps_text}")
+        pixel = values.get("pixel_format") or "格式無法讀取"
+        self.pixel_format_current.setText(f"設備回報：{pixel}")
+        self.format_status.setText(f"設備設定回報\n{size_text} · {fps_text} · {pixel}")
         if "resolution" not in self._dirty:
             self._restore_value("resolution")
+        if "pixel_format" not in self._dirty:
+            self._restore_value("pixel_format")
         if messages:
             self.feedback.setPlainText("\n".join(messages))
         self._waiting = False

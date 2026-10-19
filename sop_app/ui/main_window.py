@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
 
 from ..model_bundle import ModelBundleError, ModelInfo, read_model_info
 from ..model_eta import ModelETA, ModelLoadProgress, model_key, stage_key
+from ..frame_pacing import InferencePacer
 from ..native_runtime import cv2, NativeDependencyError
 from ..paths import APP_SETTINGS, PROJECT_ROOT, RECORDS_DIR, SOPS_DIR, resolve
 from ..pipeline import FramePacket, VideoPipeline
@@ -59,11 +60,19 @@ class MainWindow(QMainWindow):
         self.model_ready = False
         self._requested_model: str | None = None
         self._engine_running = False
+        self._camera_settings_token = 0
+        self._pending_camera_settings_token = None
         self._model_started = None
         self._model_stage = ""
         self._model_eta = None
         self._model_work = ModelLoadProgress()
         self._source_label = ""
+        self._today_stats_dirty = False
+        self._record_stats_timer = QTimer(self)
+        self._record_stats_timer.setSingleShot(True)
+        self._record_stats_timer.setInterval(500)
+        self._record_stats_timer.timeout.connect(self._flush_today_stats)
+        self._performance_tooltip_at = None
         self._error_box: QMessageBox | None = None
         self._error_counts: dict[str, int] = {}
         self._vision_error = ""
@@ -83,6 +92,8 @@ class MainWindow(QMainWindow):
         self.pipeline.status.connect(lambda text: self.statusBar().showMessage(text, 6000))
         self.pipeline.error.connect(self._notify_error)
         self.pipeline.records_changed.connect(self._on_records_changed)
+        self.pipeline.camera_configuration_ready.connect(self._on_camera_configuration)
+        self.pipeline.inference_fps_ready.connect(self._on_inference_fps_ready)
 
         self.run_page = RunPage()
         self.run_page.start_requested.connect(self._start_run)
@@ -146,6 +157,7 @@ class MainWindow(QMainWindow):
         install_readability_guard(self)
         self._push_context(self.run_page.context())   # 啟動時只同步給背景執行緒，不寫入設定檔
         self._refresh_today_stats()
+        self.pipeline.set_inference_fps(self.inference_fps.value())
         self.pipeline.start()
         if not defer_initial_sop:
             self._open_initial_sop()
@@ -243,7 +255,7 @@ class MainWindow(QMainWindow):
         connect_button.clicked.connect(self._connect_source)
         toolbar.addWidget(connect_button)
         disconnect_button = QPushButton("中斷")
-        disconnect_button.clicked.connect(self.pipeline.close_source)
+        disconnect_button.clicked.connect(self._disconnect_source)
         toolbar.addWidget(disconnect_button)
         self.camera_button = QPushButton("攝影機參數…")
         self.camera_button.setEnabled(False)
@@ -256,6 +268,12 @@ class MainWindow(QMainWindow):
         self.mask_check.setChecked(True)
         self.mask_check.toggled.connect(self._apply_display)
         toolbar.addWidget(self.mask_check)
+        self.regions_check = QCheckBox("顯示作業區域")
+        self.regions_check.setChecked(True)
+        self.regions_check.setToolTip("顯示工作區、安裝位置等區域的框線與名稱；不影響辨識、SOP 判定及紀錄。\n"
+                                     "編輯區域、參考影像或框選時，會暫時顯示操作框線。")
+        self.regions_check.toggled.connect(self._apply_regions_display)
+        toolbar.addWidget(self.regions_check)
         toolbar.addWidget(QLabel("最低顯示信心度"))
         self.display_score = QDoubleSpinBox()
         self.display_score.setRange(0.3, 1.0)
@@ -263,6 +281,19 @@ class MainWindow(QMainWindow):
         self.display_score.setValue(0.5)
         self.display_score.valueChanged.connect(self._apply_display)
         toolbar.addWidget(self.display_score)
+        toolbar.addSeparator()
+        toolbar.addWidget(QLabel("辨識上限"))
+        self.inference_fps = QDoubleSpinBox()
+        self.inference_fps.setRange(0, 240)
+        self.inference_fps.setDecimals(1)
+        self.inference_fps.setKeyboardTracking(False)
+        self.inference_fps.setSpecialValueText("不限")
+        self.inference_fps.setSuffix(" FPS")
+        self.inference_fps.setValue(self._saved_inference_fps())
+        self.inference_fps.setToolTip("限制每秒辨識／判定的最高次數，0 表示不限；相機仍持續擷取最新影像。\n"
+                                      "實際速度受模型與硬體限制；降低上限可能漏掉短暫動作。停止作業後可調整。")
+        self.inference_fps.valueChanged.connect(self._change_inference_fps)
+        toolbar.addWidget(self.inference_fps)
 
     # ---- 設定檔 ----------------------------------------------------------------
     def _set_station_paths(self, station):
@@ -348,6 +379,8 @@ class MainWindow(QMainWindow):
         self.editor._stop_validation()
         self._on_context_changed(self.run_page.context())
         self._pending_station = station
+        self._pending_camera_settings_token = self._camera_settings_token
+        self._camera_settings_token += 1
         self._maintenance_busy = True
         self.setEnabled(False)
         self.statusBar().showMessage("正在保存目前工站紀錄並切換工站…")
@@ -361,9 +394,13 @@ class MainWindow(QMainWindow):
         self._maintenance_busy = False
         self.setEnabled(True)
         if error:
+            # A failed switch keeps the old source alive; its identity remains valid.
+            self._camera_settings_token = self._pending_camera_settings_token
+            self._pending_camera_settings_token = None
             self._refresh_station_choices()
             QMessageBox.warning(self, "切換工站未完成", error)
             return
+        self._pending_camera_settings_token = None
         self.current_station = station
         self._set_station_paths(station)
         self._bind_station_logging()
@@ -374,6 +411,10 @@ class MainWindow(QMainWindow):
         self._set_editor_station_paths()
         self.settings = self._load_settings()
         self.settings["station"] = station.name
+        self.inference_fps.blockSignals(True)
+        self.inference_fps.setValue(self._saved_inference_fps())
+        self.inference_fps.blockSignals(False)
+        self.pipeline.set_inference_fps(self.inference_fps.value())
         self.run_page.reset_station()
         self.run_page.blockSignals(True)
         self.run_page.set_context(self.settings.get("run_context", {}))
@@ -397,8 +438,10 @@ class MainWindow(QMainWindow):
     def _save_settings(self):
         try:
             self._atomic_settings()
-        except OSError:
-            pass
+            return True
+        except OSError as exc:
+            self._notify_error(f"設定未能儲存，重新啟動後可能不會保留：{exc}")
+            return False
 
     @property
     def station(self) -> str:
@@ -432,9 +475,17 @@ class MainWindow(QMainWindow):
 
     def _on_records_changed(self):
         self.records_page.mark_stale()
-        self._refresh_today_stats()
+        self._today_stats_dirty = True
+        if not self._record_stats_timer.isActive():
+            self._record_stats_timer.start()
+
+    def _flush_today_stats(self):
+        if self._today_stats_dirty:
+            self._refresh_today_stats()
 
     def _refresh_today_stats(self):
+        self._record_stats_timer.stop()
+        self._today_stats_dirty = False
         try:
             rows = query(self._records_dir / "records.db", "SELECT result, COUNT(*) FROM cycles "
                          "WHERE started_at >= ? AND result IN ('OK','NG') GROUP BY result",
@@ -445,18 +496,82 @@ class MainWindow(QMainWindow):
         self.run_page.set_today_stats(dict(rows))
 
     # ---- 影像來源 --------------------------------------------------------------
+    def _saved_camera_preferences(self, source):
+        profiles = self.settings.get("camera_profiles", {})
+        if isinstance(profiles, dict) and isinstance(profiles.get(source), dict):
+            return copy.deepcopy(profiles[source])
+        # Earlier releases stored modes and driver controls separately, but never
+        # restored them on open. Migrate lazily without deleting those originals.
+        modes = self.settings.get("camera_modes", {})
+        controls = self.settings.get("camera_controls", {})
+        prefs = copy.deepcopy(modes.get(source, {})) if isinstance(modes, dict) else {}
+        if not isinstance(prefs, dict):
+            prefs = {}
+        if isinstance(controls, dict) and isinstance(controls.get(source), dict):
+            prefs["controls"] = copy.deepcopy(controls[source])
+        return prefs
+
+    def _on_camera_configuration(self, payload):
+        source = payload.get("source_key")
+        if not source or payload.get("settings_token") != self._camera_settings_token:
+            return  # A previous camera/station must never save into the active station.
+        from ..camera_controls import accepted_camera_preferences
+        prefs = accepted_camera_preferences(self._saved_camera_preferences(source), payload["changes"],
+                                             payload["values"], payload["messages"])
+        previous = copy.deepcopy(self.settings)
+        profiles = self.settings.get("camera_profiles")
+        if not isinstance(profiles, dict):
+            profiles = self.settings["camera_profiles"] = {}
+        profiles[source] = prefs
+        if not self._save_settings():
+            self.settings = previous
+        messages = payload.get("messages", [])
+        self.source_status.setToolTip("\n".join(messages + ["以上為驅動回報值；實際擷取速率請看下方擷取 FPS。 "]))
+        if messages:
+            self.statusBar().showMessage("；".join(messages), 15000)
+
+    def _saved_inference_fps(self):
+        try:
+            return InferencePacer(self.settings.get("inference_fps", 0)).fps
+        except ValueError:
+            return 0.
+
+    def _change_inference_fps(self, fps):
+        # Only the background thread acknowledges and persists an accepted rate.
+        if 0 < fps < 1:
+            fps = 1.
+            self.inference_fps.blockSignals(True)
+            self.inference_fps.setValue(fps)
+            self.inference_fps.blockSignals(False)
+        self.pipeline.set_inference_fps(fps)
+
+    def _on_inference_fps_ready(self, fps):
+        self.inference_fps.blockSignals(True)
+        self.inference_fps.setValue(fps)
+        self.inference_fps.blockSignals(False)
+        if self.settings.get("inference_fps", 0) != fps:
+            self.settings["inference_fps"] = fps
+            self._save_settings()
+
+    def _disconnect_source(self):
+        self._camera_settings_token += 1
+        self.pipeline.close_source()
+
     def _connect_source(self):
         if self._vision_error:
             QMessageBox.warning(self, "影像功能不可用", self._vision_error)
             return
         source = self.source_combo.currentData()
         if source.startswith("camera:"):
-            self.pipeline.open_camera(int(source.split(":")[1]))
+            self._camera_settings_token += 1
+            self.pipeline.open_camera(int(source.split(":")[1]), self._saved_camera_preferences(source),
+                                      self._camera_settings_token)
         else:
             start_dir = self.settings.get("video_path") or str(self._data_root)
             path, _ = QFileDialog.getOpenFileName(self, "選擇影片", start_dir, VIDEO_FILTER)
             if not path:
                 return
+            self._camera_settings_token += 1
             self.pipeline.open_file(path, loop=True)
             self.settings["video_path"] = path
         self.settings["source"] = source
@@ -464,6 +579,10 @@ class MainWindow(QMainWindow):
 
     def _apply_display(self, *_args):
         self.pipeline.set_display(self.mask_check.isChecked(), self.display_score.value())
+
+    def _apply_regions_display(self, visible):
+        self.run_page.set_regions_visible(visible)
+        self.editor.set_regions_visible(visible)
 
     def _camera_settings(self):
         if self._vision_error:
@@ -491,9 +610,12 @@ class MainWindow(QMainWindow):
 
     def _on_source_changed(self, label: str):
         self._source_label = label
+        self._performance_tooltip_at = None
+        self.fps_status.setToolTip("")
         self.run_page.clear_video("影像來源已變更，等待影像" if label else "影像來源已中斷")
         self.editor.clear_video("影像來源已變更，等待影像")
         self.source_status.setText(label or "未連線")
+        self.source_status.setToolTip("")
         if not label:
             self.fps_status.setText("")
             self.editor.clear_video("影像來源已中斷")
@@ -505,7 +627,7 @@ class MainWindow(QMainWindow):
                 # Do not preview stale detections while clear/load commands are queued.
                 # Trials read every pending result, so clear those the same way as the preview frame.
                 cleared = replace(packet.result, detections=[], detection_valid=False)
-                packet = replace(packet, result=cleared, display=packet.frame, classes=(),
+                packet = replace(packet, result=cleared, display=packet.frame, model_display=packet.frame, classes=(),
                                  results=tuple(replace(result, detections=[], detection_valid=False)
                                                for result in packet.results))
             page = self.tabs.currentWidget()
@@ -515,15 +637,47 @@ class MainWindow(QMainWindow):
                 self.editor.on_packet(packet)
             count = len([d for d in packet.result.detections if d.score >= self.display_score.value()])
             capture = f"擷取 {packet.camera_fps:.1f} FPS · " if packet.camera_fps is not None else ""
-            self.fps_status.setText(f"{capture}處理 {packet.fps:.1f} FPS · 推論 {packet.inference_ms:.0f} ms · 偵測 {count} 個  ")
+            processing = "辨識" if self.model_ready else "處理"
+            self.fps_status.setText(f"{capture}{processing} {packet.fps:.1f} FPS · 推論 {packet.inference_ms:.0f} ms · 偵測 {count} 個  ")
+            self._update_performance_tooltip(packet)
         finally:
             self.pipeline.acknowledge_packet()
+
+    def _update_performance_tooltip(self, packet):
+        now = time.monotonic()
+        if self._performance_tooltip_at is not None and now - self._performance_tooltip_at < 1.:
+            return
+        self._performance_tooltip_at = now
+        runtime = packet.inference_runtime
+        shape = runtime.get("input_shape")
+        lines = [f"裝置：{runtime.get('device', '未提供')} · 後端：{runtime.get('backend', '未提供')}",
+                 f"精度：{runtime.get('dtype', '未提供')} · FP16：{runtime.get('fp16', '未提供')}",
+                 f"輸入形狀：{shape or '未提供'} · {runtime.get('shape_stage', '')}",
+                 "本幀觀測（ms；巢狀階段不可相加）："]
+        names = ("inference_rpc_ms", "inference_worker_roundtrip_ms", "inference_input_copy_ms",
+                 "inference_model_preprocess_ms", "inference_model_inference_ms", "inference_model_postprocess_ms",
+                 "tracking_ms", "engine_ms", "overlay_ms", "record_accept_ms",
+                 "processing_ms", "capture_to_decision_ms")
+        for name in names:
+            value = packet.stage_ms.get(name)
+            if isinstance(value, (int, float)):
+                lines.append(f"{name}: {value:.2f}")
+        summary = self.pipeline.performance_snapshot()
+        lines.append(f"最近 {summary.get('frames', 0)} 幀（含 GUI 未繪製幀）P95：")
+        for name in ("processing_ms", "tracking_ms", "inference_rpc_ms", "capture_to_decision_ms"):
+            stage = summary.get("stages_ms", {}).get(name)
+            if stage:
+                lines.append(f"{name}: {stage['p95']:.2f} ms")
+        lines.extend(("model_* 是已同步的 runtime 階段時間，非純 GPU kernel 時間。",
+                      "RPC 包含 IPC、輸入拷貝與結果回傳；擷取時間不含曝光及 GUI 繪製。"))
+        self.fps_status.setToolTip("\n".join(lines))
 
     def _on_events(self, events):
         self.run_page.on_events(events)
 
     def _on_engine_state(self, running: bool):
         self._engine_running = running
+        self.inference_fps.setEnabled(not running)
         self.editor.set_production_running(running)
         self.station_combo.setEnabled(not running and self.station_store is not None)
         self.new_station_button.setEnabled(not running and self.station_store is not None)
@@ -871,7 +1025,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "還原完成" if action == "restore" else "備份完成",
                 f"還原完成；還原前的資料保存於：\n{result}" if action == "restore" else
                 f"已建立並校驗工站備份：\n{result}\n\n包含資料目錄內的 SOP、紀錄、截圖及設定；不含外部 SOP、模型與日誌。")
-        self.records_page.mark_stale()
+        self.records_page.refresh()
         self._refresh_today_stats()
         self.statusBar().showMessage("資料維護未完成" if error else "資料維護完成", 6000)
 
@@ -889,6 +1043,7 @@ class MainWindow(QMainWindow):
             return
         if self._error_box is not None:
             self._error_box.close()
+        self._record_stats_timer.stop()
         if self._station_log_handler:
             logging.getLogger("sop").removeHandler(self._station_log_handler)
             self._station_log_handler.close()

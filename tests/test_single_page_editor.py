@@ -266,10 +266,12 @@ class SinglePageEditorTests(unittest.TestCase):
                                                  Step("B", conditions=[Condition(label="other")])]))
         cards = tuple(editor.step_editors)
         fields = tuple(card.condition_table.field_widget(0, "label") for card in cards)
-        editor.on_packet(packet(labels=("part", "other")))
+        with patch("sop_app.ui.editor_page.time.monotonic", return_value=10.):
+            editor.on_packet(packet(labels=("part", "other")))
         self.assertTrue(all("本幀成立，尚未代表工序完成" in card.live_label.text() for card in cards))
         self.assertTrue(all(card.live_label.property("state") == "ok" for card in cards))
-        editor.on_packet(packet(2, labels=()))
+        with patch("sop_app.ui.editor_page.time.monotonic", return_value=10.25):
+            editor.on_packet(packet(2, labels=()))
         self.assertTrue(all("本幀條件未成立" in card.live_label.text() for card in cards))
         self.assertEqual(tuple(editor.step_editors), cards)
         self.assertEqual(tuple(card.condition_table.field_widget(0, "label") for card in cards), fields)

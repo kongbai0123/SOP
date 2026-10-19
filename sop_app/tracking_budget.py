@@ -16,6 +16,29 @@ class TrackingBudget:
         self.samples = 0
         self._high = self._low = 0
         self._overloaded = False
+        self._recovery_cursor = 0
+        self._selected_stage = None
+
+    def begin_frame(self):
+        """A forced retry also consumes this frame's single recovery slot."""
+        self._selected_stage = None
+
+    def select_stage(self, stages, now, elapsed_ms):
+        """Fairly choose at most one costly stage; never reuse another frame's pose.
+
+        The clock is processing wall time, never a video/source timestamp. A
+        250ms retry is a scheduling opportunity, not a completion deadline.
+        """
+        if self._selected_stage is not None or not stages:
+            return None
+        for offset in range(len(stages)):
+            index = (self._recovery_cursor + offset) % len(stages)
+            stage = stages[index]
+            if self.allow(stage, now, elapsed_ms):
+                self._selected_stage = stage
+                self._recovery_cursor = (index + 1) % len(stages)
+                return stage
+        return None
 
     def observe_frame(self, elapsed_ms):
         # Require sustained pressure; one slow search must not switch modes.

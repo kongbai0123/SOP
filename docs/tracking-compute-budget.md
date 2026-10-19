@@ -1,5 +1,7 @@
 # 追蹤運算預算分支
 
+> 2026-10-19 整合更新：正式共用定位管線已重新啟用預算，加入局部優先、單幀單一昂貴恢復與搜尋工作量限制。最新行為、效能及驗證見 [單機工站效能優化](performance-optimization.md)。以下保留原分支的歷史說明與量測背景。
+
 - 分支：`codex/tracking-compute-budget`
 - 起點：`06b0e6b`（`codex/adaptive-kalman-tracking`）。原卡曼分支及更早 baseline 均保留。
 

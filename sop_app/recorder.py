@@ -130,7 +130,9 @@ class Recorder:
 
     def handle(self, events: list[EngineEvent], sop_name: str, sop_version: int, model_version: str,
                frame: np.ndarray | None = None, context: dict | None = None,
-               sop_snapshot: dict | None = None, *, session_id=None, job_key=None, recorded_at=None):
+               sop_snapshot: dict | None = None, *, session_id=None, job_key=None, recorded_at=None,
+               snapshot_jpeg: bytes | None = None):
+        """Write one atomic job; snapshot_jpeg is prevalidated by AsyncRecorder."""
         context = context or {}
         stamp = recorded_at or _now()
         session = session_id or self._session
@@ -138,7 +140,7 @@ class Recorder:
             return
         try:
             self._handle_batch(events, sop_name, sop_version, model_version, frame, context,
-                               sop_snapshot, session, stamp)
+                               sop_snapshot, session, stamp, snapshot_jpeg)
             if job_key:
                 self.db.execute("INSERT INTO applied_jobs VALUES (?,?)", (job_key, stamp))
             self.db.commit()
@@ -147,7 +149,7 @@ class Recorder:
             raise
 
     def _handle_batch(self, events, sop_name, sop_version, model_version, frame, context,
-                      sop_snapshot, session, stamp):
+                      sop_snapshot, session, stamp, snapshot_jpeg=None):
         snapshot_hash = None
         if sop_snapshot is not None:
             content = json.dumps(sop_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -174,7 +176,8 @@ class Recorder:
                 self.db.execute("UPDATE cycles SET ended_at=?, duration_sec=?, result=? WHERE id=?",
                                 (stamp, round(event.data.get("duration", 0.0), 2), result, cycle_id))
             elif event.kind == "step_completed":
-                snapshot = self._save_snapshot(frame, f"cycle{cycle_id:05d}_step{event.step_index + 1:02d}")
+                snapshot = self._save_snapshot(frame, f"cycle{cycle_id:05d}_step{event.step_index + 1:02d}",
+                                               snapshot_jpeg)
                 self.db.execute(
                     "INSERT INTO step_records (cycle_id, step_index, step_name, status, manual, had_alarm, "
                     "duration_sec, finished_at, snapshot) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -192,7 +195,7 @@ class Recorder:
                     (cycle_id, event.step_index + 1, event.step_name, event.data.get("alarm"), event.message, stamp))
                 # NG 的證據比 OK 更重要：警報當下也保留畫面。
                 snapshot = self._save_snapshot(frame, f"cycle{cycle_id:05d}_step{event.step_index + 1:02d}"
-                                                      f"_alarm{cursor.lastrowid}")
+                                                      f"_alarm{cursor.lastrowid}", snapshot_jpeg)
                 if snapshot:
                     self.db.execute("UPDATE alarms SET snapshot=? WHERE id=?", (snapshot, cursor.lastrowid))
 
@@ -208,16 +211,18 @@ class Recorder:
                 self.db.execute("INSERT INTO applied_jobs VALUES (?,?)", (job_key, _now()))
         return cursor.rowcount
 
-    def _save_snapshot(self, frame: np.ndarray | None, stem: str) -> str:
-        if frame is None:
+    def _save_snapshot(self, frame: np.ndarray | None, stem: str, jpeg: bytes | None = None) -> str:
+        if frame is None and jpeg is None:
             return ""
         path = self.snapshot_dir / f"{stem}.jpg"
-        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        if not ok:
-            raise OSError("截圖編碼失敗")
+        if jpeg is None:
+            ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                raise OSError("截圖編碼失敗")
+            jpeg = encoded.tobytes()
         temp = path.with_suffix(".tmp")
         with temp.open("wb") as stream:
-            stream.write(encoded.tobytes())
+            stream.write(jpeg)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temp, path)
@@ -244,6 +249,11 @@ class AsyncRecorder:
         self._on_error = on_error or (lambda message: None)
         self._on_status = on_status or (lambda pending, message: None)
         self._last_error = ("", 0.0)
+        # Two fixed-size snapshots, independent from the SQLite lock. Readers
+        # receive copies; no per-event history or unbounded performance log.
+        self._metrics_lock = threading.Lock()
+        self._last_enqueue_metrics = {}
+        self._last_write_metrics = {}
         self._session = uuid.uuid4().hex
         self._live_sessions = set()
         self._lock = threading.RLock()
@@ -263,19 +273,32 @@ class AsyncRecorder:
         self._ready.wait(10)
 
     def _enqueue(self, payload, frame=None):
+        started = time.perf_counter()
         image = None
         if frame is not None:
             ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if not ok:
                 raise OSError("無法保存待寫入截圖")
             image = encoded.tobytes()
+        encoded_at = time.perf_counter()
         content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        serialized_at = time.perf_counter()
         with self._lock:
+            locked_at = time.perf_counter()
             if self._closed:
                 raise RuntimeError("紀錄寫入器已關閉")
             with self._journal:
                 self._journal.execute("INSERT INTO jobs(job_key,payload,image) VALUES (?,?,?)",
                                       (uuid.uuid4().hex, content, image))
+            committed_at = time.perf_counter()
+        with self._metrics_lock:
+            self._last_enqueue_metrics = {
+                "encode_ms": (encoded_at - started) * 1000 if frame is not None else 0.0,
+                "serialize_ms": (serialized_at - encoded_at) * 1000,
+                "pending_lock_wait_ms": (locked_at - serialized_at) * 1000,
+                "pending_commit_ms": (committed_at - locked_at) * 1000,
+                "total_ms": (committed_at - started) * 1000,
+            }
         self._wake.set()
         self._on_status(self.pending_count(), "事件已保存，等待寫入正式紀錄")
 
@@ -299,26 +322,57 @@ class AsyncRecorder:
         with self._lock:
             return self._journal.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
 
+    @property
+    def last_enqueue_metrics(self):
+        """Last successful durable enqueue, in ms (before status callback)."""
+        with self._metrics_lock:
+            return self._last_enqueue_metrics.copy()
+
+    @property
+    def last_write_metrics(self):
+        """Last completed background job, in ms; overlaps the calling thread."""
+        with self._metrics_lock:
+            return self._last_write_metrics.copy()
+
     def _drain(self, recorder):
         while True:
             with self._lock:
                 row = self._journal.execute("SELECT id,job_key,payload,image FROM jobs ORDER BY id LIMIT 1").fetchone()
             if row is None:
                 return
+            started = time.perf_counter()
             number, key, content, image = row
             payload = json.loads(content)
             kwargs = dict(session_id=payload["session"], job_key=key, recorded_at=payload["at"])
+            decode_ms = 0.0
             if payload["command"] == "ack":
+                write_started = time.perf_counter()
                 recorder.acknowledge_alarms(payload["by"], **kwargs)
             else:
+                decode_started = time.perf_counter()
                 frame = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_COLOR) if image else None
                 if image and frame is None:
                     raise ValueError("待寫入截圖損毀，已保留待處理資料")
+                decode_ms = (time.perf_counter() - decode_started) * 1000 if image else 0.0
+                # The pending BLOB already contains a complete JPEG. Keep the
+                # decode validation for old journals, but save the same encoded
+                # bytes rather than recompressing the decoded pixels again.
+                del frame
+                write_started = time.perf_counter()
                 recorder.handle([EngineEvent(**event) for event in payload["events"]],
                                 payload["sop_name"], payload["sop_version"], payload["model_version"],
-                                frame, payload["context"], payload["sop_snapshot"], **kwargs)
+                                None, payload["context"], payload["sop_snapshot"], snapshot_jpeg=image or None, **kwargs)
+            written_at = time.perf_counter()
             with self._lock, self._journal:
                 self._journal.execute("DELETE FROM jobs WHERE id=?", (number,))
+            deleted_at = time.perf_counter()
+            with self._metrics_lock:
+                self._last_write_metrics = {
+                    "decode_ms": decode_ms,
+                    "formal_write_ms": (written_at - write_started) * 1000,
+                    "pending_delete_ms": (deleted_at - written_at) * 1000,
+                    "total_ms": (deleted_at - started) * 1000,
+                }
             self._on_written()
             self._on_status(self.pending_count(), "正式紀錄已寫入")
 

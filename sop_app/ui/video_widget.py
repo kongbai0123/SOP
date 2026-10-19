@@ -25,11 +25,13 @@ class VideoWidget(QWidget):
         self._classes = ()
         self._placeholder = "尚未連線影像來源"
         self._rois: list[ROI] = []
+        self._regions_visible = True
         self._highlight: set[str] = set()
         self._stale: set[str] = set()
         self._selected: str | None = None
         self._banner = ""
         self._banner_color = QColor("#455a64")
+        self._banner_single_line = False
         self._draw_mode = False
         self._drag_start: QPointF | None = None
         self._drag_end: QPointF | None = None
@@ -59,9 +61,22 @@ class VideoWidget(QWidget):
         self._stale = set(stale)
         self.update()
 
-    def set_banner(self, text: str, color: str = "#455a64"):
-        if text != self._banner or QColor(color) != self._banner_color:
+    def set_banner(self, text: str, color: str = "#455a64", *, single_line=False):
+        if text != self._banner or QColor(color) != self._banner_color or bool(single_line) != self._banner_single_line:
             self._banner, self._banner_color = text, QColor(color)
+            self._banner_single_line = bool(single_line)
+            self.setToolTip(text if self._banner_single_line else "")
+            self.update()
+
+    @property
+    def regions_visible(self):
+        return self._regions_visible
+
+    def set_regions_visible(self, visible: bool):
+        visible = bool(visible)
+        if self._regions_visible != visible:
+            self._regions_visible = visible
+            self._edit_drag = None
             self.update()
 
     def set_draw_mode(self, enabled: bool):
@@ -83,7 +98,7 @@ class VideoWidget(QWidget):
             super().keyPressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
-        if self._selected in self._editable and not self._draw_mode:
+        if self._regions_visible and self._selected in self._editable and not self._draw_mode:
             self.roi_rename_requested.emit(self._selected)
 
     # ---- 座標轉換 --------------------------------------------------------------
@@ -121,7 +136,7 @@ class VideoWidget(QWidget):
         painter.drawImage(rect, self._image)
         label_font = QFont(self.font().family(), 10, QFont.Weight.Bold)
 
-        for roi in self._rois:
+        for roi in self._rois if self._regions_visible else ():
             points = self._edit_drag['preview'] if self._edit_drag and self._edit_drag['name'] == roi.name else roi.points
             polygon = QPolygonF([self._to_widget(rect, x, y) for x, y in points])
             if roi.name in self._stale:
@@ -151,10 +166,20 @@ class VideoWidget(QWidget):
 
         if self._banner:
             banner_font = QFont(self.font().family(), 16, QFont.Weight.Bold)
-            bounds = QRectF(0, 0, rect.width(), self.height()).adjusted(12, 8, -12, -8)
-            banner_font, measured = self._fit_text(painter, self._banner, banner_font, bounds)
-            painter.setFont(banner_font)
-            height = measured.height() + 16
+            text = self._banner
+            flags = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+            if self._banner_single_line:
+                painter.setFont(banner_font)
+                text = painter.fontMetrics().elidedText(" ".join(text.split()), Qt.TextElideMode.ElideRight,
+                                                       max(1, int(rect.width() - 24)))
+                height = painter.fontMetrics().height() + 16
+                flags |= Qt.TextFlag.TextSingleLine
+            else:
+                bounds = QRectF(0, 0, rect.width(), self.height()).adjusted(12, 8, -12, -8)
+                banner_font, measured = self._fit_text(painter, text, banner_font, bounds)
+                painter.setFont(banner_font)
+                height = measured.height() + 16
+                flags |= Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere
             # 上方有黑邊時把橫幅放在黑邊裡，不遮住畫面內容
             top = rect.y() - height if rect.y() >= height else min(rect.y(), self.height() - height)
             band = QRectF(rect.x(), top, rect.width(), height)
@@ -162,9 +187,7 @@ class VideoWidget(QWidget):
             color.setAlpha(220)
             painter.fillRect(band, color)
             painter.setPen(QColor("white"))
-            painter.drawText(band.adjusted(12, 0, -12, 0),
-                             Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft |
-                             Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere, self._banner)
+            painter.drawText(band.adjusted(12, 0, -12, 0), flags, text)
 
         if self._draw_mode:
             painter.setFont(label_font)
@@ -219,7 +242,7 @@ class VideoWidget(QWidget):
     # ---- 框選 ------------------------------------------------------------------
     def mousePressEvent(self, event):
         self.setFocus()
-        if not self._draw_mode and self._editable and event.button() == Qt.MouseButton.LeftButton:
+        if self._regions_visible and not self._draw_mode and self._editable and event.button() == Qt.MouseButton.LeftButton:
             rect = self._image_rect()
             if rect.isEmpty() or not rect.contains(event.position()):
                 return

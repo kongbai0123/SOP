@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 from .native_runtime import cv2
 import numpy as np
@@ -81,20 +82,50 @@ class _TorchVisionDetector:
             return f"GPU（{self._torch.cuda.get_device_name(self.device)}）"
         return "CPU"
 
+    @property
+    def runtime_info(self):
+        return {"backend": "torchvision", "device": str(self.device),
+                "cuda": self.device.type == "cuda", "dtype": str(next(self.model.parameters()).dtype),
+                "input_shape": getattr(self, "_input_shape", None), "shape_stage": "before_model_transform"}
+
     def detect(self, bgr: np.ndarray) -> list[Detection]:
         torch = self._torch
+        started = time.perf_counter()
+        gpu_start = gpu_input = gpu_forward = None
+        if self.device.type == "cuda":
+            gpu_start, gpu_input, gpu_forward = (torch.cuda.Event(enable_timing=True) for _ in range(3))
+            gpu_start.record()
         height, width = bgr.shape[:2]
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         tensor = torch.from_numpy(rgb).to(self.device).permute(2, 0, 1).float().div_(255.0)
+        self._input_shape = [1, *tensor.shape]
+        prepared_at = time.perf_counter()
+        if gpu_input is not None:
+            gpu_input.record()
         with torch.inference_mode():
             output = self.model([tensor])[0]
+            if gpu_forward is not None:
+                gpu_forward.record()
+            forwarded_at = time.perf_counter()
             labels = output["labels"]
             keep = (output["scores"] >= self.score_floor) & (labels >= 1) & (labels <= len(self.classes))
             scores = output["scores"][keep].cpu().tolist()
             labels = [label - 1 for label in labels[keep].cpu().tolist()]
             boxes = output["boxes"][keep].round().int().cpu().numpy()
             masks = (output["masks"][keep, 0] >= 0.5).cpu().numpy() if "masks" in output else None
-        return _collect(self.classes, scores, labels, boxes, masks, width, height)
+        transferred_at = time.perf_counter()
+        detections = _collect(self.classes, scores, labels, boxes, masks, width, height)
+        self.last_metrics = {"preprocess_enqueue_ms": (prepared_at - started) * 1000,
+                             "forward_enqueue_ms": (forwarded_at - prepared_at) * 1000,
+                             "output_transfer_ms": (transferred_at - forwarded_at) * 1000,
+                             "result_convert_ms": (time.perf_counter() - transferred_at) * 1000}
+        if gpu_forward is not None:
+            # CPU output is already required by the rule engine. Events distinguish
+            # CUDA execution from the CPU enqueue measurements above.
+            gpu_forward.synchronize()
+            self.last_metrics.update(cuda_input_ms=gpu_start.elapsed_time(gpu_input),
+                                     cuda_forward_ms=gpu_input.elapsed_time(gpu_forward))
+        return detections
 
 
 class MaskRCNNDetector(_TorchVisionDetector):
@@ -161,6 +192,8 @@ class UltralyticsDetector:
         checkpoint = ensure_checkpoint(info)
         report("建立辨識模型")
         self.model = constructor(str(checkpoint))
+        self._input_shape = None
+        self._observed_backend = None
         names = getattr(self.model, "names", None) or {}
         ordered = tuple(str(names[key]) for key in sorted(names))
         if ordered and ordered != tuple(self.classes):
@@ -176,14 +209,47 @@ class UltralyticsDetector:
             return f"GPU（{self._torch.cuda.get_device_name(self.device)}）"
         return "CPU"
 
+    def _observe_input(self, module, inputs):
+        if inputs and hasattr(inputs[0], "shape"):
+            self._input_shape = list(inputs[0].shape)
+
+    @property
+    def runtime_info(self):
+        backend = getattr(getattr(self.model, "predictor", None), "model", None)
+        execution_model = getattr(backend, "model", None)
+        parameter = next(execution_model.parameters(), None) if hasattr(execution_model, "parameters") else None
+        device = getattr(backend, "device", self.device)
+        fp16 = bool(getattr(backend, "fp16", False))
+        return {"backend": "ultralytics", "device": str(device),
+                "cuda": device.type == "cuda",
+                "dtype": str(parameter.dtype) if parameter is not None else ("float16" if fp16 else "float32"),
+                "fp16": fp16,
+                "input_shape": self._input_shape, "shape_stage": "network_input"}
+
     def detect(self, bgr: np.ndarray) -> list[Detection]:
         height, width = bgr.shape[:2]
         result = self.model.predict(source=bgr, imgsz=self.image_size, conf=self.score_floor,
                                     retina_masks=self.info.has_masks,
                                     device="cuda" if self.device.type == "cuda" else "cpu",
                                     verbose=False)[0]
+        converted_at = time.perf_counter()
+        # setup_model deep-copies the source nn.Module. Attach only AFTER that
+        # setup, to the executing backend: a bound hook on the source model
+        # would otherwise deepcopy this detector and its imported torch module.
+        backend = self.model.predictor.model
+        if backend is not self._observed_backend:
+            if self._observed_backend is not None:
+                self._shape_hook.remove()
+            self._shape_hook = backend.register_forward_pre_hook(self._observe_input)
+            self._observed_backend = backend
+        # Ultralytics already synchronizes its three Profile stages. Reuse them
+        # rather than adding another synchronization to every inference.
+        self.last_metrics = {f"model_{key}_ms": float(value) for key, value in
+                             (getattr(result, "speed", None) or {}).items()
+                             if value is not None}
         boxes = getattr(result, "boxes", None)
         if boxes is None or len(boxes) == 0:
+            self.last_metrics["result_convert_ms"] = (time.perf_counter() - converted_at) * 1000
             return []
         scores = boxes.conf.cpu().tolist()
         labels = boxes.cls.cpu().tolist()
@@ -198,5 +264,7 @@ class UltralyticsDetector:
                                            interpolation=cv2.INTER_NEAREST).astype(bool) for m in raw])
             masks = raw
 
-        return _collect(self.classes, [scores[i] for i in keep], [labels[i] for i in keep],
-                        xyxy[keep], masks[keep] if masks is not None else None, width, height)
+        detections = _collect(self.classes, [scores[i] for i in keep], [labels[i] for i in keep],
+                              xyxy[keep], masks[keep] if masks is not None else None, width, height)
+        self.last_metrics["result_convert_ms"] = (time.perf_counter() - converted_at) * 1000
+        return detections

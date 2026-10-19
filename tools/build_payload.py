@@ -14,7 +14,6 @@ import json
 import os
 from pathlib import Path
 import platform
-import re
 import struct
 import subprocess
 import sys
@@ -23,6 +22,11 @@ import urllib.request
 from collect_notices import collect_notices
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from sop_app.release_version import parse_release_version, windows_file_version, windows_version_tuple
+
 BUILD = ROOT / "installer" / ".build"
 GENERATED = BUILD / "generated"
 BUILD_TOOLS = {"pyinstaller": "6.22.3", "pyinstaller-hooks-contrib": "2026.8", "altgraph": "0.17.5",
@@ -34,9 +38,12 @@ def read_version() -> str:
     for node in module.body:
         if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "__version__" for t in node.targets):
             value = ast.literal_eval(node.value)
-            if re.fullmatch(r"\d+\.\d+\.\d+", value):
-                return value
-    raise SystemExit("Expected a numeric three-part sop_app.__version__ for PE resources")
+            try:
+                parse_release_version(value)
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+            return value
+    raise SystemExit("Expected a numeric three- or four-part sop_app.__version__ for PE resources")
 
 
 def bootstrap_tools() -> None:
@@ -75,6 +82,8 @@ def bootstrap_tools() -> None:
 
 
 def generate_resources(version: str) -> None:
+    version_parts = windows_version_tuple(version)
+    file_version = windows_file_version(version)
     from PIL import Image, ImageDraw
 
     GENERATED.mkdir(parents=True, exist_ok=True)
@@ -93,15 +102,12 @@ def generate_resources(version: str) -> None:
         draw.rectangle((86, top + 6, 202, top + 16), fill="#C6D9E8")
     draw.line((126, 196, 150, 218, 210, 157), fill="#62E0B5", width=17, joint="curve")
     image.save(GENERATED / "SOP.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
-    a, b, c = (int(p) for p in version.split("."))
-    if max(a, b, c) > 65535:
-        raise SystemExit("PE file version exceeds 16-bit component limit")
     info = f'''VSVersionInfo(
-  ffi=FixedFileInfo(filevers=({a}, {b}, {c}, 0), prodvers=({a}, {b}, {c}, 0),
+  ffi=FixedFileInfo(filevers={version_parts!r}, prodvers={version_parts!r},
     mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
   kids=[StringFileInfo([StringTable('040404b0', [
     StringStruct('FileDescription', 'SOP 工序監控'),
-    StringStruct('FileVersion', '{version}.0'),
+    StringStruct('FileVersion', '{file_version}'),
     StringStruct('InternalName', 'SOP'),
     StringStruct('OriginalFilename', 'SOP.exe'),
     StringStruct('ProductName', 'SOP 工序監控'),
