@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import csv
+import sqlite3
 from datetime import date
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QSize, Qt, QUrl
+from PySide6.QtCore import QDate, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QPixmap
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QFileDialog, QHBoxLayout,
                                QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
                                QSizePolicy, QTableWidgetItem, QVBoxLayout, QWidget)
 
-from ..recorder import ALARM_TEXT, RESULT_TEXT, cycle_filter_sql, export_csv, has_column, query
+from ..recorder import ALARM_TEXT, RESULT_TEXT, cycle_filter_sql, export_csv, has_column, query, read_sop_snapshot
 from .compact_layout import set_state, text_label
 from .record_summary import positioning_summary
 from .workbench_widgets import install_readability_guard
@@ -186,6 +187,9 @@ def _line(*items) -> QHBoxLayout:
 
 
 class RecordsPage(QWidget):
+    backup_requested = Signal()
+    restore_requested = Signal()
+
     def __init__(self, records_dir: Path, parent=None):
         super().__init__(parent)
         self.records_dir = Path(records_dir)
@@ -200,6 +204,17 @@ class RecordsPage(QWidget):
         folder_button = QPushButton("開啟截圖資料夾")
         folder_button.clicked.connect(lambda: QDesktopServices.openUrl(
             QUrl.fromLocalFile(str(self.records_dir / "snapshots"))))
+        self.export_sop_button = QPushButton("匯出本輪 SOP…")
+        self.export_sop_button.clicked.connect(self._export_sop_snapshot)
+        self.backup_button = QPushButton("備份工站資料…")
+        self.restore_button = QPushButton("還原工站資料…")
+        self.backup_button.clicked.connect(self.backup_requested)
+        self.restore_button.clicked.connect(self.restore_requested)
+        maintenance = QHBoxLayout()
+        for button in (self.export_sop_button, self.backup_button, self.restore_button):
+            maintenance.addWidget(button)
+        maintenance.addStretch(1)
+        self.recording_status_label = text_label("紀錄系統準備中", "mutedLabel")
 
         # 篩選：日期區間（預設不限）、結果、關鍵字（SOP／作業員／工單／序號／工站）
         self.use_dates = QCheckBox("日期")
@@ -264,6 +279,8 @@ class RecordsPage(QWidget):
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(6)
         layout.addLayout(toolbar)
+        layout.addLayout(maintenance)
+        layout.addWidget(self.recording_status_label)
         layout.addLayout(body, 1)
         self._clear_details()
         install_readability_guard(self)
@@ -275,6 +292,20 @@ class RecordsPage(QWidget):
         layout.addStretch(1)
         widget.setLayout(layout)
         return widget
+
+    def set_recording_status(self, pending, message):
+        self.recording_status_label.setText(f"待寫入 {pending} 批 · {message}" if pending else message)
+        set_state(self.recording_status_label, "warning" if pending or "重試" in message else "neutral")
+
+    def set_records_directory(self, directory):
+        self.records_dir = Path(directory)
+        self.db_path = self.records_dir / "records.db"
+        self._cycle_details = {}
+        self.cycles.clearSelection()
+        self.cycles.setRowCount(0)
+        self._clear_details()
+        self._stale = True
+        self.refresh()
 
     def mark_stale(self):
         self._stale = True
@@ -298,6 +329,16 @@ class RecordsPage(QWidget):
                     result=self.result_filter.currentData() or "", text=self.search.text().strip())
 
     def refresh(self):
+        try:
+            self._refresh_records()
+        except sqlite3.Error as exc:
+            self._clear_details()
+            self.cycles.setRowCount(0)
+            self.summary.setText(f"無法讀取作業紀錄：{exc}")
+            self.cycles_empty.setText("資料庫暫時無法讀取；可排除問題，或在沒有待寫入事件時還原備份。")
+            self.cycles_empty.show()
+
+    def _refresh_records(self):
         self._stale = False
         selected_id = self._selected_cycle_id()
         self._clear_details()
@@ -318,6 +359,7 @@ class RecordsPage(QWidget):
         self.cycles.blockSignals(False)
         self.cycles.setVisible(bool(rows))
         self.cycles_empty.setVisible(not rows)
+        self.cycles_empty.setText("沒有符合條件的作業紀錄。")
         stats = dict(query(self.db_path, f"SELECT c.result, COUNT(*) FROM cycles c{where} GROUP BY c.result",
                            tuple(params)))
         judged = stats.get("OK", 0) + stats.get("NG", 0)
@@ -352,6 +394,7 @@ class RecordsPage(QWidget):
         empty.setVisible(not rows)
 
     def _clear_details(self):
+        self.export_sop_button.setEnabled(False)
         for table in (self.steps, self.alarms, self.positioning):
             table.blockSignals(True)
             table.clearSelection()
@@ -381,6 +424,12 @@ class RecordsPage(QWidget):
             self.cycle_summary.setText(
                 f"輪次 {cycle_id} 明細 · SOP 版本 {cycle[2] if cycle[2] is not None else '未記錄'}"
                 f" · 模型 {cycle[3] or '未記錄'}")
+            rows = (query(self.db_path, "SELECT sop_snapshot_hash FROM cycles WHERE id=?", (cycle_id,))
+                    if has_column(self.db_path, "cycles", "sop_snapshot_hash") else [])
+            digest = rows[0][0] if rows else None
+            self.export_sop_button.setEnabled(bool(digest))
+            self.cycle_summary.setText(self.cycle_summary.text() + (" · 完整 SOP 已保存" if digest else " · 舊紀錄未保存 SOP 快照"))
+            self.cycle_summary.setToolTip(f"SOP SHA-256：{digest}" if digest else "此筆紀錄建立時尚未保存完整 SOP，無法回推當時設定。")
         steps = query(self.db_path, "SELECT step_index, step_name, status, duration_sec, manual, had_alarm, "
                                     "finished_at, snapshot FROM step_records WHERE cycle_id=? ORDER BY id", (cycle_id,))
         _fill(self.steps, [(i, name, "人工跳過" if status == "skipped" else
@@ -452,6 +501,21 @@ class RecordsPage(QWidget):
             self.preview.show_message("歷史截圖無法讀取，紀錄仍可查閱")
             return
         self.preview.show_image(pixmap)
+
+    def _export_sop_snapshot(self):
+        cycle_id = self._selected_cycle_id()
+        if cycle_id is None:
+            return
+        try:
+            snapshot = read_sop_snapshot(self.db_path, cycle_id)
+            if snapshot is None:
+                raise ValueError("此筆舊紀錄未保存完整 SOP 快照")
+            path, _ = QFileDialog.getSaveFileName(self, "匯出當時實際執行的 SOP", f"cycle-{cycle_id}-sop.json", "SOP (*.json)")
+            if path:
+                from ..station_backup import atomic_json
+                atomic_json(Path(path), snapshot[0])
+        except Exception as exc:
+            QMessageBox.warning(self, "無法匯出 SOP", str(exc))
 
     def _export_records(self, target: Path) -> int:
         if not self.db_path.exists() or has_column(self.db_path, "cycles", "operator"):

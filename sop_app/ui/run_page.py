@@ -299,6 +299,17 @@ class RunPage(QWidget):
         self._today = dict(stats)
         self._update_stats()
 
+    def reset_station(self):
+        self.set_running(False)
+        self._stats = {"OK": 0, "NG": 0, "中止": 0}
+        self._today = {}
+        self._pending_alarms.clear()
+        self._flash_timer.stop()
+        self._flash_on = False
+        self.alarm_panel.hide()
+        self.clear_video("已切換工站，請連線影像來源")
+        self._update_stats()
+
     # ---- 外部介面 --------------------------------------------------------------
     def set_sop(self, sop: SOPDefinition):
         """作業進行中不更換，避免畫面與背景引擎使用不同版本的 SOP。"""
@@ -399,6 +410,8 @@ class RunPage(QWidget):
         if not self.sop:
             return "等待 SOP", set(), set()
         if snapshot and snapshot.phase == Phase.CYCLE_DONE:
+            if not self.sop.cycle.enabled:
+                return "本輪完成，已停用自動開始下一輪", set(), set()
             conditions = self.sop.cycle.reset_conditions
             return ("循環重置" if conditions else "本輪完成，等待下一輪",
                     {c.roi for c in conditions if c.roi}, {c.label for c in conditions if c.label})
@@ -573,7 +586,12 @@ class RunPage(QWidget):
                               self._colors["start"] if ok else "#ef6c00")
         self.step_title.setText(f"本輪完成：{result}")
         cycle = self.sop.cycle
-        if cycle.reset_conditions:
+        if not cycle.enabled:
+            self.instruction.setText("本輪已完成；自動開始下一輪已停用")
+            self.progress.setFormat("")
+            self.progress.setValue(0)
+            self.condition_label.setText("")
+        elif cycle.reset_conditions:
             self.instruction.setText("等待重置條件成立後開始下一輪")
             self.progress.setFormat("重置條件 %p%")
             self.progress.setValue(round(snapshot.progress * 100))

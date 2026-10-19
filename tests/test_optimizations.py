@@ -261,7 +261,7 @@ class RecorderTests(unittest.TestCase):
             recorder = Recorder(Path(folder))
             recorder.close()
             self.assertEqual(query(db_path, "SELECT result FROM cycles"), [("INTERRUPTED",)])
-            self.assertEqual(query(db_path, "PRAGMA user_version"), [(2,)])
+            self.assertEqual(query(db_path, "PRAGMA user_version"), [(3,)])
             columns = {row[1] for row in query(db_path, "PRAGMA table_info(cycles)")}
             self.assertTrue({"operator", "serial_no", "station", "work_order"} <= columns)
             # positioning_events 在舊庫不存在時也會補建

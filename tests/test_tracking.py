@@ -292,7 +292,7 @@ class EditorTests(unittest.TestCase):
         editor.on_packet(packet)
         self.assertIn('左側（固定畫面）', editor.roi_rows[0].toolTip())
         self.assertIn('條件本幀成立', editor.roi_rows[0].toolTip())
-        editor.expand_all_button.click()
+        editor.edit_steps_button.setChecked(True)
         self.app.processEvents()
         self.assertGreater(editor.page_scroll.verticalScrollBar().maximum(), 0)
         for form in editor.step_editors:

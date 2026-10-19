@@ -121,6 +121,8 @@ class UIComfortTests(unittest.TestCase):
 
     def test_description_is_always_visible_and_edits_saved(self):
         editor = self.make_editor(fixtures.sop(Step("說明", instruction="請將工件放入指定位置。")))
+        editor.edit_steps_button.setChecked(True)
+        self.app.processEvents()
         instruction = editor.step_editors[0].instruction_edit
         self.assertTrue(instruction.isVisible())
         self.assertEqual(instruction.toPlainText(), "請將工件放入指定位置。")
@@ -130,7 +132,7 @@ class UIComfortTests(unittest.TestCase):
     def test_large_and_short_windows_never_scroll_sideways(self):
         editor = self.make_editor(fixtures.sop(*[Step(f"工序 {index}", conditions=[Condition(label="grip")])
                                                  for index in range(1, 5)]))
-        editor.expand_all_button.click()
+        editor.edit_steps_button.setChecked(True)
         for width, height in ((1300, 640), (1500, 900), (1000, 600)):
             editor.resize(width, height)
             self.app.processEvents()
@@ -143,6 +145,8 @@ class UIComfortTests(unittest.TestCase):
 
     def test_description_grows_with_its_text_instead_of_hiding_lines(self):
         editor = self.make_editor()
+        editor.edit_steps_button.setChecked(True)
+        self.app.processEvents()
         instruction = editor.step_editors[0].instruction_edit
         single = instruction.height()
         instruction.setPlainText("\n".join(("第一行", "第二行", "第三行")))

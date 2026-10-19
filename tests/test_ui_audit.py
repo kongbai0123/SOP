@@ -161,7 +161,7 @@ class WholeUIAuditTests(unittest.TestCase):
         """Collapsed summaries and every expanded field fit without clipping."""
         self.assertFalse(self.editor.findChildren(QTabWidget))
         self.check(self.window, "editor-collapsed")
-        self.editor.expand_all_button.click()
+        self.editor.edit_steps_button.setChecked(True)
         self.assertGreater(self.editor.page_scroll.verticalScrollBar().maximum(), 0)
         for index, step in enumerate(self.editor.step_editors):
             for control in (step.instruction_edit, step.hold_spin, step.forbidden_mode,

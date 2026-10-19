@@ -43,7 +43,7 @@ class SinglePageEditorTests(unittest.TestCase):
         editor.resize(1000, 720)
         editor.show()
         if expanded:
-            editor.expand_all_button.click()
+            editor.edit_steps_button.setChecked(True)
         self.app.processEvents()
         return editor
 
@@ -78,7 +78,7 @@ class SinglePageEditorTests(unittest.TestCase):
         for card in (first, second):
             self.assertFalse(card.expanded)
             self.assertEqual(card.expand_button.text(), "展開")
-            for widget in (card.step_name_edit, card.up_button, card.trial_button, card.live_label):
+            for widget in (card.step_name_edit, card.drag_handle):
                 self.assertTrue(widget.isVisible())
             # The description and rules are a tooltip on the name row, not text on screen.
             self.assertFalse(any(label.isVisible() and "違規：" in label.text()
@@ -93,23 +93,25 @@ class SinglePageEditorTests(unittest.TestCase):
             self.assertIn(text, rules)
         self.assertIn("完成：人工確認", second.header_row.toolTip())
         self.assertIn("違規：未設定", second.header_row.toolTip())
-        first.expand_button.click()
+        editor.edit_steps_button.click()
         self.app.processEvents()
         self.assertTrue(first.condition_table.isVisible())
         self.assertEqual(first.expand_button.text(), "收合")
         self.assertTrue(first.instruction_edit.isVisible())
-        self.assertFalse(second.condition_table.isVisible())
+        self.assertTrue(second.condition_table.isVisible())
         first.hold_spin.setValue(1.5)
         first.expand_button.click()
         self.assertIn("觀察 1.5 秒", first.header_row.toolTip())
-        editor.expand_all_button.click()
+        editor.edit_steps_button.setChecked(False)
+        editor.edit_steps_button.setChecked(True)
         self.assertTrue(all(card.expanded for card in editor.step_editors))
-        editor.collapse_all_button.click()
-        self.assertFalse(any(card.expanded for card in editor.step_editors))
+        editor.edit_steps_button.setChecked(False)
+        self.assertTrue(all(card.body.isHidden() for card in editor.step_editors))
 
     def test_new_and_duplicated_steps_open_alone_and_moves_keep_state(self):
         editor = self.editor(SOPDefinition(steps=[Step("A"), Step("B")]), expanded=False)
-        editor.step_editors[1].expand_button.click()
+        editor.edit_steps_button.click()
+        editor.step_editors[0].set_expanded(False, notify=True)
         editor.step_editors[1].up_button.click()
         self.assertEqual([s.name for s in editor.sop.steps], ["B", "A"])
         self.assertEqual([card.expanded for card in editor.step_editors], [True, False])
@@ -120,7 +122,8 @@ class SinglePageEditorTests(unittest.TestCase):
         self.assertEqual([s.name for s in editor.sop.steps], ["B", "A", "A（複製）", "工序 3"])
         self.assertEqual([card.expanded for card in editor.step_editors], [False, False, True, False])
         editor.set_sop(SOPDefinition(steps=[Step("only")]))
-        self.assertTrue(editor.step_editors[0].expanded)
+        self.assertFalse(editor.step_editors[0].expanded)
+        self.assertTrue(editor.step_editors[0].body.isHidden())
 
     def test_adding_and_deleting_keep_the_scroll_position(self):
         steps = [Step(f"s{i}", conditions=[Condition(label="part")], forbidden=[Condition(label="part")])

@@ -311,6 +311,8 @@ class SOPEngine:
 
         elif self.phase == Phase.CYCLE_DONE:
             cycle = self.sop.cycle
+            if not cycle.enabled:
+                return events
             if cycle.reset_conditions:
                 met, invalid, self._results = evaluate_condition_set(cycle.reset_conditions, frame, self.rois)
                 if invalid or self._completion_invalid:

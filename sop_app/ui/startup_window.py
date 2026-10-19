@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication, QLabel, QLayout, QProgressBar, QVBoxLayout, QWidget
 
-from ..startup import read_progress_messages
+from ..startup import read_progress_file, read_progress_messages
 
 
 class StartupWindow(QWidget):
@@ -50,9 +50,11 @@ class StartupWindow(QWidget):
         self.timer.timeout.connect(self.poll)
         self.timer.start(50)
 
-    def read_messages(self):
+    def read_messages(self, status_path=None):
         try:
-            for message in read_progress_messages(sys.stdin.buffer):
+            messages = (read_progress_file(status_path) if status_path is not None else
+                        read_progress_messages(sys.stdin.buffer))
+            for message in messages:
                 self._messages.put(message)
         finally:
             self._messages.put({"close": True})
@@ -69,12 +71,12 @@ class StartupWindow(QWidget):
         self.elapsed.setText(f"已等待 {time.monotonic() - self._started:.1f} 秒 · 階段進度")
 
 
-def main():
+def main(status_path=None):
     app = QApplication([])
     app.setStyle("Fusion")
     app.setFont(QFont("Microsoft JhengHei UI", 10))
     window = StartupWindow()
-    threading.Thread(target=window.read_messages, daemon=True).start()
+    threading.Thread(target=window.read_messages, args=(status_path,), daemon=True).start()
     window.show()
     return app.exec()
 

@@ -2,14 +2,21 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import sys
 
 from sop_app import __version__
 from sop_app.inference_worker import InferenceWorker
 from sop_app.startup import StartupProgress, initial_model_path
+from sop_app.paths import DATA_ROOT, initialize_runtime
+from sop_app.stations import StationStore
 
 
 def main():
+    multiprocessing.freeze_support()
+    initialize_runtime()
+    station_store = StationStore(DATA_ROOT)
+    station = station_store.initialize()
     progress = StartupProgress()
     progress.start()
     worker = None
@@ -18,7 +25,7 @@ def main():
         progress.report(10, "1 / 4 · 正在背景準備 AI，並開啟介面…")
         # AI 程序先載入 torch；介面程序只載入 Qt，兩者不爭用 GIL 或 DLL loader。
         try:
-            worker = InferenceWorker(initial_model_path()).start()
+            worker = InferenceWorker(initial_model_path(root=station.root)).start()
         except (OSError, RuntimeError):
             logging.getLogger("sop.launcher").exception("無法啟動 AI 程序，繼續開啟介面")
 
@@ -34,7 +41,7 @@ def main():
         app.setStyle("Fusion")
         app.setFont(QFont("Microsoft JhengHei UI", 10))
         progress.report(65, "3 / 4 · 正在建立工作視窗…")
-        window = MainWindow(defer_initial_sop=True, inference_worker=worker)
+        window = MainWindow(defer_initial_sop=True, inference_worker=worker, station_store=station_store)
         progress.report(90, "4 / 4 · 介面就緒，準備讀取 SOP…")
         window.show()
         progress.report(100, "主介面已開啟")
@@ -52,4 +59,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())

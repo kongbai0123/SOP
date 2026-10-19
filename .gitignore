@@ -2,6 +2,7 @@
 /records/
 /logs/
 /app_settings.json
+/data/
 *.db
 *.db-*
 *.sqlite*
@@ -44,3 +45,15 @@ __pycache__/
 /build/
 /dist/
 *.egg-info/
+
+# Local installer toolchain, staging and versioned binary deliveries
+/installer/.tools/
+/installer/.build/
+/installer/releases/
+/Ultralytics/
+
+# Local reports, authoring caches, and exported personal skills
+/.report-build/
+/reports/
+/installer/skill-export/
+node_modules/

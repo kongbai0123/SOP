@@ -1,0 +1,18 @@
+{
+  "productId": "SOP.WorkInstruction",
+  "productName": "SOP 工序監控",
+  "publisher": "kongbai0123",
+  "entryExe": "SOP.exe",
+  "architecture": "x64",
+  "minimumWindows": "10",
+  "installScope": "current-user",
+  "channel": "test",
+  "signingPolicy": "optional",
+  "updateMode": "manual",
+  "distribution": "local",
+  "dataDirectory": "%LOCALAPPDATA%\\SOP.WorkInstruction",
+  "nsisVersion": "3.13",
+  "nsisUrl": "https://downloads.sourceforge.net/project/nsis/NSIS%203/3.13/nsis-3.13.zip",
+  "nsisSha256": "ba63dffc4410ee89193e1cb5a41989991bd77c61068da17e3156d136b7b0b3d8",
+  "nsisChecksumSource": "https://sourceforge.net/projects/nsis/files/NSIS%203/3.13/"
+}

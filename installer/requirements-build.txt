@@ -1,0 +1,9 @@
+# Build tools only. Runtime dependencies remain in ../requirements.txt.
+# Official PyPI wheels are verified by tools/build_payload.py before installation.
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+packaging==26.3
+setuptools==84.0.0

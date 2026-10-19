@@ -1,11 +1,16 @@
 """作業紀錄：SQLite + 工序完成與警報當下的截圖。
 
 資料庫以 ``PRAGMA user_version`` 記錄結構版本，開啟時依序套用遷移，舊紀錄可直接沿用。
-正式監控透過 :class:`AsyncRecorder` 在獨立執行緒寫入，JPEG 編碼與 SQLite 不會拖慢影像處理。
+正式監控先持久保存事件與必要截圖，再透過 :class:`AsyncRecorder` 在獨立執行緒轉入正式紀錄。
 """
 from __future__ import annotations
 
 import csv
+import hashlib
+import json
+import os
+import uuid
+from dataclasses import asdict
 from datetime import datetime
 from contextlib import closing
 import logging
@@ -13,6 +18,7 @@ from pathlib import Path
 import queue
 import sqlite3
 import threading
+import time
 from typing import Callable
 
 from .native_runtime import cv2
@@ -20,7 +26,7 @@ import numpy as np
 
 from .engine import EngineEvent
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 每個版本只做增量變更；已存在的資料庫會從目前版本往後套用。
 _MIGRATIONS: dict[int, str] = {
@@ -60,6 +66,16 @@ CREATE INDEX IF NOT EXISTS idx_steps_cycle ON step_records(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_alarms_cycle ON alarms(cycle_id);
 CREATE INDEX IF NOT EXISTS idx_positioning_cycle ON positioning_events(cycle_id);
 """,
+    3: """
+CREATE TABLE sop_snapshots (
+    hash TEXT PRIMARY KEY, content TEXT NOT NULL, created_at TEXT NOT NULL
+);
+ALTER TABLE cycles ADD COLUMN sop_snapshot_hash TEXT REFERENCES sop_snapshots(hash);
+ALTER TABLE cycles ADD COLUMN session_id TEXT;
+ALTER TABLE cycles ADD COLUMN source_cycle INTEGER;
+CREATE UNIQUE INDEX idx_cycle_session ON cycles(session_id, source_cycle);
+CREATE TABLE applied_jobs (job_key TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+""",
 }
 
 RESULT_TEXT = {"OK": "OK", "NG": "NG", "ABORTED": "中止", "INTERRUPTED": "中斷", "RUNNING": "進行中"}
@@ -77,14 +93,14 @@ def connect(db_path: Path) -> sqlite3.Connection:
     try:
         db.execute("PRAGMA foreign_keys = ON")
         db.execute("PRAGMA journal_mode = WAL")
+        db.execute("PRAGMA synchronous = FULL")
         # 舊版資料庫沒有版本號（0）：第 1 版全是 IF NOT EXISTS，可安全重跑以補齊缺少的資料表。
         version = db.execute("PRAGMA user_version").fetchone()[0]
         for target in range(version + 1, SCHEMA_VERSION + 1):
-            with db:
-                db.executescript(_MIGRATIONS[target])
-                db.execute(f"PRAGMA user_version = {target}")
+            db.executescript("BEGIN IMMEDIATE;\n" + _MIGRATIONS[target]
+                             + f"\nPRAGMA user_version = {target};\nCOMMIT;")
         if version > SCHEMA_VERSION:
-            logging.getLogger("sop.records").warning("紀錄資料庫版本 %s 比程式新（%s）", version, SCHEMA_VERSION)
+            raise ValueError(f"紀錄資料庫版本 {version} 比程式新（{SCHEMA_VERSION}），請更新程式")
     except Exception:
         db.close()
         raise
@@ -94,42 +110,69 @@ def connect(db_path: Path) -> sqlite3.Connection:
 class Recorder:
     """只能在建立它的執行緒中使用（SQLite 連線限制）。"""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, recover=True):
         self.root = Path(root)
         self.snapshot_dir = self.root / "snapshots"
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         self.db = connect(self.root / "records.db")
-        self._cycle_ids: dict[int, int] = {}
-        self.recover_interrupted()
+        self._session = uuid.uuid4().hex
+        if recover:
+            self.recover_interrupted()
 
-    def recover_interrupted(self) -> int:
+    def recover_interrupted(self, preserve_sessions=()) -> int:
         """上次程式異常結束而停在「進行中」的輪次，標記為中斷，避免永遠顯示進行中。"""
         with self.db:
+            placeholders = ",".join("?" for _ in preserve_sessions)
+            clause = f" AND (session_id IS NULL OR session_id NOT IN ({placeholders}))" if preserve_sessions else ""
             cursor = self.db.execute("UPDATE cycles SET result='INTERRUPTED', ended_at=COALESCE(ended_at, ?) "
-                                     "WHERE result='RUNNING'", (_now(),))
+                                     "WHERE result='RUNNING'" + clause, (_now(), *preserve_sessions))
         return cursor.rowcount
 
     def handle(self, events: list[EngineEvent], sop_name: str, sop_version: int, model_version: str,
-               frame: np.ndarray | None = None, context: dict | None = None):
+               frame: np.ndarray | None = None, context: dict | None = None,
+               sop_snapshot: dict | None = None, *, session_id=None, job_key=None, recorded_at=None):
         context = context or {}
+        stamp = recorded_at or _now()
+        session = session_id or self._session
+        if job_key and self.db.execute("SELECT 1 FROM applied_jobs WHERE job_key=?", (job_key,)).fetchone():
+            return
+        try:
+            self._handle_batch(events, sop_name, sop_version, model_version, frame, context,
+                               sop_snapshot, session, stamp)
+            if job_key:
+                self.db.execute("INSERT INTO applied_jobs VALUES (?,?)", (job_key, stamp))
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
+
+    def _handle_batch(self, events, sop_name, sop_version, model_version, frame, context,
+                      sop_snapshot, session, stamp):
+        snapshot_hash = None
+        if sop_snapshot is not None:
+            content = json.dumps(sop_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+            snapshot_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            self.db.execute("INSERT OR IGNORE INTO sop_snapshots VALUES (?,?,?)", (snapshot_hash, content, stamp))
         for event in events:
             if event.kind == "cycle_started":
                 cursor = self.db.execute(
                     "INSERT INTO cycles (sop_name, sop_version, model_version, started_at, result, "
-                    "station, operator, work_order, serial_no) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (sop_name, sop_version, model_version, _now(), "RUNNING",
+                    "station, operator, work_order, serial_no, sop_snapshot_hash, session_id, source_cycle) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (sop_name, sop_version, model_version, stamp, "RUNNING",
                      context.get("station", ""), context.get("operator", ""),
-                     context.get("work_order", ""), context.get("serial_no", "")))
-                self._cycle_ids[event.cycle] = cursor.lastrowid
+                     context.get("work_order", ""), context.get("serial_no", ""), snapshot_hash, session, event.cycle))
                 continue
 
-            cycle_id = self._cycle_ids.get(event.cycle)
-            if cycle_id is None:
-                continue
+            row = self.db.execute("SELECT id FROM cycles WHERE session_id=? AND source_cycle=?",
+                                  (session, event.cycle)).fetchone()
+            if row is None:
+                raise ValueError(f"找不到事件所屬輪次：{session}/{event.cycle}")
+            cycle_id = row[0]
             if event.kind in ("cycle_completed", "cycle_aborted"):
                 result = event.data.get("result", "ABORTED")
                 self.db.execute("UPDATE cycles SET ended_at=?, duration_sec=?, result=? WHERE id=?",
-                                (_now(), round(event.data.get("duration", 0.0), 2), result, cycle_id))
+                                (stamp, round(event.data.get("duration", 0.0), 2), result, cycle_id))
             elif event.kind == "step_completed":
                 snapshot = self._save_snapshot(frame, f"cycle{cycle_id:05d}_step{event.step_index + 1:02d}")
                 self.db.execute(
@@ -137,27 +180,32 @@ class Recorder:
                     "duration_sec, finished_at, snapshot) VALUES (?,?,?,?,?,?,?,?,?)",
                     (cycle_id, event.step_index + 1, event.step_name, event.data.get("status"),
                      int(event.data.get("manual", False)), int(event.data.get("alarm", False)),
-                     round(event.data.get("duration", 0.0), 2), _now(), snapshot))
+                     round(event.data.get("duration", 0.0), 2), stamp, snapshot))
             elif event.kind in ("position_lost", "position_recovered"):
                 self.db.execute("INSERT INTO positioning_events "
                                 "(cycle_id, step_index, kind, message, source_time, created_at) VALUES (?,?,?,?,?,?)",
-                                (cycle_id, event.step_index + 1, event.kind, event.message, event.time, _now()))
+                                (cycle_id, event.step_index + 1, event.kind, event.message, event.time, stamp))
             elif event.kind == "alarm":
                 cursor = self.db.execute(
                     "INSERT INTO alarms (cycle_id, step_index, step_name, kind, message, created_at) "
                     "VALUES (?,?,?,?,?,?)",
-                    (cycle_id, event.step_index + 1, event.step_name, event.data.get("alarm"), event.message, _now()))
+                    (cycle_id, event.step_index + 1, event.step_name, event.data.get("alarm"), event.message, stamp))
                 # NG 的證據比 OK 更重要：警報當下也保留畫面。
                 snapshot = self._save_snapshot(frame, f"cycle{cycle_id:05d}_step{event.step_index + 1:02d}"
                                                       f"_alarm{cursor.lastrowid}")
                 if snapshot:
                     self.db.execute("UPDATE alarms SET snapshot=? WHERE id=?", (snapshot, cursor.lastrowid))
-        self.db.commit()
 
-    def acknowledge_alarms(self, by: str = "") -> int:
+    def acknowledge_alarms(self, by: str = "", *, session_id=None, job_key=None, recorded_at=None) -> int:
         with self.db:
+            if job_key and self.db.execute("SELECT 1 FROM applied_jobs WHERE job_key=?", (job_key,)).fetchone():
+                return 0
+            clause = " AND cycle_id IN (SELECT id FROM cycles WHERE session_id=?)" if session_id else ""
+            params = (recorded_at or _now(), by) + ((session_id,) if session_id else ())
             cursor = self.db.execute("UPDATE alarms SET acknowledged_at=?, acknowledged_by=? "
-                                     "WHERE acknowledged_at IS NULL", (_now(), by))
+                                     "WHERE acknowledged_at IS NULL" + clause, params)
+            if job_key:
+                self.db.execute("INSERT INTO applied_jobs VALUES (?,?)", (job_key, _now()))
         return cursor.rowcount
 
     def _save_snapshot(self, frame: np.ndarray | None, stem: str) -> str:
@@ -166,8 +214,13 @@ class Recorder:
         path = self.snapshot_dir / f"{stem}.jpg"
         ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         if not ok:
-            return ""
-        path.write_bytes(encoded.tobytes())      # 避免 cv2.imwrite 在 Windows 非 ASCII 路徑失敗
+            raise OSError("截圖編碼失敗")
+        temp = path.with_suffix(".tmp")
+        with temp.open("wb") as stream:
+            stream.write(encoded.tobytes())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
         return path.name
 
     def close(self):
@@ -175,58 +228,197 @@ class Recorder:
 
 
 class AsyncRecorder:
-    """在獨立執行緒擁有 :class:`Recorder`；呼叫端只把工作放入佇列，不等待磁碟。
+    """Persist jobs before returning; replay in order with transactional deduplication."""
 
-    ``on_written`` 在每批寫入提交後呼叫，``on_error`` 回報失敗；兩者都在寫入執行緒中執行。
-    """
-
-    def __init__(self, root: Path, on_written: Callable[[], None] | None = None,
-                 on_error: Callable[[str], None] | None = None):
+    def __init__(self, root: Path, on_written=None, on_error=None, on_status=None):
+        from PySide6.QtCore import QLockFile
+        from .station_backup import recover_restore
         self._root = Path(root)
+        self._root.mkdir(parents=True, exist_ok=True)
+        self._writer_lock = QLockFile(str(self._root / ".writer.lock"))
+        self._writer_lock.setStaleLockTime(0)
+        if not self._writer_lock.tryLock(0):
+            raise RuntimeError("此工站資料已由另一個程式使用，請先關閉另一個 SOP 視窗")
+        recover_restore(self._root.parent)
         self._on_written = on_written or (lambda: None)
         self._on_error = on_error or (lambda message: None)
-        self._jobs: queue.Queue = queue.Queue()
+        self._on_status = on_status or (lambda pending, message: None)
+        self._last_error = ("", 0.0)
+        self._session = uuid.uuid4().hex
+        self._live_sessions = set()
+        self._lock = threading.RLock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
         self._ready = threading.Event()
+        self._closed = False
+        self._journal = sqlite3.connect(self._root / "pending.db", check_same_thread=False)
+        self._journal.execute("PRAGMA journal_mode=WAL")
+        self._journal.execute("PRAGMA synchronous=FULL")
+        self._journal.execute("CREATE TABLE IF NOT EXISTS jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                              "job_key TEXT UNIQUE NOT NULL, payload TEXT NOT NULL, image BLOB)")
+        self._journal.commit()
+        self._maintenance = queue.Queue()
         self._thread = threading.Thread(target=self._run, name="sop-recorder", daemon=True)
         self._thread.start()
         self._ready.wait(10)
 
-    def handle(self, events, sop_name, sop_version, model_version, frame=None, context=None):
-        has_image = any(e.kind in ("step_completed", "alarm") for e in events)
-        image = frame.copy() if has_image and frame is not None else None
-        self._jobs.put(("handle", (list(events), sop_name, sop_version, model_version, image, dict(context or {}))))
+    def _enqueue(self, payload, frame=None):
+        image = None
+        if frame is not None:
+            ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if not ok:
+                raise OSError("無法保存待寫入截圖")
+            image = encoded.tobytes()
+        content = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("紀錄寫入器已關閉")
+            with self._journal:
+                self._journal.execute("INSERT INTO jobs(job_key,payload,image) VALUES (?,?,?)",
+                                      (uuid.uuid4().hex, content, image))
+        self._wake.set()
+        self._on_status(self.pending_count(), "事件已保存，等待寫入正式紀錄")
 
-    def acknowledge_alarms(self, by: str = ""):
-        self._jobs.put(("ack", (by,)))
+    def handle(self, events, sop_name, sop_version, model_version, frame=None, context=None, sop_snapshot=None):
+        if not events:
+            return
+        if any(e.kind == "cycle_started" and e.cycle == 1 for e in events):
+            self._session = uuid.uuid4().hex
+        with self._lock:
+            self._live_sessions.add(self._session)
+        image = frame if any(e.kind in ("step_completed", "alarm") for e in events) else None
+        self._enqueue(dict(command="handle", session=self._session, at=_now(),
+                           events=[asdict(e) for e in events], sop_name=sop_name,
+                           sop_version=sop_version, model_version=model_version,
+                           context=dict(context or {}), sop_snapshot=sop_snapshot), image)
 
-    def close(self, timeout: float = 10.0):
-        self._jobs.put(("close", ()))
+    def acknowledge_alarms(self, by=""):
+        self._enqueue(dict(command="ack", session=self._session, at=_now(), by=by))
+
+    def pending_count(self):
+        with self._lock:
+            return self._journal.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+    def _drain(self, recorder):
+        while True:
+            with self._lock:
+                row = self._journal.execute("SELECT id,job_key,payload,image FROM jobs ORDER BY id LIMIT 1").fetchone()
+            if row is None:
+                return
+            number, key, content, image = row
+            payload = json.loads(content)
+            kwargs = dict(session_id=payload["session"], job_key=key, recorded_at=payload["at"])
+            if payload["command"] == "ack":
+                recorder.acknowledge_alarms(payload["by"], **kwargs)
+            else:
+                frame = cv2.imdecode(np.frombuffer(image, dtype=np.uint8), cv2.IMREAD_COLOR) if image else None
+                if image and frame is None:
+                    raise ValueError("待寫入截圖損毀，已保留待處理資料")
+                recorder.handle([EngineEvent(**event) for event in payload["events"]],
+                                payload["sop_name"], payload["sop_version"], payload["model_version"],
+                                frame, payload["context"], payload["sop_snapshot"], **kwargs)
+            with self._lock, self._journal:
+                self._journal.execute("DELETE FROM jobs WHERE id=?", (number,))
+            self._on_written()
+            self._on_status(self.pending_count(), "正式紀錄已寫入")
+
+    def maintenance(self, action, callback, *, allow_unavailable=False):
+        self._maintenance.put((action, callback, allow_unavailable))
+        self._wake.set()
+
+    def close(self, timeout=10.0):
+        with self._lock:
+            if self._closed:
+                return not self._thread.is_alive()
+            self._closed = True
+        self._stop.set()
+        self._wake.set()
         self._thread.join(timeout)
+        return not self._thread.is_alive()
 
     def _run(self):
+        recorder = None
+        recovered = False
         try:
-            recorder = Recorder(self._root)
-        except Exception as exc:          # 無法開啟資料庫：仍持續消化佇列，避免呼叫端堆積
-            recorder = None
-            self._on_error(f"無法開啟作業紀錄資料庫：{exc}")
-        self._ready.set()
-        while True:
-            command, args = self._jobs.get()
-            if command == "close":
-                break
-            if recorder is None:
-                continue
-            try:
-                if command == "handle":
-                    recorder.handle(*args)
-                elif command == "ack":
-                    recorder.acknowledge_alarms(*args)
-                self._on_written()
-            except Exception as exc:
-                logging.getLogger("sop.records").exception("寫入紀錄失敗")
-                self._on_error(f"寫入紀錄失敗：{exc}")
-        if recorder is not None:
-            recorder.close()
+            while True:
+                self._wake.clear()
+                try:
+                    if recorder is None:
+                        from .station_backup import recover_restore
+                        recover_restore(self._root.parent)
+                        recorder = Recorder(self._root, recover=False)
+                    self._drain(recorder)
+                    self._last_error = ("", 0.0)
+                    if not recovered:
+                        with self._lock:
+                            recorder.recover_interrupted(tuple(self._live_sessions))
+                        recovered = True
+                        self._on_status(self.pending_count(), "紀錄系統就緒，待處理紀錄已補寫")
+                    self._ready.set()
+                    while not self._maintenance.empty():
+                        action, callback, _allow_unavailable = self._maintenance.get_nowait()
+                        # No events are produced during maintenance (pipeline is stopped).
+                        recorder.close()
+                        recorder = None
+                        try:
+                            result = action()
+                            recorder = Recorder(self._root, recover=True)
+                        except Exception as exc:
+                            callback(None, str(exc))
+                        else:
+                            callback(result, "")
+                        finally:
+                            if recorder is None:
+                                from .station_backup import recover_restore
+                                recover_restore(self._root.parent)
+                                recorder = Recorder(self._root, recover=False)
+                except Exception as exc:
+                    last_message, last_time = self._last_error
+                    if str(exc) != last_message or time.monotonic() - last_time >= 30:
+                        logging.getLogger("sop.records").exception("紀錄尚未寫入，保留待重試資料")
+                        self._on_error(f"紀錄尚未寫入，待處理資料已保留，將自動重試：{exc}")
+                        self._last_error = (str(exc), time.monotonic())
+                    self._on_status(self.pending_count(), f"正式紀錄尚未寫入，將自動重試：{exc}")
+                    self._ready.set()
+                    if recorder is not None:
+                        recorder.close()
+                        recorder = None
+                    while not self._maintenance.empty():
+                        action, callback, allow_unavailable = self._maintenance.get_nowait()
+                        if allow_unavailable and self.pending_count() == 0:
+                            try:
+                                result = action()
+                                recorder = Recorder(self._root, recover=True)
+                                recovered = True
+                            except Exception as maintenance_error:
+                                callback(None, str(maintenance_error))
+                            else:
+                                callback(result, "")
+                                self._on_status(0, "工站資料已還原，紀錄系統就緒")
+                        else:
+                            callback(None, "仍有待寫入紀錄，請排除磁碟／資料庫問題後再備份或還原")
+                if self._stop.is_set():
+                    break
+                self._wake.wait(1.0)
+        finally:
+            if recorder is not None:
+                recorder.close()
+            with self._lock:
+                self._journal.close()
+            self._writer_lock.unlock()
+
+
+def read_sop_snapshot(db_path: Path, cycle_id: int) -> tuple[dict, str] | None:
+    if not has_column(db_path, "cycles", "sop_snapshot_hash"):
+        return None
+    rows = query(db_path, "SELECT s.content,s.hash FROM cycles c JOIN sop_snapshots s "
+                         "ON s.hash=c.sop_snapshot_hash WHERE c.id=?", (cycle_id,))
+    if not rows:
+        return None
+    content, digest = rows[0]
+    if hashlib.sha256(content.encode("utf-8")).hexdigest() != digest:
+        raise ValueError("SOP 快照完整性檢查失敗")
+    return json.loads(content), digest
 
 
 def query(db_path: Path, sql: str, params: tuple = ()) -> list[tuple]:

@@ -65,6 +65,7 @@ class CycleSettings:
     auto_restart_sec: float = 3.0   # 沒有重置條件時，本輪完成後幾秒自動開始下一輪
     reset_ratio: float = 0.8        # 重置條件觀察期間至少多少比例的幀成立
     detect_sequence: bool = False   # 後續工序的完成條件提前成立 → 「順序錯誤」警報
+    enabled: bool = True            # 本輪完成後自動開始下一輪
 
 
 @dataclass
@@ -103,6 +104,7 @@ class SOPDefinition:
                       str(r.get("anchor", "fixed")))
                   for r in data.get("rois", [])],
             cycle=CycleSettings(
+                enabled=bool(cycle.get("enabled", True)),
                 reset_conditions=_conditions(cycle.get("reset_conditions")),
                 reset_hold_sec=float(cycle.get("reset_hold_sec", 2.0)),
                 auto_restart_sec=float(cycle.get("auto_restart_sec", 3.0)),

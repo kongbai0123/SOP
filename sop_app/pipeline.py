@@ -182,6 +182,9 @@ class VideoPipeline(QThread):
     camera_controls_ready = Signal(object, object)
     engine_state = Signal(bool)            # 作業是否進行中
     records_changed = Signal()             # 紀錄已寫入資料庫
+    maintenance_finished = Signal(str, str, str)  # action, result, error
+    recording_status = Signal(int, str)
+    station_switched = Signal(str, str)  # target records directory, error
     status = Signal(str)
     error = Signal(str)
 
@@ -275,13 +278,24 @@ class VideoPipeline(QThread):
             worker.close()
         return self.wait(5000)
 
+    def maintain_records(self, action, path):
+        self._commands.put(("maintenance", (action, str(path))))
+
+    def switch_station(self, directory):
+        self._commands.put(("station", Path(directory)))
+
     # ---- 背景執行緒 ------------------------------------------------------------
     def run(self):
-        recorder = AsyncRecorder(self._records_dir, on_written=self.records_changed.emit,
-                                 on_error=self.error.emit)
+        try:
+            recorder = AsyncRecorder(self._records_dir, on_written=self.records_changed.emit,
+                                     on_error=self.error.emit, on_status=self.recording_status.emit)
+        except Exception as exc:
+            self._alive = False
+            self.error.emit(f"無法啟動紀錄系統，已停止影像管線：{exc}")
+            return
         try:
             while self._alive:
-                self._drain_commands(recorder)
+                recorder = self._drain_commands(recorder)
                 if self._source is None:
                     time.sleep(0.03)
                     continue
@@ -391,9 +405,13 @@ class VideoPipeline(QThread):
         sop = self._engine.sop
         model_version = self._detector.info.model_version_id if self._detector is not None else ""
         try:
-            recorder.handle(events, sop.name, sop.version, model_version, self._last_display, self._context)
+            snapshot = sop.to_dict() if any(e.kind == "cycle_started" for e in events) else None
+            recorder.handle(events, sop.name, sop.version, model_version, self._last_display, self._context,
+                            sop_snapshot=snapshot)
         except Exception as exc:
-            self.error.emit(f"寫入紀錄失敗：{exc}")
+            self._engine.stop(self._now)
+            self.engine_state.emit(False)
+            self.error.emit(f"無法持久保存作業事件，已停止作業，請排除磁碟問題後再開始：{exc}")
         self.events_ready.emit(events)
 
     def _drain_commands(self, recorder: Recorder):
@@ -401,15 +419,83 @@ class VideoPipeline(QThread):
             try:
                 command, payload = self._commands.get_nowait()
             except queue.Empty:
-                return
+                return recorder
             try:
-                self._handle_command(command, payload, recorder)
+                if command == "station":
+                    recorder = self._switch_station(payload, recorder)
+                else:
+                    self._handle_command(command, payload, recorder)
             except Exception as exc:
                 if self._alive:
                     self.error.emit(str(exc))
+        return recorder
+
+    def _switch_station(self, directory, recorder):
+        directory = Path(directory)
+        target = None
+        try:
+            if self._engine is not None and self._engine.phase != Phase.IDLE:
+                raise RuntimeError("請先停止作業，再切換工站")
+            if directory.resolve() == self._records_dir.resolve():
+                self.station_switched.emit(str(directory), "")
+                return recorder
+            done, errors = threading.Event(), []
+            def flushed(_result, error):
+                errors.append(error)
+                done.set()
+            recorder.maintenance(lambda: True, flushed)
+            done.wait()
+            if errors[0]:
+                raise RuntimeError(errors[0])
+            # Acquire the target before releasing the old station; failure keeps the old one usable.
+            target = AsyncRecorder(directory)
+            self._set_source(None, recorder)
+            if not recorder.close():
+                raise RuntimeError("目前工站的紀錄寫入器尚未關閉，請稍後重試")
+        except Exception as exc:
+            if target is not None:
+                target.close()
+            self.station_switched.emit(str(directory), str(exc))
+            return recorder
+        self._records_dir = directory
+        self._engine = None
+        self._context = {}
+        self._model_generation += 1
+        self._detector = None
+        self._preview_workpiece = None
+        self._preview_key = ""
+        self._locator = None
+        self._locator_key = ""
+        self._pending_results.clear()
+        self._last_display = None
+        target._on_written = self.records_changed.emit
+        target._on_error = self.error.emit
+        target._on_status = self.recording_status.emit
+        self.station_switched.emit(str(directory), "")
+        startup_error = target._last_error[0]
+        self.recording_status.emit(target.pending_count(),
+            f"目前工站紀錄仍待修復，將自動重試：{startup_error}" if startup_error else "目前工站紀錄系統就緒")
+        return target
 
     def _handle_command(self, command: str, payload, recorder):
-        if command == "source":
+        if command == "maintenance":
+            action, path = payload
+            if self._engine is not None and self._engine.phase != Phase.IDLE:
+                self.maintenance_finished.emit(action, "", "請先停止作業，再備份或還原")
+                return
+            from .station_backup import create_backup, restore_backup
+            operation = {"backup": create_backup, "restore": restore_backup}.get(action)
+            if operation is None:
+                raise ValueError("未知的資料維護操作")
+            # Wait here so no pipeline command can race with a replacement of station data.
+            done = threading.Event()
+            def finished(result, error):
+                self.maintenance_finished.emit(action, str(result or ""), error)
+                done.set()
+            recorder.maintenance(lambda: operation(self._records_dir.parent, Path(path)), finished,
+                                 allow_unavailable=action == "restore")
+            done.wait()
+        elif command == "source":
             self._set_source(payload, recorder)
         elif command == "model":
             self._start_model_load(payload)
@@ -457,7 +543,7 @@ class VideoPipeline(QThread):
             events = self._engine.start(self._now)
             self._sync_locator()              # 引擎進入作業狀態後才切換為作業中 SOP 的工件
             self._emit_events(events, recorder)
-            self.engine_state.emit(True)
+            self.engine_state.emit(self._engine.phase != Phase.IDLE)
         elif command == "stop":
             self._stop_engine(recorder)
         elif self._engine is not None and self._engine.phase != Phase.IDLE:

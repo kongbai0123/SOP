@@ -1,13 +1,9 @@
-"""One SOP step as a stacked block in the narrow step column.
-
-Collapsed, a step keeps its name and actions; the description and every rule
-appear as a tooltip on the step's name row. Expanded, it shows the description,
-time parameters and condition blocks.
-"""
+"""A reorderable name row with actions and settings available in edit mode."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtCore import QMimeData, Qt, Signal
+from PySide6.QtGui import QDrag
+from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QVBoxLayout, QWidget)
 
 from ..engine import violation_window
@@ -76,6 +72,41 @@ def section(title: QLabel, *widgets) -> QWidget:
     return widget
 
 
+class StepDragHandle(QLabel):
+    MIME = "application/x-sop-step"
+
+    def __init__(self, owner):
+        super().__init__("≡", owner)
+        self.owner = owner
+        self.start = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("拖曳調整工序順序；聚焦後按 Alt＋↑／↓ 也可移動")
+        self.setAccessibleName("拖曳調整工序順序")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.start = event.position().toPoint()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self.start is not None and event.buttons() & Qt.MouseButton.LeftButton
+                and (event.position().toPoint() - self.start).manhattanLength() >= QApplication.startDragDistance()):
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setData(self.MIME, str(id(self.owner.step)).encode("ascii"))
+            drag.setMimeData(mime)
+            self.start = None
+            drag.exec(Qt.DropAction.MoveAction)
+
+    def keyPressEvent(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.AltModifier and event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+            self.owner.move_requested.emit(-1 if event.key() == Qt.Key.Key_Up else 1)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+
 class StepEditor(QFrame):
     changed = Signal()
     region_selected = Signal(str)
@@ -84,14 +115,18 @@ class StepEditor(QFrame):
     move_requested = Signal(int)
     trial_requested = Signal()
     expanded_changed = Signal(bool)
+    reorder_requested = Signal(str, bool)
 
     def __init__(self, step: Step, classes, roi_names, parent=None):
         super().__init__(parent)
         self.setObjectName("stepBlock")
+        self.setAcceptDrops(True)
+        self._editing = False
         self.step = step
         self._loading = True
         self.number_label = QLabel("1")
         self.number_label.setObjectName("stepNumber")
+        self.drag_handle = StepDragHandle(self)
         self.step_name_edit = QLineEdit(step.name)
         self.step_name_edit.setPlaceholderText("工序名稱")
         self.step_name_edit.setAccessibleName("工序名稱")
@@ -142,10 +177,12 @@ class StepEditor(QFrame):
         name_line = QHBoxLayout()
         name_line.setContentsMargins(0, 0, 0, 0)
         name_line.setSpacing(6)
+        name_line.addWidget(self.drag_handle)
         name_line.addWidget(self.number_label)
         name_line.addWidget(self.step_name_edit, 1)
         name_line.addWidget(self.expand_button)
-        actions = QHBoxLayout()
+        self.actions_row = QWidget()
+        actions = QHBoxLayout(self.actions_row)
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(4)
         for button in (self.up_button, self.down_button, self.duplicate_button, self.delete_button):
@@ -156,7 +193,7 @@ class StepEditor(QFrame):
         header.setContentsMargins(6, 5, 6, 5)
         header.setSpacing(4)
         header.addLayout(name_line)
-        header.addLayout(actions)
+        header.addWidget(self.actions_row)
 
         self.description_row = field_pair("說明", self.instruction_edit)
         self.completion_row = section(group_label("完成", "completion"), parameter_grid((
@@ -173,7 +210,7 @@ class StepEditor(QFrame):
         status_layout.addWidget(self.summary_label)
         status_layout.addWidget(self.live_label)
 
-        body = QWidget()
+        body = self.body = QWidget()
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(8, 4, 6, 6)
         body_layout.setSpacing(4)
@@ -195,6 +232,32 @@ class StepEditor(QFrame):
         self._loading = False
         self.update_summary()
         self.set_expanded(True)
+        self.set_editing(False)
+
+    def set_editing(self, editing, individual=False):
+        self._editing = bool(editing)
+        self._individual_edit = bool(individual)
+        self.expand_button.setText("完成" if individual else ("收合" if self.expanded else "展開"))
+        self.expand_button.setVisible(self._editing)
+        self.actions_row.setVisible(self._editing)
+        self.body.setVisible(self._editing)
+
+    def dragEnterEvent(self, event):
+        source = event.source()
+        if (isinstance(source, StepDragHandle) and source.owner.parent() is self.parent()
+                and source.owner is not self and event.mimeData().hasFormat(StepDragHandle.MIME)):
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        self.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        source = event.source()
+        if isinstance(source, StepDragHandle) and source.owner.parent() is self.parent() and source.owner is not self:
+            token = bytes(event.mimeData().data(StepDragHandle.MIME)).decode("ascii")
+            after = event.position().y() >= self.height() / 2
+            event.acceptProposedAction()
+            self.reorder_requested.emit(token, after)
 
     @staticmethod
     def mode_choice(value):

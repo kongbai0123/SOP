@@ -200,7 +200,7 @@ class WorkbenchQtTests(unittest.TestCase):
         for card in editor.step_editors:
             self.assertTrue(card.step_name_edit.isVisible())
             self.assertIn("完成", card.header_row.toolTip())
-        editor.expand_all_button.click()
+        editor.edit_steps_button.setChecked(True)
         for card in editor.step_editors:
             self.assertTrue(card.instruction_edit.isVisible())
             self.assertTrue(card.forbidden_table.isVisible())
@@ -359,6 +359,8 @@ class WorkbenchQtTests(unittest.TestCase):
 
     def test_option_refresh_keeps_all_fields_visible_with_real_height(self):
         editor = self.make_editor()
+        editor.edit_steps_button.setChecked(True)
+        self.app.processEvents()
         table = editor.step_editors[0].condition_table
         score = table.field_widget(0, "min_score")
         editor._refresh_options()
@@ -405,6 +407,8 @@ class WorkbenchQtTests(unittest.TestCase):
 
     def test_condition_thresholds_are_immediately_editable(self):
         editor = self.make_editor()
+        editor.edit_steps_button.setChecked(True)
+        self.app.processEvents()
         table = editor.step_editors[0].condition_table
         score = table.field_widget(0, "min_score")
         self.assertTrue(score.isVisible())
@@ -456,7 +460,7 @@ class WorkbenchQtTests(unittest.TestCase):
                 window._apply_sop(definition, None)
                 editor = window.editor
                 editor.set_classes(["grip", "tool"])
-                editor.expand_all_button.click()
+                editor.edit_steps_button.setChecked(True)
                 window.tabs.setCurrentWidget(editor)
                 window.show()
                 for width, height in ((1366, 768), (1920, 1080)):

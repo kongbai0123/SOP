@@ -23,6 +23,7 @@ from .condition_rows import ConditionRows
 from .editor_validation import EditorValidation
 from .step_editor import StepEditor, field_pair, flow_row
 from .video_widget import VideoWidget
+from .toggle_switch import ToggleSwitch
 from .workbench_widgets import install_readability_guard, workbench_styles
 
 SIDE_MARGIN = 6          # inner margin of the two side columns
@@ -94,7 +95,8 @@ class ROIEditorRow(QFrame):
         top.setSpacing(4)
         top.addWidget(self.name_edit, 1)
         top.addWidget(self.anchor_combo)
-        actions = QHBoxLayout()
+        self.actions_row = QWidget()
+        actions = QHBoxLayout(self.actions_row)
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(4)
         for button in (self.edit_button, self.duplicate_button, self.delete_button):
@@ -104,8 +106,12 @@ class ROIEditorRow(QFrame):
         layout.setContentsMargins(0, 4, 0, 5)
         layout.setSpacing(3)
         layout.addLayout(top)
-        layout.addLayout(actions)
+        layout.addWidget(self.actions_row)
         self.set_status("本幀 —")
+
+    def set_editing(self, editing):
+        self.anchor_combo.setVisible(editing)
+        self.actions_row.setVisible(editing)
 
     def set_status(self, text):
         """This frame's state of the region is a tooltip on the row."""
@@ -123,6 +129,9 @@ class EditorPage(QWidget):
         super().__init__(parent)
         self.setObjectName("workbenchEditor")
         self.setProperty("ownsPageScroll", True)
+        self._data_root = PROJECT_ROOT
+        self._resolve_path = resolve
+        self._relativize_path = relativize
         # The arrangement adapts to the size it receives, so the three-column
         # minimum must not stop the window from shrinking.
         self.setMinimumSize(480, 320)
@@ -139,6 +148,9 @@ class EditorPage(QWidget):
         self._mode = None
         self._applying_layout = False
         self._image_focus = self._auto_focus = False
+        self._editing_steps = False
+        self._individual_step = None
+        self._editing_rois = False
         self._expanded: set[int] = set()  # id() of steps whose settings are open
         self._validation = EditorValidation()
         self.step_editors, self.roi_rows = [], []
@@ -258,13 +270,20 @@ class EditorPage(QWidget):
 
     def _build_tools(self):
         """Right column: regions and the trial."""
-        self.draw_button = QPushButton("框選新區域")
+        self.draw_button = QPushButton("新增區域")
         self.draw_button.setCheckable(True)
         self.draw_button.toggled.connect(self._toggle_draw)
-        self.undo_roi_button, self.redo_roi_button = QPushButton("復原區域"), QPushButton("重做區域")
+        self.undo_roi_button, self.redo_roi_button = QPushButton("復原區域"), QPushButton("重作區域")
         self.undo_roi_button.clicked.connect(self._undo_roi)
         self.redo_roi_button.clicked.connect(self._redo_roi)
-        self.region_tools = flow_row(self.draw_button, self.undo_roi_button, self.redo_roi_button, spacing=4)
+        self.edit_rois_button = QPushButton("編輯區域")
+        self.edit_rois_button.setCheckable(True)
+        self.edit_rois_button.toggled.connect(self._set_rois_editing)
+        self.region_tools = flow_row(self.draw_button, self.edit_rois_button, spacing=4)
+        self.roi_edit_toolbar = flow_row(self.undo_roi_button, self.redo_roi_button, spacing=4)
+        self.roi_edit_note = text_label("可修改定位方式、移動／縮放、複製或刪除區域；復原／重作會保留區域與條件的引用。", "mutedLabel")
+        self.roi_edit_toolbar.hide()
+        self.roi_edit_note.hide()
         self.rois_layout = QVBoxLayout()
         self.rois_layout.setContentsMargins(0, 0, 0, 0)
         self.rois_layout.setSpacing(0)
@@ -273,7 +292,9 @@ class EditorPage(QWidget):
         self.empty_rois_label = text_label("尚未建立作業區域；條件可使用整個畫面。", "mutedLabel")
         self.roi_status = text_label("尚未建立作業區域。", "mutedLabel")
         self.roi_status.hide()  # per-region status is shown in each row
-        regions = titled("作業區域", panel(self.region_tools, rows, self.empty_rois_label))
+        self.regions_panel = panel(self.region_tools, self.roi_edit_toolbar,
+                                   self.roi_edit_note, rows, self.empty_rois_label)
+        regions = titled("作業區域", self.regions_panel)
 
         self.validation_box = self._build_validation_area()
         self.tools_content = QWidget()
@@ -325,32 +346,32 @@ class EditorPage(QWidget):
         layout = QVBoxLayout(self.steps_box)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
-        self.expand_all_button = QPushButton("全部展開")
-        self.collapse_all_button = QPushButton("全部收合")
-        self.expand_all_button.clicked.connect(lambda: self._set_all_expanded(True))
-        self.collapse_all_button.clicked.connect(lambda: self._set_all_expanded(False))
+        self.add_step_button = QPushButton("新增工序")
+        self.add_step_button.clicked.connect(lambda: self._add_step())
+        self.edit_steps_button = QPushButton("編輯")
+        self.edit_steps_button.setCheckable(True)
+        self.edit_steps_button.toggled.connect(self._set_steps_editing)
         title = QHBoxLayout()
         title.setContentsMargins(0, 0, 0, 0)
         title.setSpacing(4)
         title.addWidget(section_title("工序（由上而下依序執行）"), 1)
-        title.addWidget(self.expand_all_button)
-        title.addWidget(self.collapse_all_button)
+        title.addWidget(self.add_step_button)
+        title.addWidget(self.edit_steps_button)
         layout.addLayout(title)
         self.steps_layout = QVBoxLayout()
         self.steps_layout.setSpacing(6)
         layout.addLayout(self.steps_layout)
-        self.empty_steps_label = text_label("尚未新增工序。新增後可直接編輯名稱、完成條件與違規條件。", "mutedLabel")
+        self.empty_steps_label = text_label("尚未新增工序。請按「新增工序」開始設定。", "mutedLabel")
         layout.addWidget(self.empty_steps_label)
-        self.add_step_button = QPushButton("新增工序")
-        self.add_step_button.clicked.connect(lambda: self._add_step())
-        layout.addWidget(self.add_step_button, alignment=Qt.AlignmentFlag.AlignLeft)
         return self.steps_box
 
     def _build_cycle_area(self):
         self.auto_restart_spin = StepEditor.seconds(3, 600)
         self.reset_hold_spin = StepEditor.seconds(2, 60)
         self.reset_ratio_spin = StepEditor.percent(80, 1)
-        self.sequence_check = QCheckBox("偵測跳步")
+        self.sequence_check = ToggleSwitch("偵測跳步")
+        self.cycle_enabled_switch = ToggleSwitch("自動開始下一輪")
+        self.cycle_enabled_switch.setChecked(True)
         self.reset_table = ConditionRows("reset", "新增重置條件", "未設定重置條件：本輪完成後依延遲秒數開始下一輪")
         self.reset_table.changed.connect(self._on_cycle_form)
         self.reset_table.region_selected.connect(self._highlight_condition_region)
@@ -364,9 +385,12 @@ class EditorPage(QWidget):
         rows.addRow(self._form_label("重置觀察"), self.reset_hold_spin)
         rows.addRow(self._form_label("重置成立比例"), self.reset_ratio_spin)
         sequence_note = text_label("後續工序含「出現」條件且提前成立時發出順序錯誤警報。", "mutedLabel")
-        self.cycle_box = panel(form, self.cycle_rule_summary,
+        self.cycle_settings = panel(form, self.cycle_rule_summary,
                                text_label("重置條件全部成立後才開始下一輪（選填）", "mutedLabel"),
-                               self.reset_table, self.sequence_check, sequence_note)
+                               self.reset_table)
+        self.cycle_box = panel(self.cycle_enabled_switch, self.cycle_settings,
+                               self.sequence_check, sequence_note)
+        self.cycle_enabled_switch.toggled.connect(self._on_cycle_form)
         for spin in (self.auto_restart_spin, self.reset_hold_spin, self.reset_ratio_spin):
             spin.valueChanged.connect(self._on_cycle_form)
         self.sequence_check.toggled.connect(self._on_cycle_form)
@@ -534,11 +558,14 @@ class EditorPage(QWidget):
         self.sop = sop
         self._clear_roi_history()
         self._selected_roi_name = self._highlighted_condition_roi = None
-        # A loaded SOP opens as a compact list; a single step is opened for editing.
-        self._expanded = {id(step) for step in sop.steps} if len(sop.steps) == 1 else set()
+        # Every loaded SOP opens as a clean, reorderable name list.
+        self._expanded = set()
+        self._individual_step = None
+        self.edit_steps_button.setChecked(False)
+        self.edit_rois_button.setChecked(False)
         self._model_state = "selected" if sop.model_path else "unselected"
         self._model_detail = ""
-        if sop.model_path and not resolve(sop.model_path).exists():
+        if sop.model_path and not self._resolve_path(sop.model_path).exists():
             self._model_state, self._model_detail = "failed", "模型路徑不存在"
         self.name_edit.setText(sop.name)
         self.version_label.setText(str(sop.version))
@@ -557,6 +584,7 @@ class EditorPage(QWidget):
         else:
             self.tracking_label.setText("尚未設定工件跟隨；區域使用固定畫面座標。")
         self.reference_button.setEnabled(self._locator is not None)
+        self.cycle_enabled_switch.setChecked(sop.cycle.enabled)
         self.auto_restart_spin.setValue(sop.cycle.auto_restart_sec)
         self.reset_hold_spin.setValue(sop.cycle.reset_hold_sec)
         self.reset_ratio_spin.setValue(round(sop.cycle.reset_ratio * 100))
@@ -626,6 +654,9 @@ class EditorPage(QWidget):
             editor.trial_requested.connect(lambda s=step: self._start_step_validation(self._step_index(s)))
             editor.expanded_changed.connect(lambda expanded, s=step: self._on_step_expanded(s, expanded))
             editor.set_expanded(id(step) in self._expanded)
+            individual = not self._editing_steps and step is self._individual_step
+            editor.set_editing(self._editing_steps or individual, individual=individual)
+            editor.reorder_requested.connect(lambda token, after, s=step: self._drop_step(token, s, after))
             self.step_editors.append(editor)
             self.steps_layout.addWidget(editor)
             # Show at once: a queued show would let the page shrink and reset the scroll.
@@ -641,6 +672,11 @@ class EditorPage(QWidget):
 
     def _on_step_expanded(self, step, expanded):
         (self._expanded.add if expanded else self._expanded.discard)(id(step))
+        if not expanded and step is self._individual_step and not self._editing_steps:
+            self._individual_step = None
+            for editor in self.step_editors:
+                if editor.step is step:
+                    editor.set_editing(False)
         self._update_steps_header()
 
     def _set_all_expanded(self, expanded):
@@ -651,11 +687,41 @@ class EditorPage(QWidget):
 
     def _open_only(self, step):
         """A new step opens for editing; the others collapse to their summaries."""
+        if not self._editing_steps:
+            self._individual_step = step
         self._expanded = {id(step)}
 
+    def _set_steps_editing(self, editing):
+        self._editing_steps = bool(editing)
+        self._individual_step = None
+        if editing:
+            self._set_all_expanded(True)
+        else:
+            self._set_all_expanded(False)
+        for editor in self.step_editors:
+            editor.set_editing(editing)
+        self._update_steps_header()
+
     def _update_steps_header(self):
-        self.expand_all_button.setEnabled(len(self._expanded) < len(self.sop.steps))
-        self.collapse_all_button.setEnabled(bool(self._expanded))
+        self.edit_steps_button.setText("完成編輯" if self._editing_steps else "編輯")
+        self.edit_steps_button.setEnabled(bool(self.sop.steps))
+
+    def _drop_step(self, token, target, after):
+        source = next((step for step in self.sop.steps if str(id(step)) == token), None)
+        if source is None or source is target or self._step_index(target) < 0:
+            return
+        index = self._step_index(source)
+        destination = self._step_index(target) + int(after)
+        if index < destination:
+            destination -= 1
+        if index == destination:
+            return
+        selected = self._current_step()
+        self.sop.steps.pop(index)
+        self.sop.steps.insert(destination, source)
+        self._clear_roi_history()
+        self._rebuild_steps(selected)
+        self._mark_modified()
 
     def _refresh_trial_steps(self, target=None):
         old = self.validation_step.currentIndex()
@@ -853,7 +919,7 @@ class EditorPage(QWidget):
         if running and self._image_focus:
             self._set_image_focus(False)
         self.settings_content.setEnabled(not running)
-        for widget in (self.tracking_tools, self.region_tools, self.view_bar):
+        for widget in (self.tracking_tools, self.regions_panel, self.view_bar):
             widget.setEnabled(not running)
         self.validation_mode.setEnabled(not running)
         self.validation_step.setEnabled(not running and self.validation_mode.currentData() == "single")
@@ -864,6 +930,17 @@ class EditorPage(QWidget):
         self._update_validation_view()
 
     # ---- regions -----------------------------------------------------------
+    def _set_rois_editing(self, editing):
+        self._editing_rois = bool(editing)
+        self.edit_rois_button.setText("完成編輯" if editing else "編輯區域")
+        self.roi_edit_toolbar.setVisible(editing)
+        self.roi_edit_note.setVisible(editing)
+        for row in self.roi_rows:
+            row.set_editing(editing)
+        if not editing:
+            self.draw_button.setChecked(False)
+        self._refresh_video_rois()
+
     def _refresh_roi_rows(self):
         self._clear_layout(self.rois_layout)
         self.roi_rows = []
@@ -874,6 +951,7 @@ class EditorPage(QWidget):
             row.edit_button.clicked.connect(lambda _checked=False, r=roi: self._begin_roi_edit(r))
             row.duplicate_button.clicked.connect(lambda _checked=False, r=roi: self._duplicate_roi(r))
             row.delete_button.clicked.connect(lambda _checked=False, r=roi: self._delete_roi(r))
+            row.set_editing(self._editing_rois)
             self.roi_rows.append(row)
             self.rois_layout.addWidget(row)
             row.setVisible(True)
@@ -912,7 +990,7 @@ class EditorPage(QWidget):
         editable = [r.name for r in self.sop.rois if
                     (r.anchor == "workpiece" and self.reference_button.isChecked()) or
                     (r.anchor == "fixed" and self.freeze_check.isChecked() and not self.reference_button.isChecked())]
-        self.video.set_editable(editable if not self._capture_target and not self._production_running else [])
+        self.video.set_editable(editable if self._editing_rois and not self._capture_target and not self._production_running else [])
 
     def _roi_snapshot(self):
         return copy.deepcopy(self.sop.rois), [c.roi for c in self._all_conditions()]
@@ -995,6 +1073,7 @@ class EditorPage(QWidget):
         if roi is None:
             self.guide_label.setText("請按欲調整區域旁的移動／縮放。")
             return False
+        self.edit_rois_button.setChecked(True)
         self._select_roi(roi.name)
         if roi.anchor == "workpiece":
             if self._reference_frame is None:
@@ -1406,10 +1485,10 @@ class EditorPage(QWidget):
         self._mark_modified()
 
     def _choose_model(self):
-        path, _ = QFileDialog.getOpenFileName(self, "選擇模型", str(PROJECT_ROOT),
+        path, _ = QFileDialog.getOpenFileName(self, "選擇模型", str(self._data_root),
                                               "模型包 (*.zip);;模型設定 (model.json)")
         if path:
-            self.sop.model_path = relativize(path)
+            self.sop.model_path = self._relativize_path(path)
             self.set_model_state("selected")
             self.model_selected.emit(path)
             self._mark_modified()
@@ -1418,6 +1497,7 @@ class EditorPage(QWidget):
         if self._loading:
             return
         self._clear_roi_history()
+        self.sop.cycle.enabled = self.cycle_enabled_switch.isChecked()
         self.sop.cycle.auto_restart_sec = self.auto_restart_spin.value()
         self.sop.cycle.reset_hold_sec = self.reset_hold_spin.value()
         self.sop.cycle.reset_ratio = self.reset_ratio_spin.value() / 100
@@ -1428,6 +1508,7 @@ class EditorPage(QWidget):
         self._mark_modified()
 
     def _update_cycle_summary(self):
+        self.cycle_settings.setEnabled(self.sop.cycle.enabled)
         uses_conditions = bool(self.sop.cycle.reset_conditions)
         self.auto_restart_spin.setEnabled(not uses_conditions)
         self.reset_hold_spin.setEnabled(uses_conditions)
@@ -1436,6 +1517,8 @@ class EditorPage(QWidget):
             f"影格成立比例判定；延遲秒數不生效。"
             if uses_conditions else f"無重置條件：本輪完成後延遲 {self.sop.cycle.auto_restart_sec:g} 秒開始下一輪。")
         self.reset_ratio_spin.setEnabled(uses_conditions)
+        if not self.sop.cycle.enabled:
+            self.cycle_rule_summary.setText("已停用自動開始下一輪；本輪完成後停止，設定會保留。")
 
     def _all_conditions(self):
         for step in self.sop.steps:

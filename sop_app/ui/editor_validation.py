@@ -57,7 +57,8 @@ class EditorValidation:
         self._accept_events(events)
         if self.running:
             if self.engine.phase == Phase.CYCLE_DONE:
-                self.message = "本輪完成，等待重置／下一輪（沿用原引擎規則）"
+                self.message = ("本輪完成，等待重置／下一輪（沿用原引擎規則）" if self.engine.sop.cycle.enabled
+                                else "本輪完成，已停用自動開始下一輪")
             elif any(result.error for result in self.engine.snapshot().results):
                 self.message = "辨識／定位無法確認，條件停止累積"
             elif not self.engine.sop.steps[self.engine.index].conditions:
@@ -72,7 +73,8 @@ class EditorValidation:
             result = "OK" if self.engine.cycle_ok else "NG"
             self.message = f"單步驗證完成：{result}（非正式作業紀錄）"
         elif any(event.kind == "cycle_completed" for event in events):
-            self.message = "本輪完成，等待重置／下一輪（沿用原引擎規則）"
+            self.message = ("本輪完成，等待重置／下一輪（沿用原引擎規則）" if self.engine.sop.cycle.enabled
+                                else "本輪完成，已停用自動開始下一輪")
 
     def confirm(self):
         if not self.running or self.engine is None or self.engine.phase != Phase.RUNNING:
@@ -110,6 +112,9 @@ class EditorValidation:
             _, results = evaluate_conditions(step.conditions, self.last_frame, engine.rois, step.completion_mode) if self.last_frame else (False, [])
             return dict(target=target, count=f"{sum(r.met for r in results)}/{len(results)}" if results else "人工確認",
                         elapsed="已完成", ratio=f"達標 ≥ {step.ratio:.0%}" if step.conditions else "不套用")
+        if engine.phase == Phase.CYCLE_DONE and not engine.sop.cycle.enabled:
+            return dict(target=f"第 {engine.cycle} 輪已完成 · 自動開始下一輪已停用",
+                        count="不套用", elapsed="已完成", ratio="不套用")
         if engine.phase == Phase.CYCLE_DONE and not engine.sop.cycle.reset_conditions:
             delay = engine.sop.cycle.auto_restart_sec
             return dict(target=f"第 {engine.cycle} 輪已完成 · 等待下一輪", count="不套用",
