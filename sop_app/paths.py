@@ -27,11 +27,12 @@ SOPS_DIR = DATA_ROOT / "sops"
 RECORDS_DIR = DATA_ROOT / "records"
 LOGS_DIR = DATA_ROOT / "logs"
 APP_SETTINGS = DATA_ROOT / "app_settings.json"
+MODELS_DIR = DATA_ROOT / "models"
 
 
 def initialize_runtime() -> None:
     """Create writable directories and seed a clean example once after install."""
-    for directory in (SOPS_DIR, RECORDS_DIR, LOGS_DIR):
+    for directory in (SOPS_DIR, RECORDS_DIR, LOGS_DIR, MODELS_DIR):
         directory.mkdir(parents=True, exist_ok=True)
     # Recover a stopped restore before settings/SOP files are read by startup.
     if (DATA_ROOT / ".restore-transaction.json").exists():
@@ -60,6 +61,27 @@ def initialize_runtime() -> None:
 def resolve(path: str | Path) -> Path:
     path = Path(path)
     return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def models_directory(root: str | Path | None = None) -> Path:
+    """Share model bundles across stations, outside their backed-up data."""
+    if root is None:
+        return MODELS_DIR
+    root = Path(root)
+    if root.parent.name == "stations" and root.parent.parent.name == "data":
+        return root.parent.parent.parent / "models"
+    return root / "models"
+
+
+def resolve_model(path: str | Path, root: str | Path | None = None) -> Path:
+    """Resolve shared models while preserving existing station-local paths."""
+    path = Path(path)
+    if path.is_absolute():
+        return path
+    local = (Path(root) if root is not None else PROJECT_ROOT) / path
+    if path.parts and path.parts[0].casefold() == "models" and not local.exists():
+        return models_directory(root).joinpath(*path.parts[1:])
+    return local
 
 
 def relativize(path: str | Path) -> str:

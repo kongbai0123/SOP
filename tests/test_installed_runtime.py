@@ -29,6 +29,7 @@ class RuntimePathsTests(unittest.TestCase):
         module = self.load_paths(False, Path("C:/unused"))
         self.assertEqual(module.PROJECT_ROOT, Path(paths.__file__).resolve().parent.parent)
         self.assertEqual(module.RECORDS_DIR, module.PROJECT_ROOT / "records")
+        self.assertEqual(module.MODELS_DIR, module.PROJECT_ROOT / "models")
         self.assertEqual(module.RESOURCE_ROOT, module.PROJECT_ROOT)
 
     def test_installed_paths_and_first_run_never_modify_install_folder(self):
@@ -42,6 +43,8 @@ class RuntimePathsTests(unittest.TestCase):
             self.assertEqual(module.INSTALL_ROOT, root / "install")
             module.initialize_runtime()
             self.assertFalse(module.INSTALL_ROOT.exists())
+            self.assertEqual(module.MODELS_DIR, module.DATA_ROOT / "models")
+            self.assertTrue(module.MODELS_DIR.is_dir())
             sample = module.SOPS_DIR / "example_sop.json"
             self.assertEqual(sample.read_bytes(), resource.read_bytes())
             sample.write_text("user change", encoding="utf-8")

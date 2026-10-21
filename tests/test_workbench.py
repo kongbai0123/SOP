@@ -187,7 +187,7 @@ class WorkbenchQtTests(unittest.TestCase):
         editor.on_packet(packet(0, "grip"))
         return editor
 
-    def test_no_automatic_trial_and_all_settings_share_one_scroll_page(self):
+    def test_no_automatic_trial_and_each_step_uses_one_settings_page(self):
         editor = self.make_editor(sop(Step("第一道"), Step("第二道")))
         self.assertIsNone(editor._validation.engine)
         self.assertFalse(editor._validation.running)
@@ -202,8 +202,14 @@ class WorkbenchQtTests(unittest.TestCase):
             self.assertIn("完成", card.header_row.toolTip())
         editor.edit_steps_button.setChecked(True)
         for card in editor.step_editors:
+            self.assertTrue(card.body.isHidden())
+            editor._open_step_settings(card.step)
+            self.app.processEvents()
+            self.assertIs(editor.step_settings.current_editor, card)
+            self.assertTrue(editor.step_settings.scroll.isAncestorOf(card.body))
             self.assertTrue(card.instruction_edit.isVisible())
             self.assertTrue(card.forbidden_table.isVisible())
+        editor.step_settings.close_button.click()
 
     def test_persistent_trial_survives_scrolling_between_settings(self):
         editor = self.make_editor()
@@ -211,7 +217,8 @@ class WorkbenchQtTests(unittest.TestCase):
         engine = editor._validation.engine
         for index, widget in enumerate((editor.name_edit, editor.step_editors[0], editor.reset_table,
                                         editor.validation_box)):
-            editor.page_scroll.ensureWidgetVisible(widget)
+            scroll = editor.tools_scroll if widget is editor.validation_box else editor.page_scroll
+            scroll.ensureWidgetVisible(widget)
             self.app.processEvents()
             editor.on_packet(packet(.1 + .1 * index, "grip"))
             self.assertTrue(editor.validation_box.isVisible())
@@ -220,6 +227,7 @@ class WorkbenchQtTests(unittest.TestCase):
 
     def test_edits_invalidate_old_result_and_retry_captures_current_settings(self):
         editor = self.make_editor()
+        editor._open_step_settings(editor.sop.steps[0])
         editor.validation_start.click()
         editor.on_packet(packet(.1, "grip"))
         original_engine = editor._validation.engine
@@ -262,6 +270,7 @@ class WorkbenchQtTests(unittest.TestCase):
         self.assertTrue(editor._validation.stale)
         self.assertIn("—", editor.validation_ratio.text())
         label = editor.step_editors[1].condition_table.field_widget(0, "label")
+        editor._open_step_settings(editor.sop.steps[1])
         label.setCurrentIndex(label.findData("grip"))
         editor.validation_start.click()
         self.assertTrue(editor._validation.running)
@@ -273,6 +282,7 @@ class WorkbenchQtTests(unittest.TestCase):
         editor._start_validation()
         self.assertIsNone(editor._validation.engine)
         self.assertIn("模型尚未就緒", editor.validation_status.text())
+        editor._open_step_settings(editor.sop.steps[0])
         editor.step_editors[0].condition_table._add()
         self.assertEqual(len(editor.sop.steps[0].conditions), 2)
 
@@ -346,7 +356,7 @@ class WorkbenchQtTests(unittest.TestCase):
         editor = self.make_editor()
         self.assertTrue(editor.validation_details.isVisible())
         self.assertFalse(editor.findChildren(QToolButton))
-        editor.page_scroll.ensureWidgetVisible(editor.validation_details)
+        editor.tools_scroll.ensureWidgetVisible(editor.validation_details)
         self.app.processEvents()
         self.assertGreater(editor.validation_details.height(), 60)
         self.assertEqual(editor.page_scroll.horizontalScrollBar().maximum(), 0)
@@ -359,7 +369,7 @@ class WorkbenchQtTests(unittest.TestCase):
 
     def test_option_refresh_keeps_all_fields_visible_with_real_height(self):
         editor = self.make_editor()
-        editor.edit_steps_button.setChecked(True)
+        editor._open_step_settings(editor.sop.steps[0])
         self.app.processEvents()
         table = editor.step_editors[0].condition_table
         score = table.field_widget(0, "min_score")
@@ -373,6 +383,7 @@ class WorkbenchQtTests(unittest.TestCase):
 
     def test_each_step_trial_button_uses_its_own_step(self):
         editor = self.make_editor(sop(Step("一"), Step("二")))
+        editor._open_step_settings(editor.sop.steps[1])
         editor.step_editors[1].trial_button.click()
         self.assertEqual(editor._validation.original_indices, [1])
         self.assertIn("工序 2", editor.validation_target.text())
@@ -407,7 +418,7 @@ class WorkbenchQtTests(unittest.TestCase):
 
     def test_condition_thresholds_are_immediately_editable(self):
         editor = self.make_editor()
-        editor.edit_steps_button.setChecked(True)
+        editor._open_step_settings(editor.sop.steps[0])
         self.app.processEvents()
         table = editor.step_editors[0].condition_table
         score = table.field_widget(0, "min_score")
@@ -421,6 +432,7 @@ class WorkbenchQtTests(unittest.TestCase):
 
     def test_dark_palette_keeps_cards_and_validation_visible(self):
         editor = self.make_editor()
+        editor._open_step_settings(editor.sop.steps[0])
         original = QPalette(self.app.palette())
         self.addCleanup(self.app.setPalette, original)
         palette = QPalette(original)
@@ -437,6 +449,8 @@ class WorkbenchQtTests(unittest.TestCase):
         definition.rois = [ROI("left", [(0, 0), (.5, 0), (.5, .5), (0, .5)])]
         definition.steps[0].conditions[0].roi = "left"
         editor = self.make_editor(definition)
+        editor._open_step_settings(editor.sop.steps[0])
+        self.app.processEvents()
         widget = editor.step_editors[0].condition_table.field_widget(0, "min_count")
         widget.setFocus()
         widget.setValue(2)
@@ -460,7 +474,6 @@ class WorkbenchQtTests(unittest.TestCase):
                 window._apply_sop(definition, None)
                 editor = window.editor
                 editor.set_classes(["grip", "tool"])
-                editor.edit_steps_button.setChecked(True)
                 window.tabs.setCurrentWidget(editor)
                 window.show()
                 for width, height in ((1366, 768), (1920, 1080)):
@@ -471,13 +484,22 @@ class WorkbenchQtTests(unittest.TestCase):
                     self.assertGreaterEqual(editor.video.height(), 180)
                     self.assertEqual(editor.page_scroll.horizontalScrollBar().maximum(), 0)
                     self.assertEqual(len(editor.step_editors), 4)
+                    image_geometry = editor.video.geometry()
                     for card in editor.step_editors:
+                        self.assertTrue(card.body.isHidden())
+                        editor._open_step_settings(card.step)
+                        self.app.processEvents()
+                        self.assertIs(editor.step_settings.current_editor, card)
                         self.assertTrue(card.instruction_edit.isVisible())
                         self.assertTrue(card.forbidden_table.isVisible())
+                        self.assertEqual(editor.video.geometry(), image_geometry)
+                        self.assertEqual(editor.step_settings.scroll.horizontalScrollBar().maximum(), 0)
                         for field in ("label", "type", "roi", "min_count", "min_score", "roi_overlap"):
                             self.assertGreaterEqual(shown_field(card.condition_table, 0, field).height(), 16)
+                        editor.step_settings.close_button.click()
                     for location, target in (("top", editor.name_edit), ("bottom", editor.validation_details)):
-                        editor.page_scroll.ensureWidgetVisible(target)
+                        scroll = editor.tools_scroll if location == "bottom" else editor.page_scroll
+                        scroll.ensureWidgetVisible(target)
                         self.app.processEvents()
                         self.assertEqual(editor.page_scroll.horizontalScrollBar().maximum(), 0)
                         artifact_directory = os.environ.get("SOP_EDITOR_TEST_ARTIFACT_DIR")

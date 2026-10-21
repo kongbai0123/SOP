@@ -158,18 +158,27 @@ class WholeUIAuditTests(unittest.TestCase):
         self.assertEqual(errors, [], f"{name}: {errors}")
 
     def test_all_editor_workspaces_and_expanded_controls(self):
-        """Collapsed summaries and every expanded field fit without clipping."""
+        """Compact rows and each single-page settings form fit without clipping."""
         self.assertFalse(self.editor.findChildren(QTabWidget))
         self.check(self.window, "editor-collapsed")
         self.editor.edit_steps_button.setChecked(True)
-        self.assertGreater(self.editor.page_scroll.verticalScrollBar().maximum(), 0)
+        settle(self.app)
+        self.assertTrue(all(card.body.isHidden() for card in self.editor.step_editors))
+        image_geometry = self.editor.video.geometry()
         for index, step in enumerate(self.editor.step_editors):
+            self.editor._open_step_settings(step.step)
+            settle(self.app)
+            self.assertIs(self.editor.step_settings.current_editor, step)
             for control in (step.instruction_edit, step.hold_spin, step.forbidden_mode,
                             step.condition_table, step.forbidden_table):
                 self.assertTrue(control.isVisible())
-            self.editor.page_scroll.ensureWidgetVisible(step)
+                self.editor.step_settings.scroll.ensureWidgetVisible(control)
+                self.check(self.window, f"editor-step-{index}-{control.objectName() or type(control).__name__}")
+            self.assertEqual(self.editor.step_settings.scroll.horizontalScrollBar().maximum(), 0)
+            self.assertEqual(self.editor.video.geometry(), image_geometry)
             self.check(self.window, "editor-step-" + str(index))
-        self.editor.page_scroll.ensureWidgetVisible(self.editor.validation_box)
+            self.editor.step_settings.close_button.click()
+        self.editor.tools_scroll.ensureWidgetVisible(self.editor.validation_box)
         self.check(self.window, "editor-validation")
         self.assertEqual(self.editor.page_scroll.horizontalScrollBar().maximum(), 0)
         self.editor.focus_button.click()

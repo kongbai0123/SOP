@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import math
 import os
 from pathlib import Path
 from typing import Sequence
@@ -56,6 +57,7 @@ class Step:
     forbidden_hold_sec: float | None = None  # None = 沿用 hold_sec
     forbidden_ratio: float | None = None     # None = 沿用 ratio
     min_duration_sec: float = 0.0  # 自動完成早於此秒數 → 「工時過短」警報（0 = 不檢查）
+    trial_notice_interval_sec: float = 2.0  # 後續試跑違規訊息最小間隔；畫面警示不延遲
 
 
 @dataclass
@@ -124,6 +126,7 @@ class SOPDefinition:
                 forbidden_hold_sec=_optional_float(s.get("forbidden_hold_sec")),
                 forbidden_ratio=_optional_float(s.get("forbidden_ratio")),
                 min_duration_sec=float(s.get("min_duration_sec", 0.0)),
+                trial_notice_interval_sec=float(s.get("trial_notice_interval_sec", 2.0)),
             ) for s in data.get("steps", [])],
         )
 
@@ -182,6 +185,8 @@ class SOPDefinition:
                 errors.append(f"{where}：成立比例需介於 1%～100%")
             if step.forbidden_ratio is not None and not 0 < step.forbidden_ratio <= 1:
                 errors.append(f"{where}：違規成立比例需介於 1%～100%")
+            if not math.isfinite(step.trial_notice_interval_sec) or step.trial_notice_interval_sec < 0:
+                errors.append(f"{where}：試跑訊息間隔需為非負有限秒數")
             for value, label in ((step.hold_sec, "觀察時間"), (step.timeout_sec, "超時秒數"),
                                  (step.min_duration_sec, "最短工時"), (step.forbidden_hold_sec or 0.0, "違規觀察時間")):
                 if value < 0:

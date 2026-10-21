@@ -87,6 +87,11 @@ class ConditionRows(QWidget):
     def conditions(self) -> list[Condition]:
         return [copy.copy(c) for c in self._conditions]
 
+    def reference_conditions(self):
+        """Actual references, including undo entries, for region maintenance."""
+        yield from self._conditions
+        yield from (condition for _index, condition in self._deleted)
+
     def field_widget(self, row: int, field: str):
         return self._fields[row][field]
 
@@ -173,6 +178,8 @@ class ConditionRows(QWidget):
                       "roi": self._choice(row, "roi")}
             count = CompactSpinBox()
             count.setRange(1, 99)
+            count.setSpecialValueText("不限")
+            count.setToolTip("不限＝只要求出現至少 1 個；指定 N 代表至少 N 個。")
             count.setValue(cond.min_count)
             count.valueChanged.connect(lambda value, r=row: self._set(r, "min_count", value))
             score = CompactDoubleSpinBox()

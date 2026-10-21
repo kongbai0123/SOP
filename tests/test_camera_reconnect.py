@@ -168,6 +168,8 @@ class CameraReconnectTests(unittest.TestCase):
             window._connect_source()
             self.assertEqual(camera.call_args.args[1]["fps"], 15)
         self.assertEqual(window.inference_fps.value(), 12)
+        self.assertIsNone(window.inference_fps_preset.currentData())
+        self.assertFalse(window.inference_fps.isHidden())
 
     def test_failed_station_switch_keeps_old_camera_profile_saveable(self):
         window, _root = self.window({"camera_profiles": {"camera:0": {"fps": 25}}}, stations=True)
@@ -202,11 +204,63 @@ class CameraReconnectTests(unittest.TestCase):
         self.assertEqual(json.loads(window._settings_path.read_text())["inference_fps"], 15)
         window._on_engine_state(True)
         self.assertFalse(window.inference_fps.isEnabled())
+        self.assertFalse(window.inference_fps_preset.isEnabled())
         window.pipeline._engine = Mock(phase=Phase.RUNNING)
         window.inference_fps.setValue(30)  # Programmatic change must also be guarded in the worker.
         window.pipeline._drain_commands(Mock())
         self.assertEqual(window.inference_fps.value(), 15)
+        self.assertIsNone(window.inference_fps_preset.currentData())  # Keep the chosen custom mode.
         self.assertEqual(window.settings["inference_fps"], 15)
+
+    def test_rate_presets_apply_after_worker_ack_and_keep_custom_entry_available(self):
+        window, _root = self.window({"inference_fps": 0})
+        self.assertEqual(window.inference_fps_preset.currentData(), 0)
+        self.assertTrue(window.inference_fps.isHidden())
+        window.inference_fps_preset.setCurrentIndex(window.inference_fps_preset.findData(30))
+        self.assertEqual(window.settings["inference_fps"], 0)
+        window.pipeline._drain_commands(Mock())
+        self.assertEqual(window.pipeline._pacer.fps, 30)
+        self.assertEqual(json.loads(window._settings_path.read_text())["inference_fps"], 30)
+        window.inference_fps_preset.setCurrentIndex(window.inference_fps_preset.findData(None))
+        self.assertFalse(window.inference_fps.isHidden())
+        self.assertEqual(window.inference_fps.value(), 30)
+        self.assertEqual(window.settings["inference_fps"], 30)
+        window.inference_fps.setValue(12.5)
+        window.pipeline._drain_commands(Mock())
+        self.assertEqual(window.pipeline._pacer.fps, 12.5)
+        self.assertIsNone(window.inference_fps_preset.currentData())
+        self.assertFalse(window.inference_fps.isHidden())
+        window.inference_fps_preset.setCurrentIndex(window.inference_fps_preset.findData(0))
+        window.pipeline._drain_commands(Mock())
+        self.assertEqual(window.settings["inference_fps"], 0)
+        self.assertTrue(window.inference_fps.isHidden())
+
+    def test_saved_custom_rate_is_not_replaced_by_a_preset_on_startup(self):
+        window, _root = self.window({"inference_fps": 29.9})
+        self.assertIsNone(window.inference_fps_preset.currentData())
+        self.assertFalse(window.inference_fps.isHidden())
+        self.assertEqual(window.inference_fps.value(), 29.9)
+        window.pipeline._drain_commands(Mock())
+        self.assertEqual(window.pipeline._pacer.fps, 29.9)
+        self.assertEqual(window.settings["inference_fps"], 29.9)
+
+    def test_older_rate_replies_do_not_overwrite_a_newer_custom_choice(self):
+        window, _root = self.window()
+        for fps in (30, 60, None):
+            window.inference_fps_preset.setCurrentIndex(window.inference_fps_preset.findData(fps))
+        replies = []
+        window.pipeline.inference_fps_ready.connect(
+            lambda _fps: replies.append((window.inference_fps.value(),
+                                         window.inference_fps_preset.currentData())))
+        window.pipeline._drain_commands(Mock())
+        self.assertEqual(replies, [(60, None)] * 2)
+        self.assertFalse(window.inference_fps.isHidden())
+        window.inference_fps.setValue(12.5)
+        window.inference_fps.setValue(15)
+        window.pipeline._drain_commands(Mock())
+        self.assertEqual(replies[-2:], [(15, None)] * 2)
+        self.assertEqual(window.settings["inference_fps"], 15)
+        self.assertFalse(window.inference_fps.isHidden())
 
     def test_fraction_below_minimum_is_normalized_before_queueing(self):
         window, _root = self.window()

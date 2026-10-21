@@ -10,8 +10,13 @@ from dataclasses import dataclass
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path, PurePosixPath
+import tempfile
 import zipfile
+import zlib
+
+from .paths import MODELS_DIR
 
 
 @dataclass(frozen=True)
@@ -97,7 +102,9 @@ def read_model_info(path: str | Path) -> ModelInfo:
         try:
             with zipfile.ZipFile(source) as bundle:
                 record, _model_member, checkpoint_member, manifest = _read_zip_bundle(bundle)
-        except zipfile.BadZipFile as exc:
+        except ModelBundleError:
+            raise
+        except (zipfile.BadZipFile, RuntimeError, zlib.error) as exc:
             raise ModelBundleError(f"模型包損毀：{source}") from exc
     elif source.is_dir():
         record, checkpoint_path, manifest = _read_directory_bundle(source)
@@ -271,29 +278,53 @@ def ensure_checkpoint(info: ModelInfo) -> Path:
         return checkpoint
 
     member = info.checkpoint_member or f"model/{info.checkpoint_name}"
-    target = info.source.parent / ".extracted" / info.source.stem / info.checkpoint_name
+    partial: Path | None = None
     try:
         with zipfile.ZipFile(info.source) as bundle:
+            # Tie the cache to the archive that is actually open, including its
+            # location and revision. Identically named ZIPs must stay separate.
+            archive_stat = os.fstat(bundle.fp.fileno())
+            cache_key = hashlib.sha256(
+                f"{info.source.resolve()}\0{archive_stat.st_size}\0{archive_stat.st_mtime_ns}".encode("utf-8")
+            ).hexdigest()
+            target = MODELS_DIR / ".cache" / cache_key / info.checkpoint_name
             entry = bundle.getinfo(member)
             if target.exists() and target.stat().st_size == entry.file_size:
                 if not info.checkpoint_sha256 or _sha256_file(target) == info.checkpoint_sha256:
                     return target
 
             target.parent.mkdir(parents=True, exist_ok=True)
-            partial = target.with_suffix(target.suffix + ".partial")
             digest = hashlib.sha256()
-            with bundle.open(entry) as src, partial.open("wb") as dst:
-                for chunk in iter(lambda: src.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                    dst.write(chunk)
-    except (KeyError, OSError, zipfile.BadZipFile) as exc:
-        raise ModelBundleError(f"無法讀取模型 checkpoint：{member}") from exc
+            # Each extraction owns its temporary file, so concurrent loaders
+            # cannot truncate or remove another loader's incomplete checkpoint.
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=target.parent, prefix=f".{target.name}.", suffix=".partial", delete=False
+            ) as dst:
+                partial = Path(dst.name)
+                with bundle.open(entry) as src:
+                    for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        dst.write(chunk)
 
-    if info.checkpoint_sha256 and digest.hexdigest() != info.checkpoint_sha256:
-        partial.unlink(missing_ok=True)
-        raise ModelBundleError(f"{info.checkpoint_name} 的 SHA-256 與模型包紀錄不符，檔案可能損毀")
-    partial.replace(target)
-    return target
+            if info.checkpoint_sha256 and digest.hexdigest() != info.checkpoint_sha256:
+                raise ModelBundleError(f"{info.checkpoint_name} 的 SHA-256 與模型包紀錄不符，檔案可能損毀")
+            try:
+                partial.replace(target)
+            except PermissionError:
+                # Windows can refuse replacement when a concurrent loader has
+                # just published/opened the same checkpoint. Reuse only a fully
+                # written file that matches the bytes extracted by this loader.
+                if (not target.is_file() or target.stat().st_size != entry.file_size or
+                        _sha256_file(target) != digest.hexdigest()):
+                    raise
+            return target
+    except ModelBundleError:
+        raise
+    except (KeyError, OSError, RuntimeError, zipfile.BadZipFile, zlib.error) as exc:
+        raise ModelBundleError(f"無法讀取模型 checkpoint：{member}") from exc
+    finally:
+        if partial is not None:
+            partial.unlink(missing_ok=True)
 
 
 def _sha256_file(path: Path) -> str:

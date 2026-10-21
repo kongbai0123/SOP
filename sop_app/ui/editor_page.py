@@ -13,7 +13,9 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                                QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
 from ..conditions import evaluate_conditions
 from ..engine import evaluate_step, violation_window
-from ..paths import PROJECT_ROOT, relativize, resolve
+from ..model_bundle import ModelBundleError
+from ..model_store import import_model
+from ..paths import MODELS_DIR, PROJECT_ROOT, relativize, resolve
 from ..pipeline import FramePacket
 from ..sop_schema import CONDITION_TYPES, Condition, ROI, SOPDefinition, Step
 from ..detection import FrameResult
@@ -21,7 +23,9 @@ from ..tracking import WorkpieceLocator, capture_workpiece, decode_reference, di
 from .compact_layout import CompactLog, relayout_now, set_state, text_label
 from .condition_rows import ConditionRows
 from .editor_validation import EditorValidation
+from .editor_wheel_guard import install_editor_wheel_guard
 from .step_editor import StepEditor, field_pair, flow_row
+from .step_settings_drawer import StepSettingsDrawer
 from .video_widget import VideoWidget
 from .toggle_switch import ToggleSwitch
 from .workbench_widgets import install_readability_guard, workbench_styles
@@ -159,19 +163,19 @@ class EditorPage(QWidget):
         self._applying_layout = False
         self._image_focus = self._auto_focus = False
         self._editing_steps = False
-        self._individual_step = None
         self._editing_rois = False
-        self._expanded: set[int] = set()  # id() of steps whose settings are open
         self._validation = EditorValidation()
         self.step_editors, self.roi_rows = [], []
         self._layout_timer = QTimer(self)
         self._layout_timer.setSingleShot(True)
         self._layout_timer.timeout.connect(self._apply_layout_mode)
         self._build()
+        self.step_settings = StepSettingsDrawer(self)
         if QApplication.instance():
             QApplication.instance().paletteChanged.connect(self._apply_workbench_theme)
         self._apply_workbench_theme()
         install_readability_guard(self)
+        install_editor_wheel_guard(self)
 
     # ---- layout --------------------------------------------------------------
     def _build(self):
@@ -340,6 +344,7 @@ class EditorPage(QWidget):
         self.model_label = text_label("（未選擇）")
         self.model_state_label = text_label("", "livePreview")
         self.model_button = QPushButton("選擇模型…")
+        self.model_button.setToolTip("選取模型包後會複製到共用 models 資料夾，所有工站皆可使用。")
         self.model_button.clicked.connect(self._choose_model)
         form = QWidget()
         rows = QFormLayout(form)
@@ -373,7 +378,7 @@ class EditorPage(QWidget):
         layout.setSpacing(4)
         self.add_step_button = QPushButton("新增工序")
         self.add_step_button.clicked.connect(lambda: self._add_step())
-        self.edit_steps_button = QPushButton("編輯")
+        self.edit_steps_button = QPushButton("管理工序")
         self.edit_steps_button.setCheckable(True)
         self.edit_steps_button.toggled.connect(self._set_steps_editing)
         title = QHBoxLayout()
@@ -445,6 +450,9 @@ class EditorPage(QWidget):
         scope_form.addRow(self._form_label("工序"), self.validation_step)
         controls = flow_row(self.validation_start, self.validation_stop, self.validation_confirm, spacing=4)
         self.validation_status = text_label("尚未開始試跑", "validationStatus")
+        self.validation_alert = text_label("", "trialAlert")
+        self.validation_alert.setAccessibleName("試跑警示")
+        self.validation_alert.hide()
         self.validation_target = text_label("尚未擷取測試設定", "mutedLabel")
         metrics = QWidget()
         metrics_layout = QHBoxLayout(metrics)
@@ -458,9 +466,9 @@ class EditorPage(QWidget):
         self.validation_details.setMinimumHeight(90)
         self.validation_details.setPlaceholderText("試跑事件")
         note = text_label("使用正式判定引擎；不寫入作業紀錄", "mutedLabel")
-        box = panel(note, scope, controls, self.validation_status, self.validation_target, metrics,
+        box = panel(note, scope, controls, self.validation_status, self.validation_alert, self.validation_target, metrics,
                     self.validation_details)
-        box.layout().setStretch(6, 1)
+        box.layout().setStretch(7, 1)
         self._validation_watchdog = QTimer(self)
         self._validation_watchdog.setInterval(500)
         self._validation_watchdog.timeout.connect(self._check_validation_feed)
@@ -504,6 +512,10 @@ class EditorPage(QWidget):
             self._arrange()
         finally:
             self._applying_layout = False
+        # Switching between narrow and wide reparents the tools pane, which
+        # otherwise stacks it above an already open settings overlay.
+        if hasattr(self, "step_settings") and self.step_settings.isVisible():
+            self.step_settings.reposition()
 
     def _arrange(self):
         width, height = self.width(), self.height()
@@ -567,6 +579,7 @@ class EditorPage(QWidget):
         if self._theme_dark != dark:
             self._theme_dark = dark
             self.setStyleSheet(workbench_styles(dark))
+            self.step_settings.set_theme(dark)
 
     def on_save_result(self, result):
         self.guide_label.setText({"saved": "SOP 已儲存。", "cancelled": "已取消儲存；目前編輯內容仍保留。"}.get(
@@ -574,6 +587,7 @@ class EditorPage(QWidget):
 
     # ---- SOP ---------------------------------------------------------------
     def set_sop(self, sop):
+        self.step_settings.close()
         self._last_live_preview_at = None
         self._validation.stop()
         self._validation = EditorValidation()
@@ -586,8 +600,6 @@ class EditorPage(QWidget):
         self._clear_roi_history()
         self._selected_roi_name = self._highlighted_condition_roi = None
         # Every loaded SOP opens as a clean, reorderable name list.
-        self._expanded = set()
-        self._individual_step = None
         self.edit_steps_button.setChecked(False)
         self.edit_rois_button.setChecked(False)
         self._model_state = "selected" if sop.model_path else "unselected"
@@ -667,6 +679,11 @@ class EditorPage(QWidget):
         QTimer.singleShot(0, restore)
 
     def _rebuild_steps(self, target=None, reveal=None):
+        active = self.step_settings.current_editor
+        active_step = active.step if active is not None else None
+        remembered = {id(editor.step): copy.deepcopy(editor._automatic_conditions)
+                      for editor in self.step_editors}
+        self.step_settings.close()
         scroll = self.page_scroll.verticalScrollBar().value()
         self._clear_layout(self.steps_layout)
         self.step_editors = []
@@ -679,10 +696,10 @@ class EditorPage(QWidget):
             editor.delete_requested.connect(lambda s=step: self._delete_step(self._step_index(s)))
             editor.move_requested.connect(lambda delta, s=step: self._move_step(delta, self._step_index(s)))
             editor.trial_requested.connect(lambda s=step: self._start_step_validation(self._step_index(s)))
-            editor.expanded_changed.connect(lambda expanded, s=step: self._on_step_expanded(s, expanded))
-            editor.set_expanded(id(step) in self._expanded)
-            individual = not self._editing_steps and step is self._individual_step
-            editor.set_editing(self._editing_steps or individual, individual=individual)
+            editor.edit_requested.connect(lambda s=step: self._open_step_settings(s))
+            if id(step) in remembered:
+                editor._automatic_conditions = remembered[id(step)]
+            editor.set_editing(self._editing_steps)
             editor.reorder_requested.connect(lambda token, after, s=step: self._drop_step(token, s, after))
             self.step_editors.append(editor)
             self.steps_layout.addWidget(editor)
@@ -690,47 +707,29 @@ class EditorPage(QWidget):
             editor.setVisible(True)
         self.page_scroll.verticalScrollBar().setValue(scroll)
         self._keep_scroll(next((editor for editor in self.step_editors if editor.step is reveal), None))
-        self._expanded &= {id(step) for step in self.sop.steps}
         self.empty_steps_label.setVisible(not self.sop.steps)
         self._update_steps_header()
         self._refresh_trial_steps(target)
         self._refresh_step_summaries()
         self._update_live()
+        if active_step is not None and self._step_index(active_step) >= 0 and not self._loading:
+            self._open_step_settings(active_step)
 
-    def _on_step_expanded(self, step, expanded):
-        (self._expanded.add if expanded else self._expanded.discard)(id(step))
-        if not expanded and step is self._individual_step and not self._editing_steps:
-            self._individual_step = None
-            for editor in self.step_editors:
-                if editor.step is step:
-                    editor.set_editing(False)
-        self._update_steps_header()
-
-    def _set_all_expanded(self, expanded):
-        self._expanded = {id(step) for step in self.sop.steps} if expanded else set()
-        for editor in self.step_editors:
-            editor.set_expanded(expanded)
-        self._update_steps_header()
-
-    def _open_only(self, step):
-        """A new step opens for editing; the others collapse to their summaries."""
-        if not self._editing_steps:
-            self._individual_step = step
-        self._expanded = {id(step)}
+    def _open_step_settings(self, step):
+        if self._production_running or self._step_index(step) < 0:
+            return
+        editor = next((editor for editor in self.step_editors if editor.step is step), None)
+        if editor is not None:
+            self.step_settings.open_editor(editor)
 
     def _set_steps_editing(self, editing):
         self._editing_steps = bool(editing)
-        self._individual_step = None
-        if editing:
-            self._set_all_expanded(True)
-        else:
-            self._set_all_expanded(False)
         for editor in self.step_editors:
             editor.set_editing(editing)
         self._update_steps_header()
 
     def _update_steps_header(self):
-        self.edit_steps_button.setText("完成編輯" if self._editing_steps else "編輯")
+        self.edit_steps_button.setText("完成管理" if self._editing_steps else "管理工序")
         self.edit_steps_button.setEnabled(bool(self.sop.steps))
 
     def _drop_step(self, token, target, after):
@@ -779,7 +778,6 @@ class EditorPage(QWidget):
         step = Step(name=f"工序 {len(self.sop.steps) + 1}")
         self.sop.steps.insert(insert_at, step)
         self._clear_roi_history()
-        self._open_only(step)
         self._rebuild_steps(step, reveal=step)
         self._mark_modified()
         self.step_editors[insert_at].step_name_edit.setFocus()
@@ -793,7 +791,6 @@ class EditorPage(QWidget):
         clone.name += "（複製）"
         self.sop.steps.insert(index + 1, clone)
         self._clear_roi_history()
-        self._open_only(clone)
         self._rebuild_steps(clone, reveal=clone)
         self._mark_modified()
 
@@ -901,7 +898,7 @@ class EditorPage(QWidget):
                 parts.append("違規條件本幀無法判斷")
                 state = "warning" if state != "ng" else state
             elif judged.forbidden_met:
-                parts.append(f"本幀違規條件成立（持續 {hold:g} 秒、比例至少 {ratio:.0%} 即警報）")
+                parts.append(f"本幀違規條件成立（觀察窗 {hold:g} 秒、至少 {ratio:.0%} 影格成立且最新一幀成立才警報）")
                 state = "ng"
             else:
                 parts.append("違規條件本幀未成立")
@@ -950,6 +947,7 @@ class EditorPage(QWidget):
     def _start_step_validation(self, index):
         if not 0 <= index < len(self.sop.steps):
             return
+        self.step_settings.close()
         self.validation_mode.setCurrentIndex(self.validation_mode.findData("single"))
         self.validation_step.setCurrentIndex(index)
         self._start_validation()
@@ -957,6 +955,9 @@ class EditorPage(QWidget):
 
     def set_production_running(self, running):
         self._production_running = bool(running)
+        if running:
+            self.step_settings.close()
+        self.step_settings.setEnabled(not running)
         if running and self._image_focus:
             self._set_image_focus(False)
         self.settings_content.setEnabled(not running)
@@ -1051,7 +1052,7 @@ class EditorPage(QWidget):
         self._refresh_video_rois()
 
     def _roi_snapshot(self):
-        return copy.deepcopy(self.sop.rois), [c.roi for c in self._all_conditions()]
+        return copy.deepcopy(self.sop.rois), [c.roi for c in self._all_condition_references()]
 
     def _remember_roi(self):
         self._roi_undo.append(self._roi_snapshot())
@@ -1074,7 +1075,7 @@ class EditorPage(QWidget):
             return
         destination.append(self._roi_snapshot())
         self.sop.rois, refs = source.pop()
-        for condition, name in zip(self._all_conditions(), refs):
+        for condition, name in zip(self._all_condition_references(), refs):
             condition.roi = name
         self._refresh_roi_rows()
         self._sync_condition_references()
@@ -1105,7 +1106,7 @@ class EditorPage(QWidget):
         for row in self.roi_rows:
             if row.roi is roi:
                 row.name_edit.setText(new)
-        for condition in self._all_conditions():
+        for condition in self._all_condition_references():
             if condition.roi == old:
                 condition.roi = new
         if self._selected_roi_name == old:
@@ -1194,8 +1195,12 @@ class EditorPage(QWidget):
         if roi is None or not any(candidate is roi for candidate in self.sop.rois):
             return
         name = roi.name
-        if any(c.roi == name for c in self._all_conditions()):
+        if any(c.roi == name for c in self._all_condition_references()):
             affected = [f"工序 {i + 1} · {step.name}" for i, step in enumerate(self.sop.steps) if any(c.roi == name for c in step.conditions + step.forbidden)]
+            for index, editor in enumerate(self.step_editors):
+                label = f"工序 {index + 1} · {editor.step.name}"
+                if label not in affected and any(c.roi == name for c in editor.reference_conditions()):
+                    affected.append(label + "（保留的完成條件／復原資料）")
             if any(c.roi == name for c in self.sop.cycle.reset_conditions):
                 affected.append("循環重置條件")
             QMessageBox.information(self, "區域仍在使用", "請先修改以下條件的區域，再刪除：\n" + "\n".join(affected))
@@ -1352,6 +1357,8 @@ class EditorPage(QWidget):
         for step in self.sop.steps:
             step.conditions = [c for c in step.conditions if c.roi not in dependent]
             step.forbidden = [c for c in step.forbidden if c.roi not in dependent]
+        for editor in self.step_editors:
+            editor._automatic_conditions = [c for c in editor._automatic_conditions if c.roi not in dependent]
         self.sop.cycle.reset_conditions = [c for c in self.sop.cycle.reset_conditions if c.roi not in dependent]
         self._locator = self._reference_frame = None
         self._workpiece_key = ""
@@ -1591,8 +1598,13 @@ class EditorPage(QWidget):
             return
         trial = self._validation
         blocker = self._validation_blocker()
+        alert = trial.alert()
+        alert_text = alert["text"] if not self._production_running else ""
+        self.validation_alert.setText(alert_text)
+        self.validation_alert.setVisible(bool(alert_text))
+        self.video.set_alert(alert_text, alert["regions"] if alert["active"] else ())
         self.validation_status.setText(trial.message if trial.engine is not None or trial.message.startswith("無法") else blocker or trial.message)
-        set_state(self.validation_status, "warning" if trial.stale or blocker else "running" if trial.running else "neutral")
+        set_state(self.validation_status, "ng" if alert_text else "warning" if trial.stale or blocker else "running" if trial.running else "neutral")
         metrics = trial.metrics()
         self.validation_target.setText(metrics["target"])
         self.validation_count.setText("條件 " + metrics["count"])
@@ -1612,11 +1624,15 @@ class EditorPage(QWidget):
             scrollbar.setValue(scrollbar.maximum() if at_end else position)
 
     def hideEvent(self, event):
+        if hasattr(self, "step_settings"):
+            self.step_settings.close()
         if self._validation.running:
             self._validation.stop("已離開編輯器，試跑已停止")
+            self._update_validation_view()
         super().hideEvent(event)
 
     def closeEvent(self, event):
+        self.step_settings.close()
         self._validation.stop()
         self._validation_watchdog.stop()
         super().closeEvent(event)
@@ -1692,12 +1708,18 @@ class EditorPage(QWidget):
         self._mark_modified()
 
     def _choose_model(self):
-        path, _ = QFileDialog.getOpenFileName(self, "選擇模型", str(self._data_root),
+        models_dir = getattr(self, "_models_dir", MODELS_DIR)
+        path, _ = QFileDialog.getOpenFileName(self, "匯入模型", str(models_dir),
                                               "模型包 (*.zip);;模型設定 (model.json)")
         if path:
-            self.sop.model_path = self._relativize_path(path)
+            try:
+                imported = import_model(path, models_dir=models_dir)
+            except (ModelBundleError, OSError, ValueError, TypeError) as exc:
+                QMessageBox.warning(self, "模型匯入失敗", str(exc))
+                return
+            self.sop.model_path = self._relativize_path(imported)
             self.set_model_state("selected")
-            self.model_selected.emit(path)
+            self.model_selected.emit(str(imported))
             self._mark_modified()
 
     def _on_cycle_form(self, *_args):
@@ -1726,6 +1748,11 @@ class EditorPage(QWidget):
         self.reset_ratio_spin.setEnabled(uses_conditions)
         if not self.sop.cycle.enabled:
             self.cycle_rule_summary.setText("已停用自動開始下一輪；本輪完成後停止，設定會保留。")
+
+    def _all_condition_references(self):
+        yield from self._all_conditions()
+        for editor in self.step_editors:
+            yield from editor.reference_conditions()
 
     def _all_conditions(self):
         for step in self.sop.steps:

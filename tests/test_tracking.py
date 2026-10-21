@@ -266,7 +266,7 @@ class EditorTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def test_editor_expands_all_steps_and_regions_in_one_scrollable_page(self):
+    def test_editor_opens_one_step_and_keeps_regions_on_the_workbench(self):
         editor = EditorPage()
         self.addCleanup(editor.close)
         editor.set_classes(['grip'])
@@ -294,14 +294,19 @@ class EditorTests(unittest.TestCase):
         self.assertIn('條件本幀成立', editor.roi_rows[0].toolTip())
         editor.edit_steps_button.setChecked(True)
         self.app.processEvents()
-        self.assertGreater(editor.page_scroll.verticalScrollBar().maximum(), 0)
+        self.assertTrue(all(form.body.isHidden() for form in editor.step_editors))
         for form in editor.step_editors:
+            editor._open_step_settings(form.step)
+            self.app.processEvents()
+            self.assertIs(editor.step_settings.current_editor, form)
+            self.assertTrue(editor.step_settings.scroll.isAncestorOf(form.body))
             for field in (form.step_name_edit, form.condition_table, form.forbidden_table,
                           form.hold_spin, form.forbidden_hold_spin):
                 self.assertTrue(field.isVisible())
-        # Choosing a trial target only changes the trial; every form remains
-        # available and edits apply to the step being edited directly.
+        # Choosing a trial target changes only the trial, retaining the open form.
         editor.validation_step.setCurrentIndex(1)
+        self.assertIs(editor.step_settings.current_editor, editor.step_editors[1])
+        editor.step_settings.close_button.click()
         name = editor.step_editors[1].step_name_edit
         name.setFocus()
         QTest.keyClick(name, Qt.Key.Key_A, Qt.KeyboardModifier.ControlModifier)
@@ -326,7 +331,7 @@ class EditorTests(unittest.TestCase):
         run.start_requested.connect(lambda: started.append(True))
         run.start_button.click()
         self.assertEqual(started, [True])
-        run.display_mode.setCurrentIndex(run.display_mode.findData('all'))
+        run.display_all_check.setChecked(True)
         self.assertEqual([r.name for r in run.video._rois], ['桌面','安裝位置'])
         self.assertEqual(run.video._stale, {'安裝位置'})
         packet = FramePacket(frame, frame.copy(), FrameResult(640,480,0), None,10,5)
@@ -391,8 +396,12 @@ class EditorTests(unittest.TestCase):
         editor.roi_rows[-1].name_edit.setText('左側安裝位置')
         editor.roi_rows[-1].name_edit.editingFinished.emit()
         editor.add_step_button.click()
-        conditions = editor.step_editors[0].condition_table
-        conditions.add_button.click()
+        step = editor.step_editors[0]
+        editor._open_step_settings(step.step)
+        step.completion_method.setCurrentIndex(step.completion_method.findData('auto'))
+        conditions = step.condition_table
+        label = conditions.field_widget(0, 'label')
+        label.setCurrentIndex(label.findData('grip'))
         region = conditions.field_widget(0, 'roi')
         region.setCurrentIndex(region.findData('左側安裝位置'))
         self.assertEqual(editor.sop.rois[0].anchor,'workpiece')
@@ -473,13 +482,14 @@ class EditorTests(unittest.TestCase):
         self.assertIn('left_part',run.display_summary.text())
         self.assertGreater(run.video._image.pixelColor(15,15).red(), 0)
         self.assertEqual(run.video._image.pixelColor(85,75).red(), 0)
-        run.display_mode.setCurrentIndex(run.display_mode.findData('all'))
+        run.display_all_check.setChecked(True)
         self.assertEqual([r.name for r in run.video._rois],['左','右'])
-        self.assertIn('目前偵測 3 個物件',run.display_summary.text())
+        self.assertIn('目前顯示 3 個物件',run.display_summary.text())
+        self.assertIn('模型共 3 類',run.display_summary.text())
         # 左側完成後，同一個 snapshot 切到右側，舊框立即消失。
         engine.update(FrameResult(100,100,1,[detections[0]]))
         packet.snapshot = engine.snapshot()
-        run.display_mode.setCurrentIndex(run.display_mode.findData('step'))
+        run.display_step_check.setChecked(True)
         run.on_packet(packet)
         self.assertEqual([r.name for r in run.video._rois],['右'])
         self.assertIn('目前流程 2：右步驟',run.display_summary.text())
@@ -489,7 +499,7 @@ class EditorTests(unittest.TestCase):
         self.addCleanup(run.close)
         run._transform = IDENTITY.copy()
         run.set_sop(SOPDefinition(rois=[ROI('新位置',TARGET,'workpiece')]))
-        run.display_mode.setCurrentIndex(run.display_mode.findData('all'))
+        run.display_all_check.setChecked(True)
         self.assertIsNone(run._transform)
         self.assertEqual(run.video._rois, [])
         self.assertIn('區域超出畫面', run.tracking_label.text())
@@ -512,8 +522,12 @@ class EditorTests(unittest.TestCase):
         editor.roi_rows[-1].name_edit.setText('壓合位置')
         editor.roi_rows[-1].name_edit.editingFinished.emit()
         self.assertEqual(editor.sop.rois[0].anchor, "workpiece")
-        conditions = editor.step_editors[0].condition_table
-        conditions.add_button.click()
+        step = editor.step_editors[0]
+        editor._open_step_settings(step.step)
+        step.completion_method.setCurrentIndex(step.completion_method.findData('auto'))
+        conditions = step.condition_table
+        label = conditions.field_widget(0, 'label')
+        label.setCurrentIndex(label.findData('tool'))
         region = conditions.field_widget(0, 'roi')
         region.setCurrentIndex(region.findData('壓合位置'))
         self.assertEqual(editor.sop.steps[0].conditions[0].roi, '壓合位置')

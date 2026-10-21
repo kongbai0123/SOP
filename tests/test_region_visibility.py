@@ -15,7 +15,7 @@ import numpy as np
 from PySide6.QtCore import QPoint, QTimer, Qt
 from PySide6.QtGui import QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QCheckBox
 
 from sop_app.detection import Detection, FrameResult
 from sop_app.engine import SOPEngine
@@ -197,7 +197,7 @@ class RegionVisibilityTests(unittest.TestCase):
                 sop = definition()
                 page = self.page(RunPage, sop)
                 if classes:
-                    page.display_mode.setCurrentIndex(page.display_mode.findData("all"))
+                    page.display_all_check.setChecked(True)
                 frame = packet(sop, classes=classes)
                 page.on_packet(frame)
                 page.set_regions_visible(False)
@@ -205,6 +205,60 @@ class RegionVisibilityTests(unittest.TestCase):
                 self.assertGreater(np.count_nonzero(rgb(page.video._image)[100:150, 30:80]), 0)
                 page.set_regions_visible(True)
                 self.assertEqual(len(page.video._rois), 1)
+
+    def test_monitor_checkboxes_are_exclusive_and_redraw_current_frame_immediately(self):
+        sop = definition()
+        sop.rois.append(ROI("OTHER", [(.1, .1), (.3, .1), (.3, .3), (.1, .3)]))
+        original_sop = deepcopy(sop.to_dict())
+        page = self.page(RunPage, sop)
+        self.assertIsInstance(page.display_step_check, QCheckBox)
+        self.assertIsInstance(page.display_all_check, QCheckBox)
+        self.assertTrue(page.display_step_check.isChecked())
+        self.assertFalse(page.display_all_check.isChecked())
+        page.display_step_check.click()
+        self.assertTrue(page.display_step_check.isChecked())
+
+        frame = packet(sop, classes=("part", "noise"))
+        noise = Detection("noise", .95, (100, 100, 150, 150))
+        frame.result.detections.append(noise)
+        frame.model_display = draw_detections(
+            frame.frame, frame.result.detections, frame.classes, frame.min_score, frame.show_masks)
+        engine = SOPEngine(sop)
+        engine.start(0.)
+        frame.snapshot = engine.snapshot()
+        before_snapshot = engine.snapshot()
+        page.set_running(True)
+        page.on_packet(frame)
+        step_image = rgb(page.video._image)
+        self.assertEqual([roi.name for roi in page.video._rois], ["REGION"])
+        self.assertTrue(page.display_summary.text().startswith("逐一｜"))
+
+        page.display_all_check.click()
+        self.assertTrue(page.display_all_check.isChecked())
+        self.assertFalse(page.display_step_check.isChecked())
+        page.display_all_check.click()
+        self.assertTrue(page.display_all_check.isChecked())
+        self.assertEqual([roi.name for roi in page.video._rois], ["REGION", "OTHER"])
+        self.assertTrue(page.display_summary.text().startswith("全開｜"))
+        np.testing.assert_array_equal(rgb(page.video._image), frame.preview_display[:, :, ::-1])
+        self.assertFalse(np.array_equal(rgb(page.video._image), step_image))
+
+        page.display_step_check.click()
+        self.assertTrue(page.display_step_check.isChecked())
+        self.assertFalse(page.display_all_check.isChecked())
+        self.assertEqual([roi.name for roi in page.video._rois], ["REGION"])
+        np.testing.assert_array_equal(rgb(page.video._image), step_image)
+        self.assertEqual(sop.to_dict(), original_sop)
+        self.assertEqual(engine.snapshot(), before_snapshot)
+        self.assertEqual(len(frame.result.detections), 2)
+
+    def test_monitor_mode_summary_matches_choice_before_sop_is_loaded(self):
+        page = RunPage()
+        self.addCleanup(self.dispose, page)
+        page.display_all_check.click()
+        self.assertEqual(page.display_summary.text(), "全開｜等待 SOP 與影像")
+        page.display_step_check.click()
+        self.assertEqual(page.display_summary.text(), "逐一｜等待 SOP 與影像")
 
     def test_pipeline_preview_is_model_only_while_completed_step_keeps_roi_evidence(self):
         sop = definition(following=True)

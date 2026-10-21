@@ -32,6 +32,8 @@ class VideoWidget(QWidget):
         self._banner = ""
         self._banner_color = QColor("#455a64")
         self._banner_single_line = False
+        self._alert = ""
+        self._alert_regions: set[str] = set()
         self._draw_mode = False
         self._drag_start: QPointF | None = None
         self._drag_end: QPointF | None = None
@@ -66,6 +68,14 @@ class VideoWidget(QWidget):
             self._banner, self._banner_color = text, QColor(color)
             self._banner_single_line = bool(single_line)
             self.setToolTip(text if self._banner_single_line else "")
+            self.update()
+
+    def set_alert(self, text: str, regions: Iterable[str] = ()):
+        """Overlay an alert without changing the source frame or locator banner."""
+        text = text.strip()
+        regions = set(regions) if text else set()
+        if text != self._alert or regions != self._alert_regions:
+            self._alert, self._alert_regions = text, regions
             self.update()
 
     @property
@@ -130,16 +140,22 @@ class VideoWidget(QWidget):
             painter.drawText(self.rect().adjusted(12, 12, -12, -12),
                              Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere,
                              self._placeholder)
+            self._draw_alert(painter, QRectF(self.rect()))
             return
 
         rect = self._image_rect()
         painter.drawImage(rect, self._image)
         label_font = QFont(self.font().family(), 10, QFont.Weight.Bold)
 
-        for roi in self._rois if self._regions_visible else ():
+        for roi in self._rois:
+            alarmed = bool(self._alert) and roi.name in self._alert_regions
+            if not self._regions_visible and not alarmed:
+                continue
             points = self._edit_drag['preview'] if self._edit_drag and self._edit_drag['name'] == roi.name else roi.points
             polygon = QPolygonF([self._to_widget(rect, x, y) for x, y in points])
-            if roi.name in self._stale:
+            if alarmed:
+                pen, fill = QPen(QColor("#ff5252"), 3), QColor(255, 82, 82, 45)
+            elif roi.name in self._stale:
                 pen, fill = QPen(QColor("#ff9800"), 2, Qt.PenStyle.DashLine), QColor(255, 152, 0, 25)
             elif roi.name == self._selected:
                 pen, fill = QPen(QColor("#00e5ff"), 3), QColor(0, 229, 255, 40)
@@ -151,7 +167,7 @@ class VideoWidget(QWidget):
             painter.setPen(pen)
             painter.setBrush(QBrush(fill))
             painter.drawPolygon(polygon)
-            if roi.name == self._selected and roi.name in self._editable:
+            if self._regions_visible and roi.name == self._selected and roi.name in self._editable:
                 painter.setBrush(QColor('white'))
                 for point in polygon:
                     painter.drawRect(QRectF(point.x() - 5, point.y() - 5, 10, 10))
@@ -164,7 +180,7 @@ class VideoWidget(QWidget):
             painter.setBrush(QColor(0, 229, 255, 40))
             painter.drawRect(QRectF(self._drag_start, self._drag_end).normalized())
 
-        if self._banner:
+        if self._banner and not self._alert:
             banner_font = QFont(self.font().family(), 16, QFont.Weight.Bold)
             text = self._banner
             flags = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
@@ -209,6 +225,24 @@ class VideoWidget(QWidget):
             self._draw_tag(painter, QPointF(box.left(), max(rect.top(), box.top() - 22)),
                            f"{det.label} {det.score:.2f}", color, label_font)
         painter.restore()
+        # 告警最後繪製，辨識框與標籤不得蓋住需要立即看見的警示。
+        self._draw_alert(painter, rect)
+
+    def _draw_alert(self, painter: QPainter, rect: QRectF):
+        if not self._alert:
+            return
+        font = QFont(self.font().family(), 16, QFont.Weight.Bold)
+        bounds = QRectF(0, 0, rect.width(), self.height()).adjusted(12, 8, -12, -8)
+        font, measured = self._fit_text(painter, self._alert, font, bounds)
+        height = min(self.height(), measured.height() + 16)
+        top = rect.y() - height if rect.y() >= height else min(rect.y(), self.height() - height)
+        band = QRectF(rect.x(), top, rect.width(), height)
+        painter.fillRect(band, QColor(183, 28, 28, 242))
+        painter.setFont(font)
+        painter.setPen(QColor("white"))
+        painter.drawText(band.adjusted(12, 8, -12, -8),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter |
+                         Qt.TextFlag.TextWordWrap | Qt.TextFlag.TextWrapAnywhere, self._alert)
 
     @staticmethod
     def _fit_text(painter, text, font, bounds):

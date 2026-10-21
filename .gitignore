@@ -1,6 +1,7 @@
 # Runtime data and machine-specific settings
 /records/
 /logs/
+/diagnostics/
 /app_settings.json
 /data/
 *.db
@@ -26,6 +27,7 @@ __pycache__/
 
 # Model exports, training data and recordings (supply locally)
 /cdc1a84bd72b48bd829c376476f3eaa7/
+/model/
 /models/
 /demo/
 .extracted/

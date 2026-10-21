@@ -199,13 +199,20 @@ class EditorPreviewAndSummaryTests(QtTests):
     def test_region_binding_updates_the_visible_step_without_navigation(self):
         region = ROI("left", [(0, 0), (.5, 0), (.5, .5), (0, .5)])
         editor = self.make_editor(SOPDefinition(rois=[region], steps=[Step("install")]))
-        cards = editor.step_editors[0].condition_table
-        cards.add_button.click()
+        step = editor.step_editors[0]
+        editor._open_step_settings(step.step)
+        step.completion_method.setCurrentIndex(step.completion_method.findData("auto"))
+        cards = step.condition_table
+        self.assertTrue(cards.isEnabled())
+        self.assertIs(editor.step_settings.current_editor, step)
+        label = cards.field_widget(0, "label")
+        label.setCurrentIndex(label.findData("grip"))
         field = cards.field_widget(0, "roi")
         field.setCurrentIndex(field.findData("left"))
         self.assertEqual(editor.sop.steps[0].conditions[0].roi, "left")
         self.assertIn("自動", editor.step_editors[0].manual_label.text())
         self.assertIn("自動 1", editor.setup_summary.text())
+        self.assertIs(editor.step_settings.current_editor, step)
 
     def test_delete_and_restore_synchronize_sop_list_and_summary(self):
         editor = self.make_editor()
@@ -439,7 +446,7 @@ class MainWindowBatchOneTests(QtTests):
         acknowledge.assert_called_once()
 
     def editing_workflow(self, width, height):
-        """Edit two expanded steps, draw/bind a region, and save the actual UI draft."""
+        """Edit individual steps, draw/bind a region, and save the actual UI draft."""
         definition = SOPDefinition(name="workflow", steps=[
             Step(f"step {index}", conditions=[Condition(label="grip")]) for index in range(1, 5)])
         self.window._apply_sop(definition, None)
@@ -450,19 +457,23 @@ class MainWindowBatchOneTests(QtTests):
         self.window.resize(width, height)
         self.window.show()
         self.app.processEvents()
-        editor.page_scroll.ensureWidgetVisible(editor.step_editors[0].duplicate_button)
+        editor._open_step_settings(editor.sop.steps[0])
+        self.app.processEvents()
         QTest.mouseClick(editor.step_editors[0].duplicate_button, Qt.MouseButton.LeftButton)
         self.app.processEvents()
         self.assertEqual(len(editor.sop.steps), 5)
+        editor.step_settings.close_button.click()
         target = editor.step_editors[1]
+        editor._open_step_settings(target.step)
+        self.app.processEvents()
         field = target.condition_table.field_widget(0, "label")
-        editor.page_scroll.ensureWidgetVisible(field)
+        editor.step_settings.scroll.ensureWidgetVisible(field)
         field.setFocus()
         QTest.keyClick(field, Qt.Key.Key_End)
         self.assertEqual(editor.sop.steps[1].conditions[0].label, "part")
         self.assertEqual(editor.sop.steps[0].conditions[0].label, "grip")
+        editor.step_settings.close_button.click()
         editor.on_packet(packet())
-        editor.page_scroll.ensureWidgetVisible(editor.video)
         editor.freeze_check.setChecked(True)
         editor.draw_button.click()
         self.app.processEvents()
@@ -475,9 +486,11 @@ class MainWindowBatchOneTests(QtTests):
         row = editor.roi_rows[0]
         row.name_edit.setText("new position")
         row.name_edit.editingFinished.emit()
+        editor._open_step_settings(editor.sop.steps[1])
         field = editor.step_editors[1].condition_table.field_widget(0, "roi")
         field.setCurrentIndex(field.findData("new position"))
         self.assertEqual(editor.sop.steps[1].conditions[0].roi, "new position")
+        editor.step_settings.close_button.click()
         editor._return_live()
         frame = packet()
         frame.result.detections = [Detection("part", .9, (10, 10, 30, 30))]

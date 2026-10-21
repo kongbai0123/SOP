@@ -4,7 +4,7 @@ from __future__ import annotations
 import copy
 from typing import Sequence
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSignalBlocker, Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDoubleSpinBox, QHBoxLayout, QHeaderView,
                                QPushButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
@@ -116,8 +116,9 @@ class ConditionTable(QWidget):
 
             count_box = QSpinBox()
             count_box.setRange(1, 99)
+            count_box.setSpecialValueText("不限")
+            count_box.setToolTip("不限＝只要求出現至少 1 個；指定 N 代表至少 N 個。")
             count_box.setValue(cond.min_count)
-            count_box.setEnabled(cond.type == "appear")
             count_box.valueChanged.connect(lambda v, r=row: self._set(r, "min_count", v))
 
             score_box = QDoubleSpinBox()
@@ -137,6 +138,7 @@ class ConditionTable(QWidget):
             for column, widget in enumerate([type_box, label_box, roi_box, count_box, score_box, overlap_box]):
                 widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
                 self.table.setCellWidget(row, column, widget)
+            self._update_count_state(row)
             live = QTableWidgetItem("—")
             live.setFlags(Qt.ItemFlag.ItemIsEnabled)
             live.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -156,8 +158,21 @@ class ConditionTable(QWidget):
             return
         setattr(self._conditions[row], field, value)
         if field == "type":
-            self.table.cellWidget(row, 3).setEnabled(value == "appear")
+            self._update_count_state(row)
         self.changed.emit()
+
+    def _update_count_state(self, row: int):
+        condition = self._conditions[row]
+        count = self.table.cellWidget(row, 3)
+        blocker = QSignalBlocker(count)
+        disappear = condition.type == "disappear"
+        # Only the disabled display uses zero. Keep the saved appearance
+        # threshold, so changing the state back restores the user's value.
+        count.setRange(0 if disappear else 1, 99)
+        count.setSpecialValueText("需為 0" if disappear else "不限")
+        count.setValue(0 if disappear else condition.min_count)
+        count.setEnabled(not disappear)
+        del blocker
 
     def _add(self):
         self._conditions.append(Condition(label=self._classes[0] if self._classes else ""))

@@ -8,7 +8,7 @@ import numpy as np
 
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QSplitter,
                                QScrollArea, QSizePolicy, QStyle, QVBoxLayout, QWidget)
 
@@ -136,15 +136,19 @@ class RunPage(QWidget):
         self.start_button.setMinimumHeight(36)
         self.start_button.setToolTip("可直接開始作業；位置尚未確認時，跟隨位置的條件會暫停累積。")
         self.start_button.clicked.connect(self._on_start_clicked)
-        self.display_mode = QComboBox()
-        self.display_mode.addItem("逐步｜目前流程", "step")
-        self.display_mode.addItem("全開｜所有結果", "all")
-        self.display_mode.setToolTip(
-            "逐步：只輸出目前流程的完成與違規條件物件及位置\n"
-            "全開：輸出模型所有辨識結果與所有位置\n"
-            "兩種模式都不會改變背景判定")
-        self.display_mode.currentIndexChanged.connect(self._on_display_mode_changed)
-        self.display_summary = QLabel("逐步｜等待 SOP 與影像")
+        self.display_step_check = QCheckBox("逐一（目前工序）")
+        self.display_all_check = QCheckBox("全開（所有結果）")
+        self.display_step_check.setToolTip(
+            "只顯示目前工序完成與違規條件使用的物件及位置；不影響背景判定。")
+        self.display_all_check.setToolTip(
+            "顯示達到最低顯示信心度的所有辨識結果與所有位置；不影響背景判定。")
+        self.display_group = QButtonGroup(self)
+        self.display_group.setExclusive(True)
+        self.display_group.addButton(self.display_step_check)
+        self.display_group.addButton(self.display_all_check)
+        self.display_step_check.setChecked(True)
+        self.display_group.buttonToggled.connect(self._on_display_mode_changed)
+        self.display_summary = QLabel("逐一｜等待 SOP 與影像")
         self.display_summary.setTextFormat(Qt.TextFormat.PlainText)
         self.display_summary.setWordWrap(True)
         self.display_summary.setObjectName("displaySummary")
@@ -242,7 +246,9 @@ class RunPage(QWidget):
         layout.addWidget(self.step_overview, 1)
         display_row = QHBoxLayout()
         display_row.addWidget(QLabel("畫面顯示"))
-        display_row.addWidget(self.display_mode, 1)
+        display_row.addWidget(self.display_step_check)
+        display_row.addWidget(self.display_all_check)
+        display_row.addStretch(1)
         details_layout.addLayout(display_row)
         details_layout.addWidget(self.display_summary)
         toggles = QHBoxLayout()
@@ -517,7 +523,7 @@ class RunPage(QWidget):
         return f"{prefix}流程 {index + 1}：{self.sop.steps[index].name}", rois, labels
 
     def _monitor_frame(self, packet, snapshot):
-        mode = self.display_mode.currentData()
+        mode = self._display_mode()
         if mode == "all" or not packet.classes:
             return packet.preview_display
         _context, _rois, labels = self._step_context(snapshot)
@@ -528,13 +534,19 @@ class RunPage(QWidget):
         self.video.set_regions_visible(visible)
         self._refresh_regions(self._tracking_status, self._snapshot)
 
+    def _display_mode(self):
+        return "all" if self.display_all_check.isChecked() else "step"
+
     def _refresh_regions(self, status="等待影像定位", snapshot=None):
+        mode = self._display_mode()
         if self.sop is None:
             self.video.set_rois([])
             self.tracking_label.setText("")
+            mode_name = "全開" if mode == "all" else "逐一"
+            self.display_summary.setText(f"{mode_name}｜等待 SOP 與影像")
             return
         context, current, labels = self._step_context(snapshot)
-        selected = self.sop.rois if self.display_mode.currentData() == "all" else [r for r in self.sop.rois if r.name in current]
+        selected = self.sop.rois if mode == "all" else [r for r in self.sop.rois if r.name in current]
         tracking_lost = (self.sop.workpiece is not None and self._transform is None
                          and (self._last_transform is None or self._tracking_misses >= 2))
         display_transform = self._transform
@@ -544,22 +556,22 @@ class RunPage(QWidget):
             display_transform = np.array([[1., 0., 0.], [0., 1., 0.]])
         visible = display_rois(selected, display_transform)
         stale = {roi.name for roi in selected if tracking_lost and roi.anchor == "workpiece"}
-        self.video.set_rois(visible, current if self.display_mode.currentData() == "step" else set(), stale=stale)
+        self.video.set_rois(visible, current if mode == "step" else set(), stale=stale)
         hidden = len(selected) - len(visible)
-        mode_text = self.display_mode.currentText()
+        mode_text = "全開｜所有結果" if mode == "all" else "逐一｜目前工序"
         self.tracking_label.setToolTip(status)
-        if self.display_mode.currentData() == "all":
+        if mode == "all":
             packet = self._last_packet
             detected = sum(d.score >= packet.min_score for d in packet.result.detections) if packet else 0
             classes = len(packet.classes) if packet else 0
             self.display_summary.setText(
-                f"全開｜模型全部輸出｜目前偵測 {detected} 個物件（{classes} 類）｜位置 {len(visible)}/{len(selected)}")
+                f"全開｜目前顯示 {detected} 個物件｜模型共 {classes} 類｜位置 {len(visible)}/{len(selected)}")
         else:
             label_text = "、".join(sorted(labels)) or "無指定物件"
             roi_text = "、".join(r.name for r in selected) or "整個畫面／無指定位置"
-            self.display_summary.setText(f"逐步｜{context}\n物件：{label_text}｜位置：{roi_text}")
+            self.display_summary.setText(f"逐一｜{context}\n物件：{label_text}｜位置：{roi_text}")
         if not selected:
-            self.tracking_label.setText("目前工序不使用工作區域" if self.display_mode.currentData() == "step"
+            self.tracking_label.setText("目前工序不使用工作區域" if mode == "step"
                                         else "全開｜目前沒有工作區域")
         elif stale and not hidden:
             self.tracking_label.setText(
@@ -577,7 +589,9 @@ class RunPage(QWidget):
             detail = self.tracking_label.text().replace("已顯示", "已設定").replace("顯示最後位置", "保留最後位置")
             self.tracking_label.setText(f"區域框線已隱藏｜{detail}")
 
-    def _on_display_mode_changed(self, _index):
+    def _on_display_mode_changed(self, _button, checked):
+        if not checked:
+            return
         self._refresh_regions(self._tracking_status, self._snapshot)
         if self._last_packet is not None:
             self.video.set_frame(self._monitor_frame(self._last_packet, self._snapshot))

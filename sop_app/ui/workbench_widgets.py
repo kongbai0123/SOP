@@ -273,6 +273,9 @@ def workbench_styles(dark: bool) -> str:
         QLabel#validationStatus { font-size:12px; color:%(muted)s; }
         QLabel#validationStatus[state="warning"] { color:%(warning)s; }
         QLabel#validationStatus[state="running"] { color:%(blue)s; }
+        QLabel#validationStatus[state="ng"] { color:%(danger)s; }
+        QLabel#trialAlert { color:white; background:#b71c1c; border:1px solid #f26c6c;
+                           padding:6px; font-size:12px; font-weight:600; }
         QFrame#conditionBlock { background:%(bg)s; border:1px solid %(border)s; }
         QFrame#conditionBlock[selected="true"] { background:%(soft)s; border-color:%(blue)s; }
         QLabel#conditionTitle { color:%(muted)s; font-size:12px; font-weight:600; }

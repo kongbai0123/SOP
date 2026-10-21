@@ -7,7 +7,7 @@ import sys
 import tempfile
 import time
 
-from .paths import APP_SETTINGS, SOPS_DIR, resolve
+from .paths import APP_SETTINGS, SOPS_DIR, resolve, resolve_model
 
 
 def initial_sop_path(settings, root=None) -> Path | None:
@@ -50,7 +50,7 @@ def initial_model_path(root=None) -> Path | None:
         model = sop.get("model_path") if isinstance(sop, dict) else None
         if not isinstance(model, str) or not model.strip():
             return None
-        path = (Path(model) if Path(model).is_absolute() else Path(root) / model) if root is not None else resolve(model)
+        path = resolve_model(model, root=root) if root is not None else resolve(model)
         return path if path.exists() else None
     except (OSError, ValueError):
         return None

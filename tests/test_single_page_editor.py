@@ -1,4 +1,4 @@
-"""Whole-document editing and preview/engine regressions without devices or records."""
+"""Single-step editing and preview/engine regressions without devices or records."""
 from __future__ import annotations
 
 import copy
@@ -49,20 +49,24 @@ class SinglePageEditorTests(unittest.TestCase):
 
     def test_all_settings_remain_available_when_trial_target_changes(self):
         editor = self.editor(SOPDefinition(steps=[Step("automatic", conditions=[Condition(label="part")]), Step("manual")]))
-        self.assertTrue(all(card.expanded for card in editor.step_editors))
-        # Steps on the left and tools on the right scroll on their own, never nested.
+        self.assertTrue(all(card.body.isHidden() for card in editor.step_editors))
+        # The list, tools and overlay have independent scroll areas.
         scrolls = editor.findChildren(QScrollArea)
-        self.assertEqual(set(scrolls), {editor.page_scroll, editor.tools_scroll})
+        self.assertEqual(set(scrolls), {editor.page_scroll, editor.tools_scroll, editor.step_settings.scroll})
         self.assertFalse(editor.page_scroll.isAncestorOf(editor.tools_scroll))
         self.assertFalse(editor.tools_scroll.isAncestorOf(editor.page_scroll))
         self.assertFalse(editor.findChildren(QTabWidget))
         self.assertFalse(editor.findChildren(QListWidget))
         for card in editor.step_editors:
+            editor._open_step_settings(card.step)
+            self.app.processEvents()
+            self.assertIs(editor.step_settings.current_editor, card)
             for widget in (card.step_name_edit, card.instruction_edit, card.condition_table,
                            card.forbidden_table, card.forbidden_hold_spin, card.timeout_spin):
                 self.assertTrue(widget.isVisible())
         editor.validation_step.setCurrentIndex(1)
         self.app.processEvents()
+        self.assertIs(editor.step_settings.current_editor, editor.step_editors[1])
         self.assertTrue(all(card.isVisible() for card in editor.step_editors))
         self.assertIn("人工確認", editor.step_editors[1].manual_label.text())
         self.assertTrue(editor.validation_confirm.isVisible())
@@ -77,8 +81,8 @@ class SinglePageEditorTests(unittest.TestCase):
         first, second = editor.step_editors
         for card in (first, second):
             self.assertFalse(card.expanded)
-            self.assertEqual(card.expand_button.text(), "展開")
-            for widget in (card.step_name_edit, card.drag_handle):
+            self.assertEqual(card.edit_button.text(), "編輯")
+            for widget in (card.step_name_edit, card.drag_handle, card.edit_button):
                 self.assertTrue(widget.isVisible())
             # The description and rules are a tooltip on the name row, not text on screen.
             self.assertFalse(any(label.isVisible() and "違規：" in label.text()
@@ -95,39 +99,47 @@ class SinglePageEditorTests(unittest.TestCase):
         self.assertIn("違規：未設定", second.header_row.toolTip())
         editor.edit_steps_button.click()
         self.app.processEvents()
+        self.assertTrue(all(card.body.isHidden() for card in (first, second)))
+        self.assertTrue(all(card.actions_row.isVisible() for card in (first, second)))
+        first.edit_button.click()
+        self.app.processEvents()
         self.assertTrue(first.condition_table.isVisible())
-        self.assertEqual(first.expand_button.text(), "收合")
+        self.assertIs(editor.step_settings.current_editor, first)
         self.assertTrue(first.instruction_edit.isVisible())
-        self.assertTrue(second.condition_table.isVisible())
+        self.assertFalse(second.condition_table.isVisible())
         first.hold_spin.setValue(1.5)
-        first.expand_button.click()
+        editor.step_settings.close_button.click()
         self.assertIn("觀察 1.5 秒", first.header_row.toolTip())
         editor.edit_steps_button.setChecked(False)
         editor.edit_steps_button.setChecked(True)
-        self.assertTrue(all(card.expanded for card in editor.step_editors))
+        self.assertTrue(all(card.body.isHidden() for card in editor.step_editors))
         editor.edit_steps_button.setChecked(False)
         self.assertTrue(all(card.body.isHidden() for card in editor.step_editors))
 
-    def test_new_and_duplicated_steps_open_alone_and_moves_keep_state(self):
+    def test_new_and_duplicated_steps_stay_compact_and_moves_keep_identity(self):
         editor = self.editor(SOPDefinition(steps=[Step("A"), Step("B")]), expanded=False)
         editor.edit_steps_button.click()
-        editor.step_editors[0].set_expanded(False, notify=True)
+        editor._open_step_settings(editor.sop.steps[1])
+        edited_step = editor.sop.steps[1]
         editor.step_editors[1].up_button.click()
         self.assertEqual([s.name for s in editor.sop.steps], ["B", "A"])
-        self.assertEqual([card.expanded for card in editor.step_editors], [True, False])
+        self.assertIs(editor.step_settings.current_editor.step, edited_step)
+        editor.step_settings.close_button.click()
         editor.add_step_button.click()
-        self.assertEqual([card.expanded for card in editor.step_editors], [False, False, True])
+        self.assertTrue(all(card.body.isHidden() for card in editor.step_editors))
+        self.assertIsNone(editor.step_settings.current_editor)
         self.assertTrue(editor.step_editors[2].step_name_edit.hasFocus())
         editor.step_editors[1].duplicate_button.click()
         self.assertEqual([s.name for s in editor.sop.steps], ["B", "A", "A（複製）", "工序 3"])
-        self.assertEqual([card.expanded for card in editor.step_editors], [False, False, True, False])
+        self.assertTrue(all(card.body.isHidden() for card in editor.step_editors))
+        self.assertIsNone(editor.step_settings.current_editor)
         editor.set_sop(SOPDefinition(steps=[Step("only")]))
         self.assertFalse(editor.step_editors[0].expanded)
         self.assertTrue(editor.step_editors[0].body.isHidden())
 
     def test_adding_and_deleting_keep_the_scroll_position(self):
         steps = [Step(f"s{i}", conditions=[Condition(label="part")], forbidden=[Condition(label="part")])
-                 for i in range(6)]
+                 for i in range(18)]
         editor = self.editor(SOPDefinition(steps=steps))
         editor.resize(1366, 700)
         bar = editor.page_scroll.verticalScrollBar()
@@ -137,7 +149,8 @@ class SinglePageEditorTests(unittest.TestCase):
                 self.app.processEvents()
 
         def keeps(action):
-            editor.page_scroll.ensureWidgetVisible(editor.step_editors[3], 0, 0)
+            # Compact rows need a later anchor to exercise a nonzero list scroll.
+            editor.page_scroll.ensureWidgetVisible(editor.step_editors[10], 0, 0)
             settle()
             before = bar.value()
             self.assertGreater(before, 0)
@@ -146,9 +159,12 @@ class SinglePageEditorTests(unittest.TestCase):
             self.assertEqual(bar.value(), before)
 
         settle()
+        editor._open_step_settings(editor.sop.steps[3])
+        settle()
         keeps(lambda: editor.step_editors[3].condition_table.add_button.click())
         keeps(lambda: editor.step_editors[3].condition_table.field_widget(0, "remove").click())
         keeps(lambda: editor.step_editors[3].condition_table.undo_delete_button.click())
+        editor.step_settings.close_button.click()
         with patch("sop_app.ui.editor_page.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
             keeps(lambda: editor.step_editors[1].delete_button.click())
         keeps(lambda: editor.step_editors[3].up_button.click())
@@ -219,6 +235,7 @@ class SinglePageEditorTests(unittest.TestCase):
         sop = SOPDefinition(steps=[Step("first"), Step("second", conditions=[Condition(label="part")])])
         editor = self.editor(sop)
         card = editor.step_editors[1]
+        editor._open_step_settings(card.step)
         card.step_name_edit.selectAll()
         QTest.keyClicks(card.step_name_edit, "renamed")
         card.instruction_edit.setPlainText("Install second part")
@@ -250,8 +267,10 @@ class SinglePageEditorTests(unittest.TestCase):
         self.assertEqual([s.name for s in editor.sop.steps], ["A", "C", "B"])
         editor.step_editors[1].duplicate_button.click()
         self.assertEqual([s.name for s in editor.sop.steps], ["A", "C", "C（複製）", "B"])
-        editor.step_editors[2].condition_table.add_button.click()
-        editor.step_editors[2].condition_table.field_widget(0, "label").setCurrentIndex(2)
+        clone = editor.step_editors[2]
+        editor._open_step_settings(clone.step)
+        clone.completion_method.setCurrentIndex(clone.completion_method.findData("auto"))
+        clone.condition_table.field_widget(0, "label").setCurrentIndex(2)
         self.assertFalse(editor.sop.steps[1].conditions)
         self.assertEqual(editor.sop.steps[2].conditions[0].label, "other")
         with patch("sop_app.ui.editor_page.QMessageBox.question", return_value=QMessageBox.StandardButton.Yes):
@@ -369,7 +388,7 @@ class SinglePageEditorTests(unittest.TestCase):
         self.assertIn("設定已變更", editor.validation_status.text())
 
     def test_production_locks_settings_and_trial_and_restores_after_stop(self):
-        editor = self.editor(SOPDefinition(steps=[Step("A")]))
+        editor = self.editor(SOPDefinition(steps=[Step("A", conditions=[Condition(label="part")])]))
         editor.on_packet(packet())
         editor.validation_start.click()
         self.assertTrue(editor._validation.running)

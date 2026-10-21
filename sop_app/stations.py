@@ -12,6 +12,7 @@ import sqlite3
 import uuid
 
 from .station_backup import atomic_json, digest, recover_restore
+from .paths import models_directory, resolve_model
 
 STATION_ID = re.compile(r"ST[0-9]{3,8}\Z")
 
@@ -48,11 +49,15 @@ class Station:
     def settings(self):
         return self.root / "app_settings.json"
 
+    @property
+    def models(self):
+        return models_directory(self.root)
+
     def resolve(self, value):
         path = Path(value)
         if path.is_absolute():
             return path
-        local = self.root / path
+        local = resolve_model(path, root=self.root)
         # Compatibility for immutable old snapshots and external model paths.
         if not local.exists() and self.legacy_root is not None:
             old = self.legacy_root / path
@@ -62,6 +67,10 @@ class Station:
 
     def relativize(self, value):
         path = Path(value).resolve()
+        try:
+            return (Path("models") / path.relative_to(self.models.resolve())).as_posix()
+        except ValueError:
+            pass
         try:
             return path.relative_to(self.root.resolve()).as_posix()
         except ValueError:

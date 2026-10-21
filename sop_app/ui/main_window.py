@@ -20,7 +20,7 @@ from ..model_bundle import ModelBundleError, ModelInfo, read_model_info
 from ..model_eta import ModelETA, ModelLoadProgress, model_key, stage_key
 from ..frame_pacing import InferencePacer
 from ..native_runtime import cv2, NativeDependencyError
-from ..paths import APP_SETTINGS, PROJECT_ROOT, RECORDS_DIR, SOPS_DIR, resolve
+from ..paths import APP_SETTINGS, MODELS_DIR, PROJECT_ROOT, RECORDS_DIR, SOPS_DIR, resolve, resolve_model
 from ..pipeline import FramePacket, VideoPipeline
 from ..recorder import query
 from ..sop_schema import SOPDefinition, Step, load_sop, save_sop
@@ -60,6 +60,7 @@ class MainWindow(QMainWindow):
         self.model_ready = False
         self._requested_model: str | None = None
         self._engine_running = False
+        self._pending_inference_fps = 0
         self._camera_settings_token = 0
         self._pending_camera_settings_token = None
         self._model_started = None
@@ -157,7 +158,7 @@ class MainWindow(QMainWindow):
         install_readability_guard(self)
         self._push_context(self.run_page.context())   # 啟動時只同步給背景執行緒，不寫入設定檔
         self._refresh_today_stats()
-        self.pipeline.set_inference_fps(self.inference_fps.value())
+        self._request_inference_fps(self.inference_fps.value())
         self.pipeline.start()
         if not defer_initial_sop:
             self._open_initial_sop()
@@ -266,6 +267,9 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
         self.mask_check = QCheckBox("顯示遮罩")
         self.mask_check.setChecked(True)
+        self.mask_check.setToolTip("在物件輪廓內疊加半透明色塊，方便查看分割範圍；僅支援分割模型。\n"
+                                   "取消後仍顯示辨識框、名稱與信心度，不影響辨識與 SOP 判定。\n"
+                                   "此設定也會影響後續紀錄截圖的色塊顯示。")
         self.mask_check.toggled.connect(self._apply_display)
         toolbar.addWidget(self.mask_check)
         self.regions_check = QCheckBox("顯示作業區域")
@@ -279,25 +283,46 @@ class MainWindow(QMainWindow):
         self.display_score.setRange(0.3, 1.0)
         self.display_score.setSingleStep(0.05)
         self.display_score.setValue(0.5)
+        self.display_score.setToolTip("只顯示信心度達到此值的辨識結果，不會改變工序條件的判定門檻。\n"
+                                      "此設定也會影響後續紀錄截圖中顯示的物件。")
         self.display_score.valueChanged.connect(self._apply_display)
         toolbar.addWidget(self.display_score)
         toolbar.addSeparator()
-        toolbar.addWidget(QLabel("辨識上限"))
+        toolbar.addWidget(QLabel("辨識頻率上限"))
+        self.inference_fps_preset = QComboBox()
+        self.inference_fps_preset.setAccessibleName("辨識頻率上限預設")
+        for fps in (0, 5, 10, 15, 30, 60):
+            self.inference_fps_preset.addItem("不限" if fps == 0 else f"{fps} FPS", fps)
+        self.inference_fps_preset.addItem("自訂…", None)
         self.inference_fps = QDoubleSpinBox()
+        self.inference_fps.setAccessibleName("自訂辨識頻率上限")
         self.inference_fps.setRange(0, 240)
         self.inference_fps.setDecimals(1)
         self.inference_fps.setKeyboardTracking(False)
         self.inference_fps.setSpecialValueText("不限")
         self.inference_fps.setSuffix(" FPS")
         self.inference_fps.setValue(self._saved_inference_fps())
-        self.inference_fps.setToolTip("限制每秒辨識／判定的最高次數，0 表示不限；相機仍持續擷取最新影像。\n"
-                                      "實際速度受模型與硬體限制；降低上限可能漏掉短暫動作。停止作業後可調整。")
+        rate_tip = ("限制每秒辨識／判定的最高次數，並非物件數量；0 表示不限。\n"
+                    "相機仍持續擷取最新影像，預覽與位置跟隨的更新也受此上限影響。\n"
+                    "實際速度受模型與硬體限制；降低上限可能漏掉短暫動作。停止作業後可調整。\n"
+                    "選「自訂…」可輸入 1～240 FPS，或輸入 0 表示不限。")
+        self.inference_fps.setToolTip(rate_tip)
+        self.inference_fps_preset.setToolTip(rate_tip)
         self.inference_fps.valueChanged.connect(self._change_inference_fps)
-        toolbar.addWidget(self.inference_fps)
+        rate_controls = QWidget()
+        rate_layout = QHBoxLayout(rate_controls)
+        rate_layout.setContentsMargins(0, 0, 0, 0)
+        rate_layout.setSpacing(4)
+        rate_layout.addWidget(self.inference_fps_preset)
+        rate_layout.addWidget(self.inference_fps)
+        toolbar.addWidget(rate_controls)
+        self._sync_inference_fps_preset()
+        self.inference_fps_preset.currentIndexChanged.connect(self._select_inference_fps_preset)
 
     # ---- 設定檔 ----------------------------------------------------------------
     def _set_station_paths(self, station):
         self._data_root = station.root if station else PROJECT_ROOT
+        self._models_dir = station.models if station else MODELS_DIR
         self._sops_dir = station.sops if station else SOPS_DIR
         self._records_dir = station.records if station else RECORDS_DIR
         self._settings_path = station.settings if station else APP_SETTINGS
@@ -305,6 +330,7 @@ class MainWindow(QMainWindow):
 
     def _set_editor_station_paths(self):
         self.editor._data_root = self._data_root
+        self.editor._models_dir = self._models_dir
         self.editor._resolve_path = self._resolve_path
         if self.current_station:
             self.editor._relativize_path = self.current_station.relativize
@@ -414,7 +440,8 @@ class MainWindow(QMainWindow):
         self.inference_fps.blockSignals(True)
         self.inference_fps.setValue(self._saved_inference_fps())
         self.inference_fps.blockSignals(False)
-        self.pipeline.set_inference_fps(self.inference_fps.value())
+        self._sync_inference_fps_preset()
+        self._request_inference_fps(self.inference_fps.value())
         self.run_page.reset_station()
         self.run_page.blockSignals(True)
         self.run_page.set_context(self.settings.get("run_context", {}))
@@ -543,12 +570,40 @@ class MainWindow(QMainWindow):
             self.inference_fps.blockSignals(True)
             self.inference_fps.setValue(fps)
             self.inference_fps.blockSignals(False)
+        self._sync_inference_fps_preset(preserve_custom=True)
+        self._request_inference_fps(fps)
+
+    def _request_inference_fps(self, fps):
+        self._pending_inference_fps += 1
         self.pipeline.set_inference_fps(fps)
 
+    def _sync_inference_fps_preset(self, *, preserve_custom=False):
+        custom = preserve_custom and self.inference_fps_preset.currentData() is None
+        index = self.inference_fps_preset.findData(None if custom else self.inference_fps.value())
+        if index < 0:
+            index = self.inference_fps_preset.findData(None)
+        self.inference_fps_preset.blockSignals(True)
+        self.inference_fps_preset.setCurrentIndex(index)
+        self.inference_fps_preset.blockSignals(False)
+        self.inference_fps.setVisible(self.inference_fps_preset.currentData() is None)
+
+    def _select_inference_fps_preset(self, _index):
+        fps = self.inference_fps_preset.currentData()
+        self.inference_fps.setVisible(fps is None)
+        if fps is None:
+            self.inference_fps.setFocus()
+            self.inference_fps.selectAll()
+        else:
+            self.inference_fps.setValue(fps)
+
     def _on_inference_fps_ready(self, fps):
-        self.inference_fps.blockSignals(True)
-        self.inference_fps.setValue(fps)
-        self.inference_fps.blockSignals(False)
+        self._pending_inference_fps = max(0, self._pending_inference_fps - 1)
+        # An older reply must not overwrite a newer selection still in flight.
+        if not self._pending_inference_fps:
+            self.inference_fps.blockSignals(True)
+            self.inference_fps.setValue(fps)
+            self.inference_fps.blockSignals(False)
+            self._sync_inference_fps_preset(preserve_custom=True)
         if self.settings.get("inference_fps", 0) != fps:
             self.settings["inference_fps"] = fps
             self._save_settings()
@@ -678,6 +733,7 @@ class MainWindow(QMainWindow):
     def _on_engine_state(self, running: bool):
         self._engine_running = running
         self.inference_fps.setEnabled(not running)
+        self.inference_fps_preset.setEnabled(not running)
         self.editor.set_production_running(running)
         self.station_combo.setEnabled(not running and self.station_store is not None)
         self.new_station_button.setEnabled(not running and self.station_store is not None)
@@ -805,7 +861,7 @@ class MainWindow(QMainWindow):
                 import uuid
                 if sop.model_path and not Path(sop.model_path).is_absolute():
                     base = path.parent.parent if path.parent.name == "sops" else path.parent
-                    sop.model_path = str((base / sop.model_path).resolve())
+                    sop.model_path = self.current_station.relativize(resolve_model(sop.model_path, root=base))
                 target = self._sops_dir / path.name
                 if target.exists():
                     target = target.with_name(f"{target.stem}-{uuid.uuid4().hex[:8]}{target.suffix}")

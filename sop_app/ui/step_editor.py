@@ -1,5 +1,7 @@
-"""A reorderable name row with actions and settings available in edit mode."""
+"""A reorderable name row with settings opened in a single-step sidebar."""
 from __future__ import annotations
+
+import copy
 
 from PySide6.QtCore import QMimeData, Qt, Signal
 from PySide6.QtGui import QDrag
@@ -7,7 +9,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QGridLayout, QHB
                                QPushButton, QVBoxLayout, QWidget)
 
 from ..engine import violation_window
-from ..sop_schema import Step
+from ..sop_schema import Condition, Step
 from .compact_layout import (AutoHeightTextEdit, CompactDoubleSpinBox, CompactSpinBox, FlowLayout,
                              set_state, text_label)
 from .condition_rows import ConditionRows
@@ -62,10 +64,12 @@ def parameter_grid(pairs) -> QWidget:
 
 
 def section(title: QLabel, *widgets) -> QWidget:
-    widget = QWidget()
+    widget = QFrame()
+    widget.setObjectName("panel")
+    widget.setProperty("stepSettingsSection", True)
     layout = QVBoxLayout(widget)
-    layout.setContentsMargins(0, 2, 0, 0)
-    layout.setSpacing(4)
+    layout.setContentsMargins(12, 10, 12, 12)
+    layout.setSpacing(8)
     layout.addWidget(title)
     for item in widgets:
         layout.addWidget(item)
@@ -109,6 +113,7 @@ class StepDragHandle(QLabel):
 
 class StepEditor(QFrame):
     changed = Signal()
+    edit_requested = Signal()
     region_selected = Signal(str)
     duplicate_requested = Signal()
     delete_requested = Signal()
@@ -122,8 +127,10 @@ class StepEditor(QFrame):
         self.setObjectName("stepBlock")
         self.setAcceptDrops(True)
         self._editing = False
+        self._details_open = False
         self.step = step
         self._loading = True
+        self._automatic_conditions = copy.deepcopy(step.conditions)
         self.number_label = QLabel("1")
         self.number_label.setObjectName("stepNumber")
         self.drag_handle = StepDragHandle(self)
@@ -132,6 +139,11 @@ class StepEditor(QFrame):
         self.step_name_edit.setAccessibleName("工序名稱")
         self.instruction_edit = AutoHeightTextEdit(step.instruction)
         self.instruction_edit.setPlaceholderText("給作業員的說明（選填）")
+        self.completion_method = QComboBox()
+        self.completion_method.setAccessibleName("工序完成方式")
+        self.completion_method.addItem("自動判定", "auto")
+        self.completion_method.addItem("人工確認", "manual")
+        self.completion_method.setCurrentIndex(0 if step.conditions else 1)
         self.completion_mode = self.mode_choice(step.completion_mode)
         self.forbidden_mode = self.mode_choice(step.forbidden_mode)
         self.hold_spin = self.seconds(step.hold_sec, 60)
@@ -142,7 +154,12 @@ class StepEditor(QFrame):
                                                 60, minimum=-0.1, special="沿用完成")
         self.forbidden_ratio_spin = self.percent(0 if step.forbidden_ratio is None else round(step.forbidden_ratio * 100), 0)
         self.forbidden_ratio_spin.setSpecialValueText("沿用完成")
-        self.condition_table = ConditionRows("completion", "新增完成條件", "")
+        self.trial_notice_interval_spin = self.seconds(step.trial_notice_interval_sec,
+                                                       max(3600, step.trial_notice_interval_sec), special="不限制")
+        self.trial_notice_interval_spin.setToolTip("同一工序的後續違規提示寫入試跑紀錄的最小間隔。首次警報立即記錄；畫面警示與區域標紅始終即時更新，不受此間隔延遲。0 秒仍只在違規狀態改變時記錄。")
+        self.forbidden_hold_spin.setToolTip("違規判定的滑動觀察秒數；這段時間內的成立影格比例達標，且最新一幀成立才警報。0 秒為當幀判定；沿用完成會使用上方的完成觀察時間。")
+        self.forbidden_ratio_spin.setToolTip("觀察時間內，違規條件組合成立的影格數占總影格數的比例，用來容許短暫漏檢。這不是模型信心度或物件落在區域內的比例；沿用完成會使用上方的完成成立比例。")
+        self.condition_table = ConditionRows("completion", "新增完成條件", "尚未設定完成條件")
         self.forbidden_table = ConditionRows("violation", "新增違規條件", "未設定違規條件")
         for table, conditions in ((self.condition_table, step.conditions), (self.forbidden_table, step.forbidden)):
             table.set_options(classes, roi_names)
@@ -152,10 +169,12 @@ class StepEditor(QFrame):
         self.summary_label = text_label("", "warningLabel")
         self.live_label = text_label("單幀預覽：等待影像", "livePreview")
         self.manual_label = text_label()
-        self.expanded = True
-        self.expand_button = QPushButton("收合")
-        self.expand_button.setAccessibleName("展開或收合工序設定")
-        self.expand_button.clicked.connect(lambda: self.set_expanded(not self.expanded, notify=True))
+        self.expanded = False
+        self.edit_button = QPushButton("編輯")
+        self.edit_button.setAccessibleName("編輯此工序")
+        self.edit_button.clicked.connect(self.edit_requested)
+        # Keep the public alias for callers that previously used expand_button.
+        self.expand_button = self.edit_button
 
         self.up_button, self.down_button = QPushButton("上移"), QPushButton("下移")
         self.duplicate_button, self.delete_button = QPushButton("複製"), QPushButton("刪除")
@@ -180,7 +199,7 @@ class StepEditor(QFrame):
         name_line.addWidget(self.drag_handle)
         name_line.addWidget(self.number_label)
         name_line.addWidget(self.step_name_edit, 1)
-        name_line.addWidget(self.expand_button)
+        name_line.addWidget(self.edit_button)
         self.actions_row = QWidget()
         actions = QHBoxLayout(self.actions_row)
         actions.setContentsMargins(0, 0, 0, 0)
@@ -196,13 +215,20 @@ class StepEditor(QFrame):
         header.addWidget(self.actions_row)
 
         self.description_row = field_pair("說明", self.instruction_edit)
-        self.completion_row = section(group_label("完成", "completion"), parameter_grid((
-            ("判定", self.completion_mode), ("觀察", self.hold_spin), ("成立比例", self.ratio_spin),
-            ("超時", self.timeout_spin), ("最短工時", self.min_duration_spin))))
         self.manual_row = self.manual_label
-        self.forbidden_row = section(group_label("違規", "violation"), parameter_grid((
+        self.basic_row = section(group_label("基本資料", "basic"),
+                                 field_pair("完成方式", self.completion_method),
+                                 self.manual_row, self.description_row)
+        self.completion_row = section(group_label("完成條件", "completion"),
+                                      field_pair("條件組合", self.completion_mode), self.condition_table)
+        self.timing_note = text_label("", "mutedLabel")
+        self.timing_row = section(group_label("時間與限制", "timing"), parameter_grid((
+            ("觀察時間", self.hold_spin), ("成立比例", self.ratio_spin),
+            ("超時", self.timeout_spin), ("最短工時", self.min_duration_spin))), self.timing_note)
+        self.forbidden_note = text_label("", "mutedLabel")
+        self.forbidden_row = section(group_label("違規檢查（選填）", "violation"), parameter_grid((
             ("判定", self.forbidden_mode), ("觀察", self.forbidden_hold_spin),
-            ("成立比例", self.forbidden_ratio_spin))))
+            ("成立比例", self.forbidden_ratio_spin), ("訊息間隔", self.trial_notice_interval_spin))), self.forbidden_note, self.forbidden_table)
         self.status_row = QWidget()
         status_layout = QVBoxLayout(self.status_row)
         status_layout.setContentsMargins(0, 0, 0, 0)
@@ -212,10 +238,9 @@ class StepEditor(QFrame):
 
         body = self.body = QWidget()
         body_layout = QVBoxLayout(body)
-        body_layout.setContentsMargins(8, 4, 6, 6)
-        body_layout.setSpacing(4)
-        for widget in (self.description_row, self.completion_row, self.manual_row, self.condition_table,
-                       self.forbidden_row, self.forbidden_table, self.status_row):
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(12)
+        for widget in (self.basic_row, self.completion_row, self.timing_row, self.forbidden_row, self.status_row):
             body_layout.addWidget(widget)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(1, 1, 1, 1)
@@ -225,22 +250,28 @@ class StepEditor(QFrame):
         self.step_name_edit.textEdited.connect(self._save)
         self.instruction_edit.textChanged.connect(self._save)
         for spin in (self.hold_spin, self.ratio_spin, self.timeout_spin, self.min_duration_spin,
-                     self.forbidden_hold_spin, self.forbidden_ratio_spin):
+                     self.forbidden_hold_spin, self.forbidden_ratio_spin, self.trial_notice_interval_spin):
             spin.valueChanged.connect(self._save)
         for box in (self.completion_mode, self.forbidden_mode):
             box.currentIndexChanged.connect(self._save)
+        self.completion_method.currentIndexChanged.connect(self._on_completion_method)
         self._loading = False
         self.update_summary()
-        self.set_expanded(True)
+        self.set_details_open(False)
         self.set_editing(False)
 
     def set_editing(self, editing, individual=False):
+        """Show list-management actions without expanding any settings."""
         self._editing = bool(editing)
-        self._individual_edit = bool(individual)
-        self.expand_button.setText("完成" if individual else ("收合" if self.expanded else "展開"))
-        self.expand_button.setVisible(self._editing)
-        self.actions_row.setVisible(self._editing)
-        self.body.setVisible(self._editing)
+        self.actions_row.setVisible(self._editing or self._details_open)
+        self.edit_button.show()
+
+    def set_details_open(self, opened):
+        """The page calls this after moving this body to/from its sidebar."""
+        self._details_open = self.expanded = bool(opened)
+        self.body.setVisible(self._details_open)
+        self.actions_row.setVisible(self._editing or self._details_open)
+        self.edit_button.show()
 
     def dragEnterEvent(self, event):
         source = event.source()
@@ -286,6 +317,21 @@ class StepEditor(QFrame):
         widget.setValue(value)
         return widget
 
+    def _on_completion_method(self, *_args):
+        if self._loading:
+            return
+        conditions = self.condition_table.conditions()
+        if self.completion_method.currentData() == "manual":
+            if conditions:
+                self._automatic_conditions = copy.deepcopy(conditions)
+            self.condition_table.set_conditions([])
+        elif not conditions:
+            # An incomplete automatic condition remains explicit and can be
+            # validated; merely opening a manual step never creates one.
+            restored = self._automatic_conditions or [Condition()]
+            self.condition_table.set_conditions(restored)
+        self._save()
+
     def _save(self, *_args):
         if self._loading:
             return
@@ -300,18 +346,20 @@ class StepEditor(QFrame):
         step.min_duration_sec = self.min_duration_spin.value()
         step.forbidden_hold_sec = None if self.forbidden_hold_spin.value() < 0 else round(self.forbidden_hold_spin.value(), 2)
         step.forbidden_ratio = None if self.forbidden_ratio_spin.value() == 0 else self.forbidden_ratio_spin.value() / 100
+        step.trial_notice_interval_sec = round(self.trial_notice_interval_spin.value(), 2)
         step.conditions = self.condition_table.conditions()
         step.forbidden = self.forbidden_table.conditions()
+        if step.conditions:
+            self._automatic_conditions = copy.deepcopy(step.conditions)
         self.update_summary()
         self.changed.emit()
 
     def set_expanded(self, expanded, notify=False):
-        self.expanded = bool(expanded)
-        for widget in (self.description_row, self.completion_row, self.condition_table,
-                       self.forbidden_row, self.forbidden_table):
-            widget.setVisible(self.expanded)
-        self.manual_row.setVisible(self.expanded and not self.step.conditions)
-        self.expand_button.setText("收合" if self.expanded else "展開")
+        """Legacy requests must not reveal settings inside the name list."""
+        if not expanded:
+            self.set_details_open(False)
+        elif notify:
+            self.edit_requested.emit()
         if notify:
             self.expanded_changed.emit(self.expanded)
 
@@ -346,16 +394,37 @@ class StepEditor(QFrame):
 
     def update_summary(self):
         manual = not self.step.conditions
-        self.manual_label.setText("人工確認：未設定完成條件，執行時由作業員按「人工確認完成」。" if manual else
+        blocked = self.completion_method.blockSignals(True)
+        self.completion_method.setCurrentIndex(1 if manual else 0)
+        self.completion_method.blockSignals(blocked)
+        self.manual_label.setText("人工確認：執行時由作業員按「人工確認完成」；仍可設定超時與違規檢查。" if manual else
                                   "自動判定：完成條件成立後，仍需達到觀察時間與成立比例。")
-        self.manual_row.setVisible(manual and self.expanded)
         set_state(self.manual_label, "warning" if manual else "neutral")
         self.completion_mode.setEnabled(not manual)
-        self.hold_spin.setEnabled(not manual)
-        self.ratio_spin.setEnabled(not manual)
+        # Removing the last automatic condition must leave its undo available.
+        # The explicit manual mode only disables adding new completion rules.
+        self.condition_table.setEnabled(True)
+        self.condition_table.add_button.setEnabled(not manual)
+        self.condition_table.empty_label.setText("人工確認不需設定完成條件；如需辨識物件，請先選擇「自動判定」。" if manual else
+                                                 "尚未設定完成條件")
+        inherited_hold = bool(self.step.forbidden) and self.step.forbidden_hold_sec is None
+        inherited_ratio = bool(self.step.forbidden) and self.step.forbidden_ratio is None
+        self.hold_spin.setEnabled(not manual or inherited_hold)
+        self.ratio_spin.setEnabled(not manual or inherited_ratio)
         self.min_duration_spin.setEnabled(not manual)
-        for widget in (self.forbidden_mode, self.forbidden_hold_spin, self.forbidden_ratio_spin):
+        self.timing_note.setText(
+            "人工確認不使用完成觀察時間、成立比例或最短工時。違規設為「沿用完成」時，仍會使用上方對應數值。" if manual else
+            "觀察時間與成立比例用來確認完成條件持續成立；超時 0 秒為不限時，最短工時 0 秒為不檢查。")
+        for widget in (self.forbidden_mode, self.forbidden_hold_spin, self.forbidden_ratio_spin,
+                       self.trial_notice_interval_spin):
             widget.setEnabled(bool(self.step.forbidden))
+        hold, ratio = violation_window(self.step)
+        self.forbidden_note.setText(
+            f"目前違規觀察 {self._seconds(hold)}、成立比例 {ratio:.0%}。"
+            f"最近觀察窗內，至少 {ratio:.0%} 的判定影格符合違規組合，且最新一幀成立才警報。"
+            "設為「沿用完成」時，使用「時間與限制」中的數值。"
+            f"試跑訊息間隔 {self.step.trial_notice_interval_sec:g} 秒，只限制重複紀錄；畫面警示即時更新。"
+            if self.step.forbidden else "選填。人工確認與自動判定工序皆可加入違規條件。")
         self._update_rules_tooltip()
 
     def _update_rules_tooltip(self):
@@ -370,11 +439,18 @@ class StepEditor(QFrame):
         self.live_label.setText(text)
         set_state(self.live_label, state)
 
+    def reference_conditions(self):
+        """Keep retained automatic rules and undo entries bound to ROI names."""
+        yield from self._automatic_conditions
+        yield from self.condition_table.reference_conditions()
+        yield from self.forbidden_table.reference_conditions()
+
     def set_options(self, classes, roi_names):
         for table, conditions in ((self.condition_table, self.step.conditions), (self.forbidden_table, self.step.forbidden)):
             table.set_options(classes, roi_names)
             if table.conditions() != conditions:
                 table.set_conditions(conditions)
+        self.update_summary()
 
     def set_position(self, index, count):
         self.number_label.setText(str(index + 1))
