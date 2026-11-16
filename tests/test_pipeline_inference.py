@@ -1,15 +1,24 @@
 """Pipeline integration with the isolated inference worker, without loading a GPU."""
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QCoreApplication
+from PySide6.QtWidgets import QApplication
 
 from sop_app.inference_worker import InferenceWorkerClosed, InferenceWorkerError, ModelProgress
 from sop_app.pipeline import VideoPipeline
 
 
 class PipelineInferenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Loader-thread signals require Qt event delivery even when this file
+        # runs alone, without another UI test creating the application first.
+        cls.app = QApplication.instance() or QApplication([])
+
     def setUp(self):
         self.path = str(Path("model.zip").resolve())
         self.info = SimpleNamespace(model_version_id="M-test", classes=("tool",))

@@ -18,7 +18,7 @@ from .native_runtime import cv2
 import numpy as np
 from PySide6.QtCore import QThread, Signal
 
-from .detection import FrameResult
+from .detection import TRACKING_RELOCATING, FrameResult
 from .engine import EngineSnapshot, Phase, SOPEngine
 from .frame_pacing import InferencePacer
 from .inference_worker import InferenceWorker, InferenceWorkerClosed
@@ -227,6 +227,7 @@ class VideoPipeline(QThread):
         self._engine: SOPEngine | None = None
         self._locator: WorkpieceLocator | None = None
         self._locator_key = ""
+        self._locator_error = ""
         self._preview_workpiece: Workpiece | None = None
         self._preview_key = ""
         self._model_generation = 0
@@ -401,15 +402,23 @@ class VideoPipeline(QThread):
 
         result = FrameResult(frame.shape[1], frame.shape[0], timestamp, detections)
         result.detection_valid = self._detector is not None
+        result.workpiece_key = self._locator_key
         if self._locator is not None:
             try:
                 tracking_load = max(inference_ms, (time.monotonic() - timestamp) * 1000) if isinstance(self._source, CameraSource) else inference_ms
                 result.workpiece_transform, result.tracking_status = self._locator.locate(
                     frame, timestamp, other_ms=tracking_load, detections=detections)
+                result.tracking_state = getattr(self._locator, "state", "")  # 沒有狀態的定位器視為外部位置
                 result.tracking_metrics = self._locator.metrics.copy()
             except Exception as exc:
                 result.workpiece_transform, result.tracking_status = None, f"位置跟隨失敗：{exc}"
-            result.workpiece_key = self._locator_key
+                result.tracking_state = TRACKING_RELOCATING
+        elif self._locator_key:
+            # 設定失敗也必須隨每幀回報同一參考的原因；否則介面只會看到「同步中」。
+            result.tracking_status = self._locator_error or "等待工件重新定位"
+            result.tracking_state = TRACKING_RELOCATING
+            result.tracking_metrics = {"state": TRACKING_RELOCATING, "valid": False,
+                                       "source": "none", "configuration_error": bool(self._locator_error)}
         stages["tracking_ms"] = (time.perf_counter() - tracking_started) * 1000
         for key, value in result.tracking_metrics.get("stages_ms", {}).items():
             stages[f"tracking_{key}_ms"] = value
@@ -554,6 +563,7 @@ class VideoPipeline(QThread):
         self._preview_key = ""
         self._locator = None
         self._locator_key = ""
+        self._locator_error = ""
         self._pending_results.clear()
         self._last_display = None
         self._last_model_display = None
@@ -641,6 +651,14 @@ class VideoPipeline(QThread):
                 self._now = time.monotonic() if isinstance(self._source, CameraSource) else self._now
             events = self._engine.start(self._now)
             self._sync_locator()              # 引擎進入作業狀態後才切換為作業中 SOP 的工件
+            if payload.requires_tracking() and self._locator is None:
+                # UI 檢查以外仍守住直接命令入口；不寫入一輪從未能開始的作業紀錄。
+                reason = self._locator_error or "尚未設定有效參考工件，請在作業區域設定工件跟隨"
+                self._engine = None
+                self._sync_locator()
+                self.error.emit(f"無法開始作業：{reason}")
+                self.engine_state.emit(False)
+                return
             self._emit_events(events, recorder)
             self.engine_state.emit(self._engine.phase != Phase.IDLE)
         elif command == "stop":
@@ -662,14 +680,17 @@ class VideoPipeline(QThread):
             key = workpiece_key(workpiece)
         else:
             workpiece, key = self._preview_workpiece, self._preview_key
-        if key == self._locator_key and (self._locator is not None or workpiece is None):
+        if key == self._locator_key and (self._locator is not None or workpiece is None
+                                        or self._locator_error):
             return
         self._locator, self._locator_key = None, key
+        self._locator_error = ""
         if workpiece is not None:
             try:
                 self._locator = WorkpieceLocator(workpiece, adaptive_budget=True)
             except (ValueError, TypeError) as exc:
-                self.status.emit(f"工件定位設定無效：{exc}")
+                self._locator_error = f"工件定位設定無效：{exc}"
+                self.status.emit(self._locator_error)
 
     def _stop_engine(self, recorder):
         if self._engine is not None and self._engine.phase != Phase.IDLE:

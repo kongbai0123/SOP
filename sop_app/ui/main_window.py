@@ -14,11 +14,12 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QGridLayout, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton,
-                               QToolBar, QWidget)
+                               QToolBar, QToolButton, QWidget)
 
 from ..model_bundle import ModelBundleError, ModelInfo, read_model_info
 from ..model_eta import ModelETA, ModelLoadProgress, model_key, stage_key
 from ..frame_pacing import InferencePacer
+from ..display_options import DISPLAY_GROUPS, DISPLAY_GROUP_LABELS, display_group_summary
 from ..native_runtime import cv2, NativeDependencyError
 from ..paths import APP_SETTINGS, MODELS_DIR, PROJECT_ROOT, RECORDS_DIR, SOPS_DIR, resolve, resolve_model
 from ..pipeline import FramePacket, VideoPipeline
@@ -28,6 +29,7 @@ from ..startup import initial_sop_path
 from .editor_page import EditorPage
 from .records_page import RecordsPage
 from .compact_layout import StatusText
+from .display_menu import DisplayCategoriesMenu
 from .run_page import RunPage
 from .workbench_widgets import PageStack, application_styles, install_readability_guard
 
@@ -272,12 +274,58 @@ class MainWindow(QMainWindow):
                                    "此設定也會影響後續紀錄截圖的色塊顯示。")
         self.mask_check.toggled.connect(self._apply_display)
         toolbar.addWidget(self.mask_check)
-        self.regions_check = QCheckBox("顯示作業區域")
-        self.regions_check.setChecked(True)
-        self.regions_check.setToolTip("顯示工作區、安裝位置等區域的框線與名稱；不影響辨識、SOP 判定及紀錄。\n"
-                                     "編輯區域、參考影像或框選時，會暫時顯示操作框線。")
-        self.regions_check.toggled.connect(self._apply_regions_display)
-        toolbar.addWidget(self.regions_check)
+        self.display_menu_button = QToolButton()
+        self.display_menu_button.setAccessibleName("畫面顯示分類")
+        self.display_menu_button.setStyleSheet(
+            "QToolButton { background: palette(button); border: 1px solid palette(mid); "
+            "border-radius: 4px; padding: 4px 7px; } "
+            "QToolButton:hover { border-color: palette(highlight); }")
+        self.display_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.display_menu = DisplayCategoriesMenu(self.display_menu_button)
+        self.display_menu.setToolTipsVisible(True)
+        heading = self.display_menu.addAction("同步套用於執行區與編輯區（可複選）")
+        heading.setEnabled(False)
+        self.display_category_actions = {}
+        tips = {
+            "operation": "工作範圍及 C1、C2、C3 等料盒區域的框線與名稱；不隨工序切換而消失。",
+            "objects": "當下實際辨識到的物件框、名稱與信心度；不篩選個別辨識類別。",
+            "installation": "左右把手、主軸等安裝區的框線與名稱；目前工序使用的位置另外加亮。",
+        }
+        for group in DISPLAY_GROUPS:
+            action = self.display_menu.addAction(DISPLAY_GROUP_LABELS[group])
+            action.setCheckable(True)
+            action.setChecked(True)
+            action.setToolTip(tips[group])
+            action.toggled.connect(self._apply_display_categories)
+            self.display_category_actions[group] = action
+        self.display_menu.addSeparator()
+        self.display_menu.addAction("全選", lambda: self._select_display_categories(DISPLAY_GROUPS))
+        self.display_menu.addAction("全部取消", lambda: self._select_display_categories(()))
+        self.display_menu_button.setMenu(self.display_menu)
+        toolbar.addWidget(self.display_menu_button)
+        self.step_display_check = QCheckBox("逐一任務")
+        self.step_display_check.setToolTip("只顯示目前工序完成與警告條件使用的物件及區域；同步套用於執行區與編輯區。")
+        self.step_display_check.toggled.connect(self._apply_step_display)
+        toolbar.addWidget(self.step_display_check)
+        self.alert_menu_button = QToolButton()
+        self.alert_menu_button.setText("警示設定 ▾")
+        self.alert_menu_button.setAccessibleName("警示設定")
+        self.alert_menu_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.alert_menu_button.setStyleSheet(self.display_menu_button.styleSheet())
+        self.alert_menu = DisplayCategoriesMenu(self.alert_menu_button)
+        self.alert_menu.setToolTipsVisible(True)
+        self.alert_actions = {}
+        for kind, label, tip in (
+                ("tracking", "追蹤提示", "顯示定位狀態與舊位置提示；關閉時不顯示失效的舊跟隨框。"),
+                ("workflow", "工序警示", "顯示工序警報、閃爍與提示音，以及編輯區試跑警示。")):
+            action = self.alert_menu.addAction(label)
+            action.setCheckable(True)
+            action.setToolTip(tip + "\n只控制提示，完成、NG 判定與事件紀錄仍照常運作。")
+            action.toggled.connect(self._apply_alert_options)
+            self.alert_actions[kind] = action
+        self.alert_menu_button.setMenu(self.alert_menu)
+        toolbar.addWidget(self.alert_menu_button)
+        self._restore_alert_options()
         toolbar.addWidget(QLabel("最低顯示信心度"))
         self.display_score = QDoubleSpinBox()
         self.display_score.setRange(0.3, 1.0)
@@ -318,6 +366,8 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(rate_controls)
         self._sync_inference_fps_preset()
         self.inference_fps_preset.currentIndexChanged.connect(self._select_inference_fps_preset)
+        self._apply_display_categories()
+        self._apply_display()
 
     # ---- 設定檔 ----------------------------------------------------------------
     def _set_station_paths(self, station):
@@ -443,6 +493,7 @@ class MainWindow(QMainWindow):
         self._sync_inference_fps_preset()
         self._request_inference_fps(self.inference_fps.value())
         self.run_page.reset_station()
+        self._restore_alert_options()
         self.run_page.blockSignals(True)
         self.run_page.set_context(self.settings.get("run_context", {}))
         self.run_page.blockSignals(False)
@@ -634,10 +685,53 @@ class MainWindow(QMainWindow):
 
     def _apply_display(self, *_args):
         self.pipeline.set_display(self.mask_check.isChecked(), self.display_score.value())
+        for page in (self.run_page, self.editor):
+            page.set_overlay_options(self.mask_check.isChecked(), self.display_score.value())
 
-    def _apply_regions_display(self, visible):
-        self.run_page.set_regions_visible(visible)
-        self.editor.set_regions_visible(visible)
+    def _apply_step_display(self, enabled):
+        for page in (self.run_page, self.editor):
+            page.set_step_display(enabled)
+
+    def _restore_alert_options(self):
+        saved = self.settings.get("alerts", {})
+        saved = saved if isinstance(saved, dict) else {}
+        for kind, default in (("tracking", False), ("workflow", True)):
+            value = saved.get(kind, default)
+            action = self.alert_actions[kind]
+            blocked = action.blockSignals(True)
+            action.setChecked(value if isinstance(value, bool) else default)
+            action.blockSignals(blocked)
+        self._apply_alert_options(persist=False)
+
+    def _apply_alert_options(self, *_args, persist=True):
+        options = {kind: action.isChecked() for kind, action in self.alert_actions.items()}
+        for page in (self.run_page, self.editor):
+            page.set_alert_options(options["tracking"], options["workflow"])
+        self.alert_menu_button.setToolTip(
+            "追蹤提示：" + ("開啟" if options["tracking"] else "關閉")
+            + "｜工序警示：" + ("開啟" if options["workflow"] else "關閉")
+            + "\n同步套用執行區與編輯區；不影響完成、NG 判定及事件紀錄。")
+        if persist:
+            self.settings["alerts"] = options
+            self._save_settings()
+
+    def _select_display_categories(self, groups):
+        selected = frozenset(groups)
+        for group, action in self.display_category_actions.items():
+            action.blockSignals(True)
+            action.setChecked(group in selected)
+            action.blockSignals(False)
+        self._apply_display_categories()
+
+    def _apply_display_categories(self, *_args):
+        groups = frozenset(group for group, action in self.display_category_actions.items() if action.isChecked())
+        for page in (self.run_page, self.editor):
+            page.set_display_groups(groups)
+        text = "全開" if len(groups) == len(DISPLAY_GROUPS) else f"已選 {len(groups)} 項" if groups else "全部隱藏"
+        self.display_menu_button.setText("畫面顯示：" + text + " ▾")
+        self.display_menu_button.setToolTip("目前顯示：" + display_group_summary(groups)
+                                            + "\n同步控制執行區與編輯區；只改預覽，不影響背景判定及紀錄。\n"
+                                              "編輯區域時會暫時顯示必要的操作框線。")
 
     def _camera_settings(self):
         if self._vision_error:

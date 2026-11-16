@@ -72,7 +72,8 @@ class AdaptiveTrackingTests(unittest.TestCase):
             actual = None
             for _ in range(6):
                 actual, _ = locator.locate(moved)
-                self.assertLessEqual(locator.metrics.get('template_candidates', 0), 6)
+                # One angle group per frame (always with 0°) × three scales.
+                self.assertLessEqual(locator.metrics.get('template_candidates', 0), 9)
                 if actual is not None:
                     break
         self.assertIsNotNone(actual)

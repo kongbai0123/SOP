@@ -1,24 +1,27 @@
-"""SOP editor: the live image in the centre with workpiece tracking under it,
-steps on the left, regions and trial on the right."""
+"""SOP editor: live image in the centre, steps on the left, and region
+creation, workpiece tracking and trial together on the right."""
 from __future__ import annotations
 
 import copy
 import time
 from dataclasses import replace
+from html import escape
 from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QEvent, Qt, QTimer, Signal
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QFrame,
                                QHBoxLayout, QLabel, QLayout, QLineEdit, QMessageBox,
-                               QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
+                               QPushButton, QScrollArea, QSizePolicy, QToolTip, QVBoxLayout, QWidget)
 from ..conditions import evaluate_conditions
-from ..engine import evaluate_step, violation_window
+from ..engine import Phase, evaluate_step, violation_window
 from ..model_bundle import ModelBundleError
 from ..model_store import import_model
 from ..paths import MODELS_DIR, PROJECT_ROOT, relativize, resolve
 from ..pipeline import FramePacket
 from ..sop_schema import CONDITION_TYPES, Condition, ROI, SOPDefinition, Step
-from ..detection import FrameResult
+from ..detection import FrameResult, TRACKING_CONFIRMED
+from ..display_options import DEFAULT_DISPLAY_GROUPS, DISPLAY_GROUPS, filter_display_rois, roi_display_group
+from ..overlay import draw_detections
 from ..tracking import WorkpieceLocator, capture_workpiece, decode_reference, display_rois, workpiece_key
 from .compact_layout import CompactLog, relayout_now, set_state, text_label
 from .condition_rows import ConditionRows
@@ -89,6 +92,20 @@ class ROIEditorRow(QFrame):
         self.anchor_combo.addItem("固定畫面", "fixed")
         self.anchor_combo.addItem("跟隨工件", "workpiece")
         self.anchor_combo.setCurrentIndex(max(0, self.anchor_combo.findData(roi.anchor)))
+        self.anchor_combo.setToolTip("選擇此區域使用固定畫面座標，或跟隨已框選的參考工件。切換結果會顯示在本列。")
+        self.anchor_feedback = text_label()
+        self.anchor_feedback.setAccessibleName(f"{roi.name} 定位切換回饋")
+        self.set_anchor_feedback("目前設定：跟隨工件。即時定位狀態請看「作業區域」內的跟隨狀態。"
+                                 if roi.anchor == "workpiece" else "", "neutral")
+        self.anchor_setup_button = QPushButton("設定參考工件")
+        self.anchor_setup_button.hide()
+        self.display_group_combo = QComboBox()
+        self.display_group_combo.setAccessibleName("區域顯示分類")
+        self.display_group_combo.addItem("自動分類", "auto")
+        self.display_group_combo.addItem("操作區", "operation")
+        self.display_group_combo.addItem("安裝位置", "installation")
+        self.display_group_combo.setCurrentIndex(max(0, self.display_group_combo.findData(roi.display_group)))
+        self.display_group_combo.setToolTip("只決定上方「畫面顯示」的分類；不改變定位方式或條件判定。")
         self.status_text = ""
         self.edit_button = QPushButton("移動／縮放")
         self.duplicate_button = QPushButton("複製")
@@ -110,18 +127,28 @@ class ROIEditorRow(QFrame):
         layout.setContentsMargins(0, 4, 0, 5)
         layout.setSpacing(3)
         layout.addLayout(top)
+        layout.addWidget(self.anchor_feedback)
+        layout.addWidget(self.anchor_setup_button)
+        layout.addWidget(self.display_group_combo)
         layout.addWidget(self.actions_row)
         self.set_status("本幀 —")
 
     def set_editing(self, editing):
         self.anchor_combo.setVisible(editing)
+        self.display_group_combo.setVisible(editing)
         self.actions_row.setVisible(editing)
 
     def set_status(self, text):
         """This frame's state of the region is a tooltip on the row."""
         self.status_text = text
         anchor = "跟隨工件" if self.roi.anchor == "workpiece" else "固定畫面"
-        self.setToolTip(f"{self.roi.name}（{anchor}）\n{text}")
+        category = "安裝位置" if roi_display_group(self.roi) == "installation" else "操作區"
+        self.setToolTip(f"{self.roi.name}（{anchor}）\n顯示分類：{category}\n{text}")
+
+    def set_anchor_feedback(self, text, state):
+        self.anchor_feedback.setText(text)
+        set_state(self.anchor_feedback, state)
+        self.anchor_feedback.setVisible(bool(text))
 
 
 class EditorPage(QWidget):
@@ -146,15 +173,31 @@ class EditorPage(QWidget):
         self._last_live_preview_at = None
         self._locator = self._reference_frame = None
         self._workpiece_key = ""
-        # Only image arrays and their exact pose are retained while selecting a
-        # frame. FramePacket can own detection tensors and must not be cached.
+        # Frame selection retains pixels, their exact pose, and presentation
+        # data only; no packet/result can be revived as trial evidence.
         self._latest_frame = self._latest_preview = self._latest_matrix = None
+        # Presentation-only owners: each detection set always belongs to the
+        # exact raw pixels it accompanied, including a frozen live image.
+        self._latest_overlay = self._shown_overlay = None
+        self._display_groups = DEFAULT_DISPLAY_GROUPS
+        self._step_display = False
+        self._show_tracking_alerts = True
+        self._show_workflow_alerts = True
+        self._shown_step_display_scope = None
+        self._overlay_show_masks = self._overlay_min_score = None
         self._latest_arrived_at = None
         self._latest_key = ""
+        self._latest_tracking_state = ""
         self._edit_frame = self._edit_matrix = None
         self._edit_frame_kind = self._edit_key = ""
         self._capture_target = False
+        self._target_frame = self._target_original = None
+        self._target_refresh_matrix = None
+        self._target_source_key = ""
+        self._pending_region_anchor = None
         self._regions_visible = True
+        self._active_alert_regions = set()
+        self._roi_anchor_feedback = {}  # UI-only last attempt, tied to this exact ROI and anchor.
         self._roi_undo, self._roi_redo = [], []
         self._selected_roi_name = self._highlighted_condition_roi = None
         self._model_state, self._model_detail = "unselected", ""
@@ -246,7 +289,12 @@ class EditorPage(QWidget):
         self.live_button = QPushButton("返回即時影像")
         self.live_button.clicked.connect(self._return_live)
         self.target_button = QPushButton("框選參考工件")
+        self.target_button.setToolTip("已有跟隨區域時，會在同一張原始參考照片重新框選工件；既有區域與工序條件會保留。")
         self.target_button.clicked.connect(self._begin_target)
+        self.refresh_reference_button = QPushButton("更新參考影像")
+        self.refresh_reference_button.setToolTip("使用當前已確認的位置更新參考照片，並將既有跟隨區域轉到新照片座標；名稱與工序條件會保留。")
+        self.refresh_reference_button.clicked.connect(self._begin_reference_refresh)
+        self.reference_update_label = text_label("等待已確認的即時位置，才可安全更新參考影像。", "mutedLabel")
         self.clear_target_button = QPushButton("清除工件跟隨")
         self.clear_target_button.clicked.connect(lambda: self._clear_workpiece())
         self.reference_button = QPushButton("編輯跟隨區域")
@@ -260,9 +308,9 @@ class EditorPage(QWidget):
         tracking = QVBoxLayout(self.tracking_tools)
         tracking.setContentsMargins(6, 3, 6, 3)
         tracking.setSpacing(3)
-        tracking.addWidget(flow_row(section_title("工件跟隨"), self.target_button,
-                                    self.reference_button, self.clear_target_button, spacing=6))
-        tracking.addWidget(self.tracking_label)
+        tracking.addWidget(flow_row(self.target_button,
+                                    self.refresh_reference_button, self.reference_button, self.clear_target_button, spacing=6))
+        tracking.addWidget(self.reference_update_label)
         self.retake_frame_button = QPushButton("重新取景")
         self.retake_frame_button.clicked.connect(self._retake_following_frame)
         self.use_frame_button = QPushButton("使用這一幀")
@@ -279,6 +327,7 @@ class EditorPage(QWidget):
         frame_tools.addWidget(self.following_frame_label)
         self.following_frame_tools.hide()
         tracking.addWidget(self.following_frame_tools)
+        self.tracking_tools.hide()
         self.view_bar = QWidget()
         bar = QHBoxLayout(self.view_bar)
         bar.setContentsMargins(0, 0, 0, 0)
@@ -292,7 +341,6 @@ class EditorPage(QWidget):
         self.center_layout.setContentsMargins(0, 0, 0, 0)
         self.center_layout.setSpacing(4)
         self.center_layout.addWidget(self.video, 1)
-        self.center_layout.addWidget(self.tracking_tools)
         self.center_layout.addWidget(self.view_bar)
         self.center_layout.addWidget(self.guide_label)
         return pane
@@ -302,13 +350,25 @@ class EditorPage(QWidget):
         self.draw_button = QPushButton("新增區域")
         self.draw_button.setCheckable(True)
         self.draw_button.toggled.connect(self._toggle_draw)
+        self.region_anchor_combo = QComboBox()
+        self.region_anchor_combo.setAccessibleName("新增區域定位方式")
+        self.region_anchor_combo.addItem("固定畫面", "fixed")
+        self.region_anchor_combo.addItem("跟隨工件", "workpiece")
+        self.region_anchor_combo.setToolTip("選擇定位方式後直接新增；跟隨區域所需的參考工件會在此處引導設定。")
+        self.region_anchor_combo.currentIndexChanged.connect(self._region_creation_anchor_changed)
         self.undo_roi_button, self.redo_roi_button = QPushButton("復原區域"), QPushButton("重作區域")
         self.undo_roi_button.clicked.connect(self._undo_roi)
         self.redo_roi_button.clicked.connect(self._redo_roi)
         self.edit_rois_button = QPushButton("編輯區域")
         self.edit_rois_button.setCheckable(True)
         self.edit_rois_button.toggled.connect(self._set_rois_editing)
-        self.region_tools = flow_row(self.draw_button, self.edit_rois_button, self.live_button, spacing=4)
+        self.region_tools = flow_row(self.region_anchor_combo, self.draw_button,
+                                     self.edit_rois_button, self.live_button, spacing=4)
+        self.region_creation_label = text_label("選擇固定畫面或跟隨工件，再按「新增區域」；所有設定都在此處完成。", "mutedLabel")
+        self.tracking_settings_button = QPushButton("展開跟隨設定")
+        self.tracking_settings_button.setToolTip("在作業區域內設定參考工件、編輯跟隨區域或調整取景。")
+        self.tracking_settings_button.setCheckable(True)
+        self.tracking_settings_button.toggled.connect(self._toggle_tracking_settings)
         self.roi_edit_toolbar = flow_row(self.undo_roi_button, self.redo_roi_button, spacing=4)
         self.roi_edit_note = text_label("可修改定位方式、移動／縮放、複製或刪除區域；復原／重作會保留區域與條件的引用。", "mutedLabel")
         self.roi_edit_toolbar.hide()
@@ -321,7 +381,9 @@ class EditorPage(QWidget):
         self.empty_rois_label = text_label("尚未建立作業區域；條件可使用整個畫面。", "mutedLabel")
         self.roi_status = text_label("尚未建立作業區域。", "mutedLabel")
         self.roi_status.hide()  # per-region status is shown in each row
-        self.regions_panel = panel(self.region_tools, self.roi_edit_toolbar,
+        self.regions_panel = panel(self.region_tools, self.region_creation_label,
+                                   self.tracking_label, self.tracking_settings_button, self.tracking_tools,
+                                   self.roi_edit_toolbar,
                                    self.roi_edit_note, rows, self.empty_rois_label)
         regions = titled("作業區域", self.regions_panel)
 
@@ -459,6 +521,11 @@ class EditorPage(QWidget):
         metrics_layout.setContentsMargins(0, 0, 0, 0)
         self.validation_count, self.validation_elapsed, self.validation_ratio = (
             text_label(), text_label(), text_label())
+        self.validation_count.setTextFormat(Qt.TextFormat.RichText)
+        self.validation_count.setTextInteractionFlags(Qt.TextInteractionFlag.LinksAccessibleByMouse |
+                                                      Qt.TextInteractionFlag.LinksAccessibleByKeyboard)
+        self.validation_count.linkActivated.connect(self._show_validation_reasons)
+        self._validation_reason_popup_text = ""
         for label in (self.validation_count, self.validation_elapsed, self.validation_ratio):
             metrics_layout.addWidget(label, 1)
         self.validation_details = CompactLog()
@@ -588,6 +655,7 @@ class EditorPage(QWidget):
     # ---- SOP ---------------------------------------------------------------
     def set_sop(self, sop):
         self.step_settings.close()
+        self._roi_anchor_feedback.clear()
         self._last_live_preview_at = None
         self._validation.stop()
         self._validation = EditorValidation()
@@ -616,13 +684,16 @@ class EditorPage(QWidget):
         if sop.workpiece:
             try:
                 self._reference_frame = decode_reference(sop.workpiece)
-                self._locator = WorkpieceLocator(sop.workpiece)
+                self._locator = WorkpieceLocator(sop.workpiece, adaptive_budget=True)
                 self.tracking_label.setText("已設定工件跟隨；即時影像可檢查定位狀態。")
             except ValueError as exc:
-                self.tracking_label.setText(str(exc))
+                recovery = ("請按「框選參考工件」，在原始照片重框含接頭、孔位或文字的完整工件；既有區域與條件會保留。"
+                            if self._reference_frame is not None else
+                            "原始照片無法讀取；請先明確清除工件跟隨設定，再使用新照片設定。")
+                self.tracking_label.setText(f"參考工件無效：{exc}。{recovery}")
         else:
             self.tracking_label.setText("尚未設定工件跟隨；區域使用固定畫面座標。")
-        self.reference_button.setEnabled(self._locator is not None)
+        self.reference_button.setEnabled(self._reference_frame is not None)
         self.cycle_enabled_switch.setChecked(sop.cycle.enabled)
         self.auto_restart_spin.setValue(sop.cycle.auto_restart_sec)
         self.reset_hold_spin.setValue(sop.cycle.reset_hold_sec)
@@ -758,6 +829,7 @@ class EditorPage(QWidget):
         row = self._step_index(target) if target is not None else old
         self.validation_step.setCurrentIndex(min(max(0, row), len(self.sop.steps) - 1))
         self.validation_step.blockSignals(False)
+        self._refresh_step_display()
 
     def _current_step(self):
         row = self.validation_step.currentIndex()
@@ -831,7 +903,9 @@ class EditorPage(QWidget):
         set_state(self.setup_summary, "warning" if invalid or self._model_state == "failed" else "neutral")
         self.model_state_label.setText(f"{model}" + (f"：{self._model_detail}" if self._model_detail else ""))
         set_state(self.model_state_label, {"available": "ok", "failed": "ng", "loading": "running"}.get(self._model_state, "neutral"))
-        self.clear_target_button.setEnabled(self.sop.workpiece is not None)
+        self.clear_target_button.setEnabled(self.sop.workpiece is not None
+                                           or any(r.anchor == "workpiece" for r in self.sop.rois))
+        self._refresh_reference_update_availability()
 
     def _refresh_options(self):
         names = [roi.name for roi in self.sop.rois]
@@ -842,25 +916,127 @@ class EditorPage(QWidget):
             self.reset_table.set_conditions(self.sop.cycle.reset_conditions)
 
     # ---- live preview ------------------------------------------------------
+    def _step_display_sets(self):
+        """Read the active engine's scope without changing any judgement input."""
+        sop, snapshot = self.sop, None
+        if self._production_running:
+            snapshot = self._packet.snapshot if self._packet is not None else None
+        elif self._validation.running and self._validation.engine is not None:
+            sop = self._validation.engine.sop
+            snapshot = self._validation.engine.snapshot()
+        else:
+            step = self._current_step()
+            conditions = step.conditions + step.forbidden if step is not None else []
+            return ({condition.roi for condition in conditions if condition.roi},
+                    {condition.label for condition in conditions if condition.label})
+        if snapshot is not None and snapshot.phase == Phase.CYCLE_DONE:
+            conditions = sop.cycle.reset_conditions if sop.cycle.enabled else []
+        else:
+            index = snapshot.current_index if snapshot is not None and snapshot.phase == Phase.RUNNING else 0
+            step = sop.steps[index] if 0 <= index < len(sop.steps) else None
+            conditions = step.conditions + step.forbidden if step is not None else []
+        return ({condition.roi for condition in conditions if condition.roi},
+                {condition.label for condition in conditions if condition.label})
+
+    def _refresh_step_display(self):
+        if not self._step_display:
+            return
+        regions, labels = self._step_display_sets()
+        scope = (frozenset(regions), frozenset(labels))
+        if scope != self._shown_step_display_scope:
+            self._shown_step_display_scope = scope
+            self._redraw_display_frame()
+            self._refresh_video_rois()
+
+    def set_step_display(self, enabled):
+        self._step_display = bool(enabled)
+        self._shown_step_display_scope = None
+        self._redraw_display_frame()
+        self._refresh_video_rois()
+
+    @staticmethod
+    def _packet_overlay(packet):
+        # Keep neither FramePacket nor FrameResult in this presentation cache:
+        # returning from reference editing must not revive trial evidence.
+        return (packet.frame, tuple(packet.result.detections), tuple(packet.classes),
+                packet.min_score, packet.show_masks, packet.model_display)
+
+    def _show_overlay(self, overlay):
+        if overlay is None:
+            return
+        self._shown_overlay = overlay
+        frame, detections, classes, packet_score, packet_masks, model_display = overlay
+        if self._step_display:
+            regions, labels = self._step_display_sets()
+            self._shown_step_display_scope = (frozenset(regions), frozenset(labels))
+            detections = tuple(detection for detection in detections if detection.label in labels)
+        if "objects" in self._display_groups:
+            score = packet_score if self._overlay_min_score is None else self._overlay_min_score
+            masks = packet_masks if self._overlay_show_masks is None else self._overlay_show_masks
+            if (not self._step_display and model_display is not None
+                    and score == packet_score and masks == packet_masks):
+                frame = model_display
+            else:
+                frame = draw_detections(frame, detections, classes, min_score=score, show_masks=masks)
+        self.video.set_frame(frame)
+
+    def _show_latest_preview(self):
+        if self._latest_overlay is not None:
+            self._show_overlay(self._latest_overlay)
+
+    def _redraw_display_frame(self):
+        # Reference and workpiece-capture modes deliberately show raw pixels.
+        # New packets may arrive while frozen; only redraw the shown owner.
+        if not self.reference_button.isChecked() and not self._capture_target:
+            self._show_overlay(self._shown_overlay)
+
+    def set_display_groups(self, groups):
+        self._display_groups = frozenset(groups).intersection(DISPLAY_GROUPS)
+        self._regions_visible = True
+        self._redraw_display_frame()
+        self._refresh_video_rois()
+
+    def set_overlay_options(self, show_masks, min_score):
+        self._overlay_show_masks = bool(show_masks)
+        self._overlay_min_score = float(min_score)
+        self._redraw_display_frame()
+
+    def set_alert_options(self, show_tracking: bool, show_workflow: bool):
+        """Change presentation only; keep the trial's decisions and alert state."""
+        self._show_tracking_alerts = bool(show_tracking)
+        self._show_workflow_alerts = bool(show_workflow)
+        self._refresh_tracking_hint_visibility()
+        self._update_validation_view()
+
+    def _refresh_tracking_hint_visibility(self):
+        # An invalid setup still needs an explanation when the user edits it.
+        configuration_error = self.sop.workpiece is not None and self._locator is None
+        self.tracking_label.setVisible(self._show_tracking_alerts or configuration_error)
+
     def on_packet(self, packet):
         result = self._tracked(packet.result)
         # Pipeline source reads hand over a new array and overlays draw on a
         # copy. Keep those owners here; copy full pixels only when freezing.
         self._latest_frame, self._latest_preview = packet.frame, packet.preview_display
+        self._latest_overlay = self._packet_overlay(packet)
         self._latest_arrived_at = time.monotonic()
         self._latest_key = result.workpiece_key
-        self._latest_matrix = self._valid_edit_matrix(result.workpiece_transform)
+        self._latest_tracking_state = result.tracking_state
+        self._latest_matrix = self._valid_edit_matrix(result.confirmed_transform)
+        self._refresh_reference_update_availability()
         if self.reference_button.isChecked():
             if self._edit_frame_kind == "selecting":
                 self._show_following_selection()
             return
+        if self._capture_target:
+            return  # Frozen reference capture owns its exact raw frame and pose.
         if not self.freeze_check.isChecked() or self._packet is None:
             self._packet_arrived_at = time.monotonic()
             self._packet = packet
             self._preview_result = result
             if self._locator:
                 self.tracking_label.setText(self._preview_result.tracking_status)
-            self.video.set_frame(packet.preview_display)
+            self._show_overlay(self._latest_overlay)
             self._refresh_video_rois()
             if self._validation.running:
                 try:
@@ -907,6 +1083,7 @@ class EditorPage(QWidget):
         return "單幀預覽：" + " · ".join(parts), state
 
     def _update_live(self):
+        self._refresh_reference_update_availability()
         available = self._packet is not None and self._preview_result is not None and not self.reference_button.isChecked()
         if not available:
             text = "參考影像編輯中；返回即時影像後顯示判定。" if self.reference_button.isChecked() else "單幀預覽：等待影像"
@@ -956,6 +1133,7 @@ class EditorPage(QWidget):
     def set_production_running(self, running):
         self._production_running = bool(running)
         if running:
+            self._return_live()
             self.step_settings.close()
         self.step_settings.setEnabled(not running)
         if running and self._image_focus:
@@ -972,8 +1150,77 @@ class EditorPage(QWidget):
         self.guide_label.setText("正式監控執行中，工序設定與試跑已鎖定。" if running else "正式監控已停止，可編輯設定並試跑。")
         self._refresh_video_rois()
         self._update_validation_view()
+        self._refresh_reference_update_availability()
 
     # ---- regions -----------------------------------------------------------
+    def _toggle_tracking_settings(self, expanded):
+        self.tracking_tools.setVisible(expanded)
+        self.tracking_settings_button.setText("收起跟隨設定" if expanded else "展開跟隨設定")
+
+    def _set_region_guide(self, text):
+        self.region_creation_label.setText(text)
+        self.guide_label.setText(text)
+
+    def _set_region_draw_state(self, enabled):
+        """Change the internal drawing stage without treating it as a user cancel."""
+        blocked = self.draw_button.blockSignals(True)
+        self.draw_button.setChecked(enabled)
+        self.draw_button.blockSignals(blocked)
+        self.video.set_draw_mode(enabled)
+
+    def _region_creation_anchor_changed(self, _index):
+        if self._pending_region_anchor or self._capture_target or self.reference_button.isChecked() or self.draw_button.isChecked():
+            self._return_live()
+        anchor = self.region_anchor_combo.currentData()
+        self._set_region_guide("已選跟隨工件；按「新增區域」即可框選，缺少參考工件時會在此處引導設定。"
+                               if anchor == "workpiece" else "已選固定畫面；按「新增區域」直接框選固定區域。")
+
+    def _start_region_creation(self, anchor):
+        """Create in one place; tracking setup is a guided stage, not a prerequisite mode."""
+        if self._production_running or anchor not in ("fixed", "workpiece"):
+            self._pending_region_anchor = None
+            self._set_region_draw_state(False)
+            self._set_region_guide("請先停止正式作業，再新增區域。" if self._production_running else "請選擇有效的區域定位方式。")
+            return False
+        blocked = self.region_anchor_combo.blockSignals(True)
+        self.region_anchor_combo.setCurrentIndex(self.region_anchor_combo.findData(anchor))
+        self.region_anchor_combo.blockSignals(blocked)
+        if anchor == "fixed":
+            if self.reference_button.isChecked() or self._capture_target:
+                self._return_live()
+            self._pending_region_anchor = None
+            if self._packet is None:
+                self._set_region_draw_state(False)
+                self._set_region_guide("請先連線影像來源，等待即時影像後再新增固定區域。")
+                return False
+            self.freeze_check.setChecked(True)
+            self._set_region_draw_state(True)
+            self._refresh_video_rois()
+            self._focus_image()
+            self._set_region_guide("直接拖曳框選固定區域，放開後可在此處命名；按「返回即時影像」結束。")
+            return True
+        self._pending_region_anchor = "workpiece"
+        self.tracking_settings_button.setChecked(True)
+        if self._locator is None or self._reference_frame is None:
+            self._begin_target()
+            if not self._capture_target:
+                self._pending_region_anchor = None
+                self._set_region_draw_state(False)
+                return False
+            if self._target_original is None:
+                self._set_region_guide("先拖曳框住參考工件，接著直接框選跟隨區域；按「返回即時影像」可取消。")
+            return True
+        self.reference_button.setChecked(True)
+        if not self._following_edit_ready():
+            self._set_region_draw_state(False)
+            self._set_region_guide("等待有效工件定位；在此處按「使用這一幀」，或明確選「使用原始參考影像」後即可框選。按「返回即時影像」可取消。")
+            return False
+        self._set_region_draw_state(True)
+        self._refresh_video_rois()
+        self._focus_image()
+        self._set_region_guide("已固定有效定位畫面，請直接拖曳框選跟隨區域；按「返回即時影像」結束。")
+        return True
+
     def _set_rois_editing(self, editing):
         self._editing_rois = bool(editing)
         self.edit_rois_button.setText("完成編輯" if editing else "編輯區域")
@@ -982,16 +1229,31 @@ class EditorPage(QWidget):
         for row in self.roi_rows:
             row.set_editing(editing)
         if not editing:
+            self._pending_region_anchor = None
+            if self._capture_target:
+                self._return_live()
             self.draw_button.setChecked(False)
         self._refresh_video_rois()
 
     def _refresh_roi_rows(self):
         self._clear_layout(self.rois_layout)
         self.roi_rows = []
+        live_rois = {id(roi): roi for roi in self.sop.rois}
+        self._roi_anchor_feedback = {
+            key: record for key, record in self._roi_anchor_feedback.items()
+            if live_rois.get(key) is record[0] and record[0].anchor == record[1]
+        }
         for roi in self.sop.rois:
             row = ROIEditorRow(roi)
+            feedback = self._roi_anchor_feedback.get(id(roi))
+            if feedback is not None:
+                row.set_anchor_feedback(feedback[2], feedback[3])
+                row.anchor_setup_button.setVisible(feedback[3] == "warning" and self._locator is None)
+            row.anchor_setup_button.clicked.connect(self._setup_reference_from_region)
             row.name_edit.editingFinished.connect(lambda r=roi, w=row: self._rename_roi(r, w.name_edit.text()))
             row.anchor_combo.currentIndexChanged.connect(lambda _index, r=roi, w=row: self._change_roi_anchor(r, w.anchor_combo.currentData()))
+            row.display_group_combo.currentIndexChanged.connect(
+                lambda _index, r=roi, w=row: self._change_roi_display_group(r, w.display_group_combo.currentData()))
             row.edit_button.clicked.connect(lambda _checked=False, r=roi: self._begin_roi_edit(r))
             row.duplicate_button.clicked.connect(lambda _checked=False, r=roi: self._duplicate_roi(r))
             row.delete_button.clicked.connect(lambda _checked=False, r=roi: self._delete_roi(r))
@@ -1004,6 +1266,10 @@ class EditorPage(QWidget):
         self._refresh_video_rois()
         self._refresh_step_summaries()
         self._update_live()
+
+    def _setup_reference_from_region(self):
+        self.tracking_settings_button.setChecked(True)
+        self._begin_target()
 
     def _selected_roi(self):
         return next((roi for roi in self.sop.rois if roi.name == self._selected_roi_name), None)
@@ -1024,27 +1290,46 @@ class EditorPage(QWidget):
 
     def _refresh_video_rois(self):
         selected = self._selected_roi_name or self._highlighted_condition_roi
-        if self.reference_button.isChecked():
+        source_rois = self.sop.rois
+        if self._capture_target and self._target_source_key:
+            matrix = self._target_refresh_matrix
+        elif self.reference_button.isChecked():
             matrix = (self._edit_matrix if self._edit_frame_kind in ("latest", "reference")
                       and self._edit_key == self._workpiece_key else
                       self._latest_matrix if self._edit_frame_kind == "selecting"
                       and self._latest_following_frame_valid() else None)
-            rois = display_rois([roi for roi in self.sop.rois if roi.anchor == "workpiece"], matrix)
+            source_rois = [roi for roi in source_rois if roi.anchor == "workpiece"]
         else:
             # Returning from editing restores the latest preview immediately,
             # but no detection result is revived for evaluation or trials.
-            matrix = (self._preview_result.workpiece_transform if self._preview_result else
+            matrix = (self._preview_result.confirmed_transform if self._preview_result else
                       self._latest_matrix if not self.freeze_check.isChecked()
                       and self._latest_following_frame_valid() else None)
-            rois = display_rois(self.sop.rois, matrix)
-        used = {c.roi for c in self._all_conditions() if c.roi}
+        visible_rois = filter_display_rois(source_rois, self._display_groups) if self._regions_visible else []
+        if self._step_display:
+            current, _labels = self._step_display_sets()
+            visible_rois = [roi for roi in visible_rois if roi.name in current]
+        editing = (self._editing_rois or self.reference_button.isChecked()
+                   or self.draw_button.isChecked() or self._capture_target)
+        if editing and not self._production_running:
+            # A hidden category must not make the region being edited
+            # impossible to see. Reveal that region only, until editing ends.
+            selected_roi = next((roi for roi in source_rois if roi.name == selected), None)
+            if selected_roi is not None and selected_roi not in visible_rois:
+                visible_rois.append(selected_roi)
+        for roi in source_rois:
+            if (self._show_workflow_alerts and roi.name in self._active_alert_regions
+                    and roi not in visible_rois):
+                visible_rois.append(roi)
+        rois = display_rois(visible_rois, matrix)
+        used = (self._step_display_sets()[0] if self._step_display else
+                {c.roi for c in self._all_conditions() if c.roi})
         self.video.set_rois(rois, used, selected)
-        self.video.set_regions_visible(self._regions_visible or self._editing_rois
-                                       or self.reference_button.isChecked() or self.draw_button.isChecked()
-                                       or self._capture_target)
+        self.video.set_regions_visible(bool(visible_rois) or editing)
+        visible_names = {roi.name for roi in visible_rois}
         editable = [r.name for r in self.sop.rois if
-                    (r.anchor == "workpiece" and self._following_edit_ready()) or
-                    (r.anchor == "fixed" and self.freeze_check.isChecked() and not self.reference_button.isChecked())]
+                    r.name in visible_names and ((r.anchor == "workpiece" and self._following_edit_ready()) or
+                    (r.anchor == "fixed" and self.freeze_check.isChecked() and not self.reference_button.isChecked()))]
         self.video.set_editable(editable if self._editing_rois and not self._capture_target and not self._production_running else [])
 
     def set_regions_visible(self, visible):
@@ -1181,7 +1466,7 @@ class EditorPage(QWidget):
         self._remember_roi()
         names = {r.name for r in self.sop.rois}
         name = next(f"{roi.name}（副本{i}）" for i in range(1, 10000) if f"{roi.name}（副本{i}）" not in names)
-        clone = ROI(name, list(roi.points), roi.anchor)
+        clone = replace(roi, name=name, points=list(roi.points))
         self.sop.rois.append(clone)
         self._selected_roi_name = name
         self._refresh_roi_rows()
@@ -1213,51 +1498,108 @@ class EditorPage(QWidget):
         self._refresh_options()
         self._mark_modified()
 
+    def _change_roi_display_group(self, roi, group):
+        if self._production_running or group not in ("auto", "operation", "installation"):
+            return
+        if not any(candidate is roi for candidate in self.sop.rois) or group == roi.display_group:
+            return
+        self._remember_roi()
+        roi.display_group = group
+        row = next((row for row in self.roi_rows if row.roi is roi), None)
+        if row is not None:
+            row.set_status(row.status_text)
+        self._refresh_video_rois()
+        self._mark_modified()
+
+    def _set_roi_anchor_feedback(self, roi, text, state):
+        self._roi_anchor_feedback[id(roi)] = (roi, roi.anchor, text, state)
+        row = next((row for row in self.roi_rows if row.roi is roi), None)
+        if row is not None:
+            # A rejected selection stays on the same row and restores its
+            # actual value without emitting another selection attempt.
+            blocked = row.anchor_combo.blockSignals(True)
+            row.anchor_combo.setCurrentIndex(row.anchor_combo.findData(roi.anchor))
+            row.anchor_combo.blockSignals(blocked)
+            row.set_anchor_feedback(text, state)
+            row.anchor_setup_button.setVisible(state == "warning" and self._locator is None)
+            self.tools_scroll.ensureWidgetVisible(row.anchor_feedback)
+
     def _change_roi_anchor(self, roi, anchor):
+        if not any(candidate is roi for candidate in self.sop.rois):
+            return False
         if anchor == roi.anchor:
-            return
-        matrix = self._preview_result.workpiece_transform if self._preview_result else None
-        if self._locator is None or matrix is None or self.freeze_check.isChecked() or self.reference_button.isChecked():
-            self.guide_label.setText("變更定位方式需先設定有效參考工件，返回即時影像並等待定位穩定；目前設定已保留。")
-            self._refresh_roi_rows()
-            return
+            return True
+
+        def reject(reason, action):
+            current = "跟隨工件" if roi.anchor == "workpiece" else "固定畫面"
+            self._set_roi_anchor_feedback(roi, f"未切換（仍為{current}）：{reason}\n{action}", "warning")
+            self.guide_label.setText(f"{roi.name}：{reason} {action} 原設定已保留。")
+            return False
+
+        if self._production_running:
+            return reject("正式作業正在執行。", "請先停止作業，再切換定位方式。")
+        if anchor not in ("fixed", "workpiece"):
+            return reject("定位方式無效。", "請選擇「固定畫面」或「跟隨工件」。")
+        if self.reference_button.isChecked():
+            return reject("正在編輯參考影像／跟隨區域。", "請按「返回即時影像」，等待定位正常後再選。")
+        if self.freeze_check.isChecked() or self._capture_target:
+            return reject("畫面已凍結。", "請按「返回即時影像」，等待定位正常後再選。")
+        if self._locator is None:
+            reason = "參考工件尚未有效設定。" if self.sop.workpiece else "尚未設定參考工件。"
+            return reject(reason, "請按本列「設定參考工件」，依此處引導完成後返回即時影像，再切換。")
+        if self._preview_result is None:
+            return reject("尚無即時影像的定位結果。", "請連線影像來源，等待即時影像與定位正常後再選。")
+        raw_matrix = self._preview_result.confirmed_transform
+        matrix = self._valid_edit_matrix(raw_matrix)
+        if matrix is None:
+            return reject("目前工件定位失敗或定位資料無效。",
+                          "請讓參考工件完整入鏡，依「作業區域」內的跟隨狀態提示調整，等待定位正常後再選。")
         transform = matrix
         if anchor == "workpiece":
             try:
                 transform = np.linalg.inv(np.vstack([matrix, [0, 0, 1]]))[:2]
             except np.linalg.LinAlgError:
-                self.guide_label.setText("目前定位無效，請等待重新定位。")
-                self._refresh_roi_rows()
-                return
-        points = np.asarray(roi.points) @ transform[:, :2].T + transform[:, 2]
+                return reject("目前定位資料無法轉換座標。", "請等待工件重新定位正常後再選。")
+        try:
+            points = np.asarray(roi.points) @ transform[:, :2].T + transform[:, 2]
+        except (TypeError, ValueError):
+            return reject("區域座標無效。", "請重新框選此區域後再選。")
         if not np.isfinite(points).all() or np.any(points < 0) or np.any(points > 1):
-            self.guide_label.setText("轉換後的區域超出有效影像範圍；原設定已保留，請調整工件或區域位置後再試。")
-            self._refresh_roi_rows()
-            return
+            return reject("轉換後的區域超出有效影像範圍。", "請調整工件或區域位置，讓整個區域位於有效範圍內後再選。")
         self._remember_roi()
         roi.points = [tuple(p) for p in points]
         roi.anchor = anchor
+        text = ("已啟用跟隨工件。\n即時定位狀態請看「作業區域」內的跟隨狀態。" if anchor == "workpiece"
+                else "已切換為固定畫面。")
+        self._set_roi_anchor_feedback(roi, text, "ok")
         self._refresh_roi_rows()
         self._update_live()
         self._mark_modified()
+        self.guide_label.setText(f"{roi.name}：已切換為{'跟隨工件' if anchor == 'workpiece' else '固定畫面'}；儲存 SOP 後保留此設定。")
+        return True
 
     def _toggle_draw(self, enabled):
-        if enabled and (self._production_running or
-                        (self.reference_button.isChecked() and not self._following_edit_ready())):
-            self.draw_button.setChecked(False)
-            self.guide_label.setText("請先按「使用這一幀」固定有效定位畫面，或選用「使用原始參考影像」。")
+        if not enabled:
+            self._pending_region_anchor = None
+            if self._capture_target:
+                self._return_live()
+            self.video.set_draw_mode(False)
+            self._refresh_video_rois()
             return
-        if enabled and not self._capture_target and not self.reference_button.isChecked():
-            if self._packet is None:
-                self.draw_button.setChecked(False)
-                self.guide_label.setText("請先連線影像來源，才能框選區域。")
-                return
-            self.freeze_check.setChecked(True)
-        self.video.set_draw_mode(enabled)
+        if self._production_running:
+            self._start_region_creation(self.region_anchor_combo.currentData())
+            return
+        if not self._capture_target and not self.reference_button.isChecked():
+            self._start_region_creation(self.region_anchor_combo.currentData())
+            return
+        if self.reference_button.isChecked() and not self._following_edit_ready():
+            self._set_region_draw_state(False)
+            self._set_region_guide("請在此處按「使用這一幀」固定有效定位畫面，或選「使用原始參考影像」。")
+            return
+        self.video.set_draw_mode(True)
         self._refresh_video_rois()
-        if enabled:
-            self._focus_image()
-            self.guide_label.setText("畫面已暫停並放大。拖曳框選區域，放開後在「作業區域」直接修改名稱；完成後按「返回即時影像」。")
+        self._focus_image()
+        self._set_region_guide("畫面已暫停並放大。拖曳框選區域，放開後在此處修改名稱；完成後按「返回即時影像」。")
 
     def _on_freeze(self, frozen):
         self._last_live_preview_at = None
@@ -1265,38 +1607,64 @@ class EditorPage(QWidget):
             self._invalidate_validation("畫面已凍結，請返回即時後重新試跑")
         else:
             self._capture_target = False
-            self.draw_button.setChecked(False)
+            self._target_frame = self._target_original = None
+            self._target_refresh_matrix, self._target_source_key = None, ""
+            if not self.reference_button.isChecked():
+                self._pending_region_anchor = None
+            self._set_region_draw_state(False)
             self.target_button.setText("框選參考工件")
             self._packet = self._preview_result = self._packet_arrived_at = None
             if not self.reference_button.isChecked() and self._latest_preview is not None:
-                self.video.set_frame(self._latest_preview)
+                self._show_latest_preview()
             self._release_auto_focus()
         self._refresh_video_rois()
+
+        self._refresh_reference_update_availability()
 
     def _on_roi_drawn(self, points):
         if self._production_running:
             return
-        self.draw_button.setChecked(False)
-        self.video.set_draw_mode(False)
+        self._set_region_draw_state(False)
         if self._capture_target:
             try:
-                target = capture_workpiece(self._packet.frame, points)
-                locator, reference = WorkpieceLocator(target), decode_reference(target)
-            except (ValueError, AttributeError) as exc:
-                QMessageBox.warning(self, "無法設定參考工件", str(exc))
-                self.draw_button.setChecked(True)
-                self.guide_label.setText("框選未成功，可重新拖曳；按「返回即時影像」可取消。")
+                refreshed_rois = self._reference_refresh_rois() if self._target_source_key else None
+                # Reframing on the exact saved photo retains the canonical
+                # coordinate space of every existing following region. Never
+                # silently replace that photo with an unrelated live frame.
+                target = (replace(self._target_original, points=[tuple(p) for p in points])
+                          if self._target_original is not None else
+                          capture_workpiece(self._target_frame, points))
+                if refreshed_rois is not None:
+                    target = replace(target, name=self.sop.workpiece.name)
+                locator, reference = WorkpieceLocator(target, adaptive_budget=True), decode_reference(target)
+            except (ValueError, AttributeError, TypeError) as exc:
+                self._set_region_draw_state(True)
+                self._set_region_guide(f"參考工件框選未成功：{exc}。請重新框選紋理清楚的完整工件；按「返回即時影像」可取消。")
                 return
             self._capture_target = False
+            self._target_frame = self._target_original = None
+            self._target_refresh_matrix, self._target_source_key = None, ""
+            self.target_button.setText("框選參考工件")
+            self.following_frame_tools.setEnabled(True)
             self.sop.workpiece = target
+            if refreshed_rois is not None:
+                self.sop.rois = refreshed_rois
+                self._roi_anchor_feedback.clear()
             self._workpiece_key = workpiece_key(target)
-            self.workpiece_changed.emit(target)
             self._clear_roi_history()
             self._locator, self._reference_frame = locator, reference
+            if refreshed_rois is not None:
+                self._refresh_roi_rows()
+            self.workpiece_changed.emit(target)
+            self.tracking_label.setText("參考工件已驗證；返回即時影像可檢查定位狀態。")
             self.reference_button.setEnabled(True)
             self.reference_button.setChecked(True)
             self._use_original_reference()
-            self.guide_label.setText("參考工件已設定。可在參考影像框選跟隨區域，或按「返回即時影像」。")
+            self._set_region_guide("參考影像已更新，跟隨區域已轉換到新照片座標，名稱與工序條件均保留；按「返回即時影像」檢查定位。"
+                                   if refreshed_rois is not None else
+                                   "參考工件已設定，請接著直接拖曳框選跟隨區域；按「返回即時影像」可取消。"
+                                   if self._pending_region_anchor == "workpiece" else
+                                   "參考工件已設定。可在此處新增跟隨區域，或按「返回即時影像」。")
             self._refresh_setup_summary()
             self._mark_modified()
             return
@@ -1309,6 +1677,7 @@ class EditorPage(QWidget):
         self._remember_roi()
         anchor = "workpiece" if self.reference_button.isChecked() else "fixed"
         self.sop.rois.append(ROI(name, [tuple(p) for p in points], anchor))
+        self._pending_region_anchor = None
         self._selected_roi_name = name
         self._refresh_roi_rows()
         self._refresh_options()
@@ -1316,35 +1685,126 @@ class EditorPage(QWidget):
         self.tools_scroll.ensureWidgetVisible(row)
         row.name_edit.setFocus()
         row.name_edit.selectAll()
-        self.guide_label.setText(f"已新增「{name}」，可在「作業區域」該列直接修改名稱；各工序的區域欄位可直接選用。")
+        self._set_region_guide(f"已新增「{name}」（{'跟隨工件' if anchor == 'workpiece' else '固定畫面'}），可在此處修改名稱；各工序的區域欄位可直接選用。")
         self._mark_modified()
 
     def _begin_target(self):
+        if self._production_running:
+            return
         if self._capture_target:
             self._return_live()
             return
         if any(r.anchor == "workpiece" for r in self.sop.rois):
-            QMessageBox.information(self, "已有跟隨區域", "重設參考工件會改變座標基準。請先清除工件跟隨設定，再重新框選。")
+            if self.sop.workpiece is None or self._reference_frame is None:
+                self._set_region_guide("已有跟隨區域，但原始參考照片缺失或損壞，無法安全保留座標；請明確清除工件跟隨設定後重新設定，不能直接套用新照片。")
+                return
+            original = copy.deepcopy(self.sop.workpiece)
+            frame = self._reference_frame.copy()
+            self.reference_button.setChecked(True)
+            self._freeze_following_frame(frame, np.eye(2, 3), "reference")
+            self._target_original, self._target_frame = original, frame
+            self._capture_target = True
+            self.following_frame_tools.setEnabled(False)
+            self.target_button.setText("取消框選參考工件")
+            self._set_region_draw_state(True)
+            self._focus_image()
+            self.tracking_settings_button.setChecked(True)
+            self._set_region_guide("正在原始參考照片重新框選工件：請框住含接頭、孔位或文字的完整工件，排除手部與背景。照片與既有區域、工序條件保持原座標；按「返回即時影像」可取消。")
+            self._refresh_video_rois()
+            self._refresh_reference_update_availability()
             return
         if self._packet is None:
-            QMessageBox.information(self, "等待影像", "請先連線影像來源並顯示即時影像。")
+            self._set_region_guide("請先連線影像來源並顯示即時影像，再框選參考工件。")
             return
         packet = self._packet
         self.reference_button.setChecked(False)
         self._packet = packet
         self.freeze_check.setChecked(True)
         self.video.set_frame(packet.frame)
+        self._target_frame, self._target_original = packet.frame.copy(), None
         self._capture_target = True
         self.target_button.setText("取消框選參考工件")
-        self.draw_button.setChecked(True)
-        self.video.set_draw_mode(True)
+        self._set_region_draw_state(True)
         self._focus_image()
-        self.guide_label.setText("畫面已暫停並放大。拖曳框住完整工件，盡量排除手部與背景。")
+        self.tracking_settings_button.setChecked(True)
+        self._set_region_guide("畫面已暫停並放大。拖曳框住完整工件，盡量排除手部與背景；按「返回即時影像」可取消。")
+        self._refresh_reference_update_availability()
+
+    def _reference_update_blocker(self):
+        if self._production_running:
+            return "請先停止正式作業，再更新參考影像。"
+        if self._capture_target:
+            return "正在框選參考工件；請完成框選，或按「返回即時影像」取消。"
+        if self.sop.workpiece is None or self._locator is None:
+            return "尚無通過驗證的參考工件；請先按「框選參考工件」設定或修復原始參考。"
+        if self._latest_frame is None or self._latest_arrived_at is None:
+            return "等待即時影像；請先連線影像來源。"
+        if self._latest_key != self._workpiece_key:
+            return "定位設定同步中；請等待目前參考工件的位置已確認後再更新。"
+        if time.monotonic() - self._latest_arrived_at > 3:
+            return "即時影像已逾時；請恢復影像來源，等待新位置已確認後再更新。"
+        if self._latest_tracking_state != TRACKING_CONFIRMED:
+            return "目前位置未經追蹤器確認；請等待「位置已確認」後再更新參考影像。"
+        if self._valid_edit_matrix(self._latest_matrix) is None:
+            return "目前位置尚未確認；請讓原工件完整入鏡並等待位置已確認，無法猜測舊區域的新位置。"
+        return ""
+
+    def _refresh_reference_update_availability(self):
+        self._refresh_tracking_hint_visibility()
+        reason = self._reference_update_blocker()
+        self.refresh_reference_button.setEnabled(not reason)
+        self.reference_update_label.setText(reason or "位置已確認，可更新參考影像；既有跟隨區域與工序條件會保留。")
+
+    def _begin_reference_refresh(self):
+        reason = self._reference_update_blocker()
+        if reason:
+            self._refresh_reference_update_availability()
+            self._set_region_guide(reason)
+            return False
+        frame, matrix = self._latest_frame.copy(), self._valid_edit_matrix(self._latest_matrix)
+        key = self._workpiece_key
+        self._return_live()
+        self.freeze_check.setChecked(True)
+        self.freeze_check.setEnabled(False)
+        self._target_frame, self._target_original = frame, None
+        self._target_refresh_matrix, self._target_source_key = matrix, key
+        self._capture_target = True
+        self.following_frame_tools.setEnabled(False)
+        self.video.set_frame(frame)
+        self.target_button.setText("取消更新參考影像")
+        self._set_region_draw_state(True)
+        self._focus_image()
+        self.tracking_settings_button.setChecked(True)
+        self._refresh_reference_update_availability()
+        self._set_region_guide("已固定這一幀及其已確認位置：請框住含接頭、孔位或文字的完整工件。成功後自動轉換既有跟隨區域；按「返回即時影像」取消，原設定會保留。")
+        self._refresh_video_rois()
+        return True
+
+    def _reference_refresh_rois(self):
+        """Build every rebased region before committing any of the new reference."""
+        matrix = self._valid_edit_matrix(self._target_refresh_matrix)
+        if (matrix is None or self._target_source_key != self._workpiece_key
+                or workpiece_key(self.sop.workpiece) != self._target_source_key):
+            raise ValueError("凍結的位置或原參考設定已無效，請取消並重新取得已確認的位置")
+        result = []
+        for roi in self.sop.rois:
+            if roi.anchor != "workpiece":
+                result.append(roi)
+                continue
+            points = np.asarray(roi.points, dtype=float)
+            if (points.ndim != 2 or points.shape[1] != 2 or len(points) < 3 or not np.isfinite(points).all()
+                    or (points < 0).any() or (points > 1).any()):
+                raise ValueError(f"跟隨區域「{roi.name}」座標無效，原設定已保留")
+            mapped = points @ matrix[:, :2].T + matrix[:, 2]
+            if not np.isfinite(mapped).all() or (mapped < -1e-9).any() or (mapped > 1 + 1e-9).any():
+                raise ValueError(f"跟隨區域「{roi.name}」超出新照片，請取消並調整工件完整入鏡後重試")
+            result.append(replace(roi, points=[tuple(p) for p in np.clip(mapped, 0., 1.)]))
+        return result
 
     def _clear_workpiece(self, restart=False):
-        if self.sop.workpiece is None:
-            return
         dependent = {r.name for r in self.sop.rois if r.anchor == "workpiece"}
+        if self.sop.workpiece is None and not dependent:
+            return
         affected = sum(c.roi in dependent for c in self._all_conditions())
         if QMessageBox.question(self, "清除工件跟隨設定",
                 f"確定清除參考工件、{len(dependent)} 個跟隨區域及 {affected} 個引用條件？\n固定區域與工序會保留。",
@@ -1389,9 +1849,15 @@ class EditorPage(QWidget):
         return None
 
     def _clear_following_frames(self):
+        self._pending_region_anchor = None
+        self._target_frame = self._target_original = None
+        self._target_refresh_matrix, self._target_source_key = None, ""
+        self.following_frame_tools.setEnabled(True)
         self._latest_frame = self._latest_preview = self._latest_matrix = None
+        self._latest_overlay = self._shown_overlay = None
         self._latest_arrived_at = None
         self._latest_key = ""
+        self._latest_tracking_state = ""
         self._edit_frame = self._edit_matrix = None
         self._edit_frame_kind = self._edit_key = ""
 
@@ -1419,15 +1885,14 @@ class EditorPage(QWidget):
         self._refresh_video_rois()
 
     def _retake_following_frame(self):
-        if self._production_running or not self.reference_button.isChecked():
+        if self._production_running or self._capture_target or not self.reference_button.isChecked():
             return
-        self.draw_button.setChecked(False)
-        self.video.set_draw_mode(False)
+        self._set_region_draw_state(False)
         self._edit_frame = self._edit_matrix = None
         self._edit_key = ""
         self._edit_frame_kind = "selecting"
         self._show_following_selection()
-        self.guide_label.setText("重新取景：調整工件或等待所需畫面，再按「使用這一幀」。既有區域與工序條件會保留。")
+        self._set_region_guide("重新取景：調整工件或等待所需畫面，再按「使用這一幀」。既有區域與工序條件會保留；按「返回即時影像」可取消。")
 
     def _freeze_following_frame(self, frame, matrix, kind):
         # Own the selected pixels and the pose belonging to these exact pixels;
@@ -1438,31 +1903,33 @@ class EditorPage(QWidget):
         self.use_frame_button.setEnabled(False)
         text = "正在使用最新有效定位的凍結畫面" if kind == "latest" else "正在使用原始參考影像"
         self.following_frame_label.setText(text + "；修改會轉回原始參考座標，保留工序條件。")
-        self.guide_label.setText(text + "。可新增或編輯跟隨區域；「重新取景」可選另一幀，完成後按「返回即時影像」。")
+        self._set_region_guide(text + "。可新增或編輯跟隨區域；「重新取景」可選另一幀，完成後按「返回即時影像」。")
+        if self._pending_region_anchor == "workpiece":
+            self._set_region_draw_state(True)
+            self._set_region_guide(text + "，請直接拖曳框選跟隨區域；按「返回即時影像」可取消。")
         self._refresh_video_rois()
 
     def _use_latest_following_frame(self):
-        if self._production_running or not self.reference_button.isChecked():
+        if self._production_running or self._capture_target or not self.reference_button.isChecked():
             return False
         if not self._latest_following_frame_valid():
             if self._edit_frame_kind == "selecting":
                 self._show_following_selection()
-            self.guide_label.setText("此幀沒有新鮮有效定位，無法固定；請重新取景，或選用原始參考影像。")
+            self._set_region_guide("此幀沒有新鮮有效定位，無法固定；請重新取景，或選用原始參考影像。")
             return False
         self._freeze_following_frame(self._latest_frame, self._latest_matrix, "latest")
         return True
 
     def _use_original_reference(self):
-        if self._production_running or not self.reference_button.isChecked() or self._reference_frame is None:
+        if self._production_running or self._capture_target or not self.reference_button.isChecked() or self._reference_frame is None:
             return False
-        self.draw_button.setChecked(False)
-        self.video.set_draw_mode(False)
+        self._set_region_draw_state(False)
         self._freeze_following_frame(self._reference_frame, np.eye(2, 3), "reference")
         return True
 
     def _following_points_to_reference(self, points):
         if not self._following_edit_ready():
-            self.guide_label.setText("尚未固定有效定位畫面；請先使用這一幀或原始參考影像，原區域已保留。")
+            self._set_region_guide("尚未固定有效定位畫面；請先使用這一幀或原始參考影像，原區域已保留。")
             return None
         try:
             displayed = np.asarray(points, dtype=float)
@@ -1480,22 +1947,28 @@ class EditorPage(QWidget):
             canonical[canonical < 0] = 0.
             canonical[canonical > 1] = 1.
         except (ValueError, TypeError, np.linalg.LinAlgError):
-            self.guide_label.setText("區域轉回原始參考座標後無效或超出影像；原設定已保留，請重新調整。")
+            self._set_region_guide("區域轉回原始參考座標後無效或超出影像；原設定已保留，請重新調整。")
             return None
         return [tuple(point) for point in canonical]
 
     def _show_reference(self, enabled):
         self._capture_target = False
+        self._target_frame = self._target_original = None
+        self._target_refresh_matrix, self._target_source_key = None, ""
+        self.following_frame_tools.setEnabled(True)
         self.target_button.setText("框選參考工件")
-        self.draw_button.setChecked(False)
-        self.video.set_draw_mode(False)
+        self._set_region_draw_state(False)
         if enabled:
             if self._production_running or self._reference_frame is None:
                 self.reference_button.setChecked(False)
                 return
+            blocked = self.region_anchor_combo.blockSignals(True)
+            self.region_anchor_combo.setCurrentIndex(self.region_anchor_combo.findData("workpiece"))
+            self.region_anchor_combo.blockSignals(blocked)
             self._invalidate_validation("跟隨區域編輯中，請返回即時後重新試跑")
             self.freeze_check.setChecked(False)
             self.freeze_check.setEnabled(False)
+            self.tracking_settings_button.setChecked(True)
             self.following_frame_tools.show()
             # Release live result/detection owners while editing; only the
             # lightweight raw/preview/pose cache continues to receive frames.
@@ -1504,13 +1977,14 @@ class EditorPage(QWidget):
             if not self._use_latest_following_frame():
                 self._retake_following_frame()
         else:
+            self._pending_region_anchor = None
             self._edit_frame = self._edit_matrix = None
             self._edit_frame_kind = self._edit_key = ""
             self.following_frame_tools.hide()
             self.freeze_check.setEnabled(True)
             self.freeze_check.setChecked(False)
             if self._latest_preview is not None:
-                self.video.set_frame(self._latest_preview)
+                self._show_latest_preview()
             else:
                 self.video.clear_frame("等待即時影像")
         self._refresh_video_rois()
@@ -1518,19 +1992,23 @@ class EditorPage(QWidget):
 
     def _return_live(self):
         self._last_live_preview_at = None
+        self._pending_region_anchor = None
         self.reference_button.setChecked(False)
         self.freeze_check.setEnabled(True)
         self.freeze_check.setChecked(False)
         self._capture_target = False
-        self.draw_button.setChecked(False)
-        self.video.set_draw_mode(False)
+        self._target_frame = self._target_original = None
+        self._target_refresh_matrix, self._target_source_key = None, ""
+        self.following_frame_tools.setEnabled(True)
+        self._set_region_draw_state(False)
         self.video.set_editable([])
         if self._latest_preview is not None:
-            self.video.set_frame(self._latest_preview)
+            self._show_latest_preview()
         self._refresh_video_rois()
         self.target_button.setText("框選參考工件")
         self._release_auto_focus()
-        self.guide_label.setText("即時影像：可框選參考工件與區域，所有工序的判定預覽同時更新。")
+        self._set_region_guide("即時影像：在「作業區域」選定位方式後直接新增，所有工序的判定預覽同時更新。")
+        self._refresh_reference_update_availability()
 
     # ---- trial -------------------------------------------------------------
     def _validation_blocker(self):
@@ -1589,6 +2067,7 @@ class EditorPage(QWidget):
         self._invalidate_validation("驗證範圍已變更，請重新試跑")
 
     def _check_validation_feed(self):
+        self._refresh_reference_update_availability()
         if self._validation.running and (self._packet_arrived_at is None or time.monotonic() - self._packet_arrived_at > 3):
             self._invalidate_validation("影像停止更新，請重新試跑")
         self._update_validation_view()
@@ -1598,16 +2077,33 @@ class EditorPage(QWidget):
             return
         trial = self._validation
         blocker = self._validation_blocker()
-        alert = trial.alert()
+        alert = trial.alert(include_tracking=self._show_tracking_alerts,
+                            include_workflow=self._show_workflow_alerts)
         alert_text = alert["text"] if not self._production_running else ""
         self.validation_alert.setText(alert_text)
         self.validation_alert.setVisible(bool(alert_text))
-        self.video.set_alert(alert_text, alert["regions"] if alert["active"] else ())
+        self.video.set_alert(alert_text, alert["regions"] if alert_text and alert["active"] else ())
+        alert_regions = set(alert["regions"]) if alert_text and alert["active"] else set()
+        if alert_regions != self._active_alert_regions:
+            self._active_alert_regions = alert_regions
+            self._refresh_video_rois()
         self.validation_status.setText(trial.message if trial.engine is not None or trial.message.startswith("無法") else blocker or trial.message)
         set_state(self.validation_status, "ng" if alert_text else "warning" if trial.stale or blocker else "running" if trial.running else "neutral")
         metrics = trial.metrics()
         self.validation_target.setText(metrics["target"])
-        self.validation_count.setText("條件 " + metrics["count"])
+        count_text = "條件 " + metrics["count"]
+        reasons = trial.unavailable_reasons()
+        if reasons:
+            suffix = "（原因）" if metrics["count"] == "無法判斷" else "（部分無法判斷：原因）"
+            self.validation_count.setText(f'<a href="condition-reasons">{escape(count_text + suffix)}</a>')
+        else:
+            self.validation_count.setText(escape(count_text))
+        self.validation_count.setToolTip("<div>" + escape(reasons).replace("\n", "<br>") + "</div>" if reasons else "")
+        self.validation_count.setAccessibleName(count_text + ("，查看原因" if reasons else ""))
+        self.validation_count.setAccessibleDescription(reasons)
+        if self._validation_reason_popup_text and self._validation_reason_popup_text != reasons:
+            QToolTip.hideText()
+            self._validation_reason_popup_text = ""
         self.validation_elapsed.setText("觀察 " + metrics["elapsed"])
         self.validation_ratio.setText("比例 " + metrics["ratio"].replace("≥", "至少"))
         self.validation_start.setEnabled(not trial.running and not blocker)
@@ -1622,6 +2118,14 @@ class EditorPage(QWidget):
             position, at_end = scrollbar.value(), scrollbar.value() == scrollbar.maximum()
             self.validation_details.setPlainText(detail)
             scrollbar.setValue(scrollbar.maximum() if at_end else position)
+        self._refresh_step_display()
+
+    def _show_validation_reasons(self, _link=""):
+        reasons = self._validation.unavailable_reasons()
+        if reasons:
+            self._validation_reason_popup_text = reasons
+            QToolTip.showText(self.validation_count.mapToGlobal(self.validation_count.rect().bottomLeft()),
+                              self.validation_count.toolTip(), self.validation_count)
 
     def hideEvent(self, event):
         if hasattr(self, "step_settings"):

@@ -174,13 +174,13 @@ class SOPEngine:
         self._last_valid_size: tuple[int, int] | None = None
 
     def _pose_corners(self, frame: FrameResult) -> np.ndarray | None:
-        if frame.workpiece_transform is None or self.sop.workpiece is None:
+        transform = frame.confirmed_transform
+        if transform is None or self.sop.workpiece is None:
             return None
         corners = np.asarray(self.sop.workpiece.points, dtype=float)
         if corners.shape != (4, 2):
             return None
-        mapped = (corners @ frame.workpiece_transform[:, :2].T +
-                  frame.workpiece_transform[:, 2]) * [frame.width, frame.height]
+        mapped = (corners @ transform[:, :2].T + transform[:, 2]) * [frame.width, frame.height]
         return mapped if np.isfinite(mapped).all() else None
 
     def _same_position(self, pose: np.ndarray, frame: FrameResult) -> bool:
@@ -242,7 +242,8 @@ class SOPEngine:
             met, completion_blocked, self._results = (judged.completion_met, judged.completion_blocked,
                                                       judged.completion_results)
             invalid = completion_blocked
-            position_missing = (invalid and frame.detection_valid and frame.workpiece_transform is None and
+            # 位置待確認與重新定位中一樣視為位置暫時未知：凍結已累積進度，不拿來累積條件。
+            position_missing = (invalid and frame.detection_valid and frame.confirmed_transform is None and
                                 any(self.rois.get(c.roi) is not None and
                                     self.rois[c.roi].anchor == "workpiece" for c in step.conditions))
             pose = self._pose_corners(frame) if not invalid else None

@@ -190,15 +190,12 @@ class SinglePageEditorTests(unittest.TestCase):
         self.assertGreater(editor.video.width(), editor.tools_pane.width())
         for widget in (editor.draw_button, editor.empty_rois_label, editor.validation_box):
             self.assertTrue(editor.tools_pane.isAncestorOf(widget))
-        # Workpiece tracking is one horizontal bar directly under the image.
+        # Region creation and tracking share the tools pane; there is no
+        # separate tracking setup entry under the image.
         bar = editor.tracking_tools
-        self.assertTrue(editor.monitor_pane.isAncestorOf(bar))
-        video_bottom = editor.video.mapTo(editor, editor.video.rect().bottomLeft()).y()
-        bar_top = bar.mapTo(editor, bar.rect().topLeft()).y()
-        self.assertGreater(bar_top, video_bottom)
-        ys = {button.mapTo(editor, button.rect().topLeft()).y()
-              for button in (editor.target_button, editor.clear_target_button, editor.reference_button)}
-        self.assertEqual(len(ys), 1)
+        self.assertTrue(editor.regions_panel.isAncestorOf(bar))
+        self.assertFalse(editor.monitor_pane.isAncestorOf(bar))
+        self.assertTrue(editor.regions_panel.isAncestorOf(editor.region_anchor_combo))
         normal = editor.video.width()
         editor.draw_button.click()
         self.app.processEvents()

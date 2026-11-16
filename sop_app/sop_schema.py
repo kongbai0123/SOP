@@ -34,6 +34,7 @@ class ROI:
     name: str
     points: list[tuple[float, float]]   # 正規化座標 0~1，換攝影機解析度也不用重畫
     anchor: str = "fixed"              # workpiece：參考影像座標，由定位矩陣轉到當前畫面
+    display_group: str = "auto"        # auto / operation / installation；只決定預覽分類
 
 
 @dataclass
@@ -84,6 +85,14 @@ class SOPDefinition:
     def roi_map(self) -> dict[str, ROI]:
         return {roi.name: roi for roi in self.rois}
 
+    def requires_tracking(self) -> bool:
+        """只有實際用於完成、違規或啟用中循環重置的跟隨區域才是作業必要條件。"""
+        following = {roi.name for roi in self.rois if roi.anchor == "workpiece"}
+        conditions = [condition for step in self.steps for condition in step.conditions + step.forbidden]
+        if self.cycle.enabled:
+            conditions.extend(self.cycle.reset_conditions)
+        return any(condition.roi in following for condition in conditions)
+
     def to_dict(self) -> dict:
         return {"schema_version": SCHEMA_VERSION, **asdict(self)}
 
@@ -103,7 +112,7 @@ class SOPDefinition:
                                 [(float(x), float(y)) for x, y in workpiece.get("points", [])])
                       if workpiece else None,
             rois=[ROI(str(r["name"]), [(float(x), float(y)) for x, y in r["points"]],
-                      str(r.get("anchor", "fixed")))
+                      str(r.get("anchor", "fixed")), str(r.get("display_group", "auto")))
                   for r in data.get("rois", [])],
             cycle=CycleSettings(
                 enabled=bool(cycle.get("enabled", True)),
@@ -140,16 +149,20 @@ class SOPDefinition:
         if not self.steps:
             errors.append("SOP 沒有任何工序")
         for roi in self.rois:
+            if roi.display_group not in ("auto", "operation", "installation"):
+                errors.append(f"區域「{roi.name}」的顯示分類無效")
             if roi.anchor not in ("fixed", "workpiece"):
                 errors.append(f"區域「{roi.name}」的定位基準無效")
             if roi.anchor == "workpiece" and self.workpiece is None:
-                errors.append(f"區域「{roi.name}」尚未設定參考工件")
+                target = errors if self.requires_tracking() else warnings
+                target.append(f"區域「{roi.name}」尚未設定參考工件")
         if self.workpiece is not None:
             from .tracking import WorkpieceLocator
             try:
-                WorkpieceLocator(self.workpiece)
+                WorkpieceLocator(self.workpiece, adaptive_budget=True)
             except (ValueError, TypeError) as exc:
-                errors.append(f"工件定位設定：{exc}")
+                target = errors if self.requires_tracking() else warnings
+                target.append(f"工件定位設定：{exc}")
 
         def check(conditions: list[Condition], where: str):
             for cond in conditions:

@@ -67,7 +67,7 @@ def evaluate_condition(cond: Condition, frame: FrameResult, rois: dict[str, ROI]
         if roi is None:
             # 區域不存在時一律不成立，避免「消失」條件被誤判為成立
             return ConditionResult(cond, 0, False, f"找不到區域 {cond.roi}", error_kind="config")
-        roi = transform_roi(roi, frame.workpiece_transform)
+        roi = transform_roi(roi, frame.confirmed_transform)
         if roi is None:
             return ConditionResult(cond, 0, False, f"作業位置暫時無法確認或已超出畫面（{frame.tracking_status}）", error_kind="unavailable")
 

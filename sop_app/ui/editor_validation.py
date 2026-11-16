@@ -9,10 +9,11 @@ import copy
 from collections import deque
 from dataclasses import replace
 
-from ..conditions import evaluate_conditions
+from ..conditions import combine_results, evaluate_conditions
 from ..detection import FrameResult
 from ..engine import EngineEvent, Phase, SOPEngine
 from ..sop_schema import SOPDefinition
+from .condition_diagnostics import condition_error_text
 
 
 class EditorValidation:
@@ -220,7 +221,7 @@ class EditorValidation:
                 self._pending_notice = None
         self._notice_signature = signature
 
-    def alert(self) -> dict[str, str | tuple[str, ...] | bool]:
+    def alert(self, *, include_tracking=True, include_workflow=True) -> dict[str, str | tuple[str, ...] | bool]:
         """Current engine-confirmed warning, or clearly labelled display history.
 
         Reading this method never creates events. Only active violations return
@@ -230,14 +231,24 @@ class EditorValidation:
         if self.engine is None or self.stale:
             return blank
         current = self._current_violation()
-        if current is not None:
+        if current is not None and include_workflow:
             text, regions, _signature = current
             if self._last_generic_alarm is not None:
                 text += "；另有警報：" + self._last_generic_alarm.message
             return dict(text=text, regions=regions, active=True)
         snapshot = self.engine.snapshot()
-        unavailable = any(result.error for result in snapshot.results + snapshot.forbidden_results)
-        last_display = self._last_display_alarm or self._last_alarm
+        # Select presentation only; the engine's unavailable results and alarm
+        # history remain intact when either kind of notification is hidden.
+        errors = [result for result in snapshot.results + snapshot.forbidden_results if result.error]
+        unavailable = False
+        for result in errors:
+            roi = self.engine.rois.get(result.condition.roi)
+            tracking = (result.error_kind == "unavailable" and self.last_frame is not None
+                        and self.last_frame.detection_valid and roi is not None and roi.anchor == "workpiece")
+            if (tracking and include_tracking) or (not tracking and include_workflow):
+                unavailable = True
+                break
+        last_display = (self._last_display_alarm or self._last_alarm) if include_workflow else None
         if last_display is None:
             return {**blank, "text": "辨識／位置無法確認，暫停相關條件判斷" if unavailable and self.running else ""}
         prefix = "已停止試跑；" if self._stopped else "單步驗證完成；" if self.completed else ""
@@ -250,6 +261,26 @@ class EditorValidation:
         if unavailable and self.running:
             text += "；辨識／位置無法確認，暫停相關條件判斷"
         return dict(text=text, regions=(), active=False)
+
+    def unavailable_reasons(self) -> str:
+        """Current errors for an explicit user inspection, not an alert.
+
+        Only consume the engine snapshot. In particular, a forbidden condition
+        or a cycle reset must not be described as a completion failure.
+        """
+        if not self.running or self.stale or self.engine is None:
+            return ""
+        snapshot = self.engine.snapshot()
+        if snapshot.phase == Phase.RUNNING:
+            groups = (("完成", snapshot.results), ("警告", snapshot.forbidden_results))
+        elif snapshot.phase == Phase.CYCLE_DONE and self.engine.sop.cycle.enabled:
+            groups = (("重置", snapshot.results),)
+        else:
+            return ""
+        return "\n".join(
+            f"{group}條件 {index}｜{condition_error_text(result, self.last_frame, self.engine.sop)}"
+            for group, results in groups for index, result in enumerate(results, 1) if result.error
+        )
 
     def metrics(self) -> dict[str, str]:
         blank = dict(target="尚未擷取測試設定", count="—", elapsed="—", ratio="—")
@@ -275,7 +306,8 @@ class EditorValidation:
         snapshot = engine.snapshot()
         window = engine._window  # Read-only diagnostics from the actual engine window.
         results = snapshot.results
-        invalid = any(result.error for result in results)
+        mode = "all" if engine.phase == Phase.CYCLE_DONE else step.completion_mode
+        invalid = combine_results(results, mode)[1]
         count = "無法判斷" if invalid else f"{sum(r.met for r in results)}/{len(results)}" if results else "—"
         if engine.phase == Phase.CYCLE_DONE:
             target = f"第 {engine.cycle} 輪已完成 · 驗證重置條件"

@@ -3,16 +3,18 @@ from __future__ import annotations
 
 import copy
 from datetime import datetime
+from html import escape
 
 import numpy as np
 
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QApplication, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
                                QListWidget, QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QSplitter,
                                QScrollArea, QSizePolicy, QStyle, QVBoxLayout, QWidget)
 
 from ..conditions import combine_results
+from ..display_options import DEFAULT_DISPLAY_GROUPS, DISPLAY_GROUPS, display_group_summary, filter_display_rois
 from ..engine import EngineEvent, EngineSnapshot, Phase
 from ..pipeline import FramePacket
 from ..overlay import draw_detections
@@ -21,6 +23,7 @@ from ..tracking import WorkpieceLocator, display_rois, workpiece_key
 from ..tracking_debug import TrackingDebug
 from .video_widget import VideoWidget
 from .compact_layout import StatusText
+from .condition_diagnostics import condition_error_text
 from .step_overview import StepOverview
 from .workbench_widgets import install_readability_guard, workbench_palette
 
@@ -68,8 +71,15 @@ class RunPage(QWidget):
         self._tracking_misses = 0
         self._workpiece_key = ""
         self._locator_error = ""
+        self._pipeline_locator_error = ""
         self._snapshot = None
         self._last_packet = None
+        self._display_groups = frozenset(DEFAULT_DISPLAY_GROUPS)
+        self._step_display = False
+        self._show_tracking_alerts = True
+        self._show_workflow_alerts = True
+        self._overlay_show_masks = None
+        self._overlay_min_score = None
         self._tracking_status = "等待影像定位"
         self._stats = {"OK": 0, "NG": 0, "中止": 0}
         self._debug = TrackingDebug()
@@ -136,19 +146,7 @@ class RunPage(QWidget):
         self.start_button.setMinimumHeight(36)
         self.start_button.setToolTip("可直接開始作業；位置尚未確認時，跟隨位置的條件會暫停累積。")
         self.start_button.clicked.connect(self._on_start_clicked)
-        self.display_step_check = QCheckBox("逐一（目前工序）")
-        self.display_all_check = QCheckBox("全開（所有結果）")
-        self.display_step_check.setToolTip(
-            "只顯示目前工序完成與違規條件使用的物件及位置；不影響背景判定。")
-        self.display_all_check.setToolTip(
-            "顯示達到最低顯示信心度的所有辨識結果與所有位置；不影響背景判定。")
-        self.display_group = QButtonGroup(self)
-        self.display_group.setExclusive(True)
-        self.display_group.addButton(self.display_step_check)
-        self.display_group.addButton(self.display_all_check)
-        self.display_step_check.setChecked(True)
-        self.display_group.buttonToggled.connect(self._on_display_mode_changed)
-        self.display_summary = QLabel("逐一｜等待 SOP 與影像")
+        self.display_summary = QLabel("操作區、物件、安裝位置｜等待 SOP 與影像")
         self.display_summary.setTextFormat(Qt.TextFormat.PlainText)
         self.display_summary.setWordWrap(True)
         self.display_summary.setObjectName("displaySummary")
@@ -244,12 +242,6 @@ class RunPage(QWidget):
         details_layout.addWidget(self.tracking_label)
         layout.addWidget(self._section("工序進度"))
         layout.addWidget(self.step_overview, 1)
-        display_row = QHBoxLayout()
-        display_row.addWidget(QLabel("畫面顯示"))
-        display_row.addWidget(self.display_step_check)
-        display_row.addWidget(self.display_all_check)
-        display_row.addStretch(1)
-        details_layout.addLayout(display_row)
         details_layout.addWidget(self.display_summary)
         toggles = QHBoxLayout()
         toggles.addWidget(self.details_button)
@@ -358,6 +350,17 @@ class RunPage(QWidget):
 
     def _show_alarm(self, message: str):
         self._pending_alarms.append(message)
+        self._render_pending_alarms()
+
+    def _render_pending_alarms(self):
+        """Apply presentation preferences without acknowledging recorded alarms."""
+        if not self._show_workflow_alerts or not self._pending_alarms:
+            self._flash_timer.stop()
+            self._set_alarm_flash(False)
+            self.alarm_panel.hide()
+            self._sync_alarm_slot()
+            return
+        message = self._pending_alarms[-1]
         count = len(self._pending_alarms)
         suffix = f"\n（共 {count} 筆未確認警報）" if count > 1 else ""
         self.alarm_text.setText(f"警報：{message}{suffix}")
@@ -367,8 +370,13 @@ class RunPage(QWidget):
             self._flash_timer.start()
 
     def _flash_alarm(self):
-        self._flash_on = not self._flash_on
-        self.alarm_panel.setProperty("flash", "true" if self._flash_on else "false")
+        if not self._show_workflow_alerts or not self._pending_alarms:
+            return
+        self._set_alarm_flash(not self._flash_on)
+
+    def _set_alarm_flash(self, enabled: bool):
+        self._flash_on = enabled
+        self.alarm_panel.setProperty("flash", "true" if enabled else "false")
         self.alarm_panel.style().unpolish(self.alarm_panel)
         self.alarm_panel.style().polish(self.alarm_panel)
 
@@ -377,8 +385,7 @@ class RunPage(QWidget):
             return
         self._pending_alarms.clear()
         self._flash_timer.stop()
-        self._flash_on = False
-        self.alarm_panel.setProperty("flash", "false")
+        self._set_alarm_flash(False)
         self.alarm_panel.hide()
         self._sync_alarm_slot()
         self.alarm_ack_requested.emit()
@@ -387,7 +394,8 @@ class RunPage(QWidget):
         # A normal alarm/ack must not repaginate an active SOP before its last
         # visible step finishes. Reserve the same strip throughout the run.
         self.alarm_panel.ensurePolished()
-        height = self.alarm_panel.sizeHint().height() if self._running or self._pending_alarms else 0
+        reserve = self._show_workflow_alerts and (self._running or self._pending_alarms)
+        height = self.alarm_panel.sizeHint().height() if reserve else 0
         self.alarm_slot.setMinimumHeight(max(0, height))
 
     def set_today_stats(self, stats: dict):
@@ -400,13 +408,23 @@ class RunPage(QWidget):
         self._today = {}
         self._pending_alarms.clear()
         self._flash_timer.stop()
-        self._flash_on = False
+        self._set_alarm_flash(False)
         self.alarm_panel.hide()
         self._sync_alarm_slot()
         self.clear_video("已切換工站，請連線影像來源")
         self._update_stats()
 
     # ---- 外部介面 --------------------------------------------------------------
+    def set_alert_options(self, show_tracking: bool, show_workflow: bool):
+        """Change visual/audio hints; engine decisions and pending alarms stay intact."""
+        self._show_tracking_alerts = bool(show_tracking)
+        self._show_workflow_alerts = bool(show_workflow)
+        self.tracking_label.setVisible(self._show_tracking_alerts)
+        self._render_pending_alarms()
+        self._refresh_regions(self._tracking_status, self._snapshot)
+        if self._running and self._snapshot is not None and self._snapshot.phase == Phase.RUNNING:
+            self._render_running(self._snapshot)
+
     def set_sop(self, sop: SOPDefinition):
         """作業進行中不更換，避免畫面與背景引擎使用不同版本的 SOP。"""
         if self._running:
@@ -419,11 +437,12 @@ class RunPage(QWidget):
         self._last_packet = None
         self._tracking_status = "等待影像定位"
         self._locator_error = ""
+        self._pipeline_locator_error = ""
         self._workpiece_key = workpiece_key(self.sop.workpiece)
         if self.sop.workpiece:
             try:
-                WorkpieceLocator(self.sop.workpiece)   # 只檢查設定；逐幀定位由背景管線執行
-            except ValueError as exc:
+                WorkpieceLocator(self.sop.workpiece, adaptive_budget=True)   # 與背景管線使用相同驗證設定
+            except (ValueError, TypeError) as exc:
                 self._locator_error = str(exc)
         self.step_overview.set_steps([step.name for step in self.sop.steps])
         self.video.set_rois(display_rois(self.sop.rois, self._transform))
@@ -450,13 +469,33 @@ class RunPage(QWidget):
         self._last_packet = packet
         if self.sop is None or self.sop.workpiece is None or self._locator_error:
             self._transform = None
+            self._last_transform = None
             status = self._locator_error or "尚未設定參考工件"
         elif packet.result.workpiece_key == self._workpiece_key:
             # 待機與正式作業都使用背景管線同一幀的定位結果；介面不另外計算。
-            self._transform = packet.result.workpiece_transform
+            self._pipeline_locator_error = (packet.result.tracking_status
+                                            if packet.result.tracking_metrics.get("configuration_error") else "")
+            self._transform = None if self._pipeline_locator_error else packet.result.confirmed_transform
             status = packet.result.tracking_status
+            if self._pipeline_locator_error:
+                self._last_transform = None
+            if self._transform is not None:
+                try:
+                    matrix = np.asarray(self._transform, dtype=float)
+                    valid = matrix.shape == (2, 3) and np.all(np.isfinite(matrix))
+                except (ValueError, TypeError):
+                    valid = False
+                if valid:
+                    self._transform = matrix.copy()
+                else:
+                    self._transform = None
+                    self._last_transform = None
+                    status = "定位資料無效，正在重新定位"
         else:
             self._transform = None
+            # A packet from a different reference/source cannot lend a stale
+            # position to the currently selected SOP.
+            self._last_transform = None
             status = "定位設定同步中…"
         if self._transform is not None:
             self._last_transform = self._transform.copy()
@@ -479,9 +518,11 @@ class RunPage(QWidget):
             self._render_cycle_done(snapshot)
 
     def clear_video(self, text: str):
+        self._last_packet = None
         self._transform = None
         self._last_transform = None
         self._tracking_misses = 0
+        self._pipeline_locator_error = ""
         self.video.clear_frame(text)
         self.video.set_rois([])
         self.tracking_label.setText(text)
@@ -489,17 +530,32 @@ class RunPage(QWidget):
         self._update_start_availability()
 
     def _update_start_availability(self):
-        color = self._colors["stop" if self._running else "start"]
+        blocked = self._tracking_configuration_error() if not self._running else ""
+        self.start_button.setEnabled(not blocked)
+        self.start_button.setToolTip(blocked or (
+            "停止作業並記錄本輪中止。" if self._running else
+            "可開始作業；位置尚未確認時，跟隨位置的條件會暫停累積。"))
+        color = self._colors["pending" if blocked else "stop" if self._running else "start"]
         appearance = (self._running, color)
         if appearance == self._start_appearance:
             return
         self._start_appearance = appearance
-        self.start_button.setEnabled(True)
         self.start_button.setText("停止作業" if self._running else "開始作業")
         self.start_button.setIcon(self.style().standardIcon(
             QStyle.StandardPixmap.SP_MediaStop if self._running else QStyle.StandardPixmap.SP_MediaPlay))
         self.start_button.setStyleSheet(f"background:{color}; color:white; font-size:16px; font-weight:bold;"
                                         "border-radius:6px")
+
+    def _tracking_configuration_error(self):
+        """Only judgement inputs require tracking; a decorative ROI does not."""
+        if not self.sop or not self.sop.requires_tracking():
+            return ""
+        if not self.sop.workpiece:
+            return "此 SOP 的條件使用跟隨區域，但尚未設定參考工件。請到「編輯 SOP → 作業區域」設定參考工件。"
+        error = self._locator_error or self._pipeline_locator_error
+        if error:
+            return f"參考工件無效：{error}\n請到「編輯 SOP → 作業區域」重新設定參考工件。"
+        return ""
 
     @staticmethod
     def _step_sets(step):
@@ -523,78 +579,108 @@ class RunPage(QWidget):
         return f"{prefix}流程 {index + 1}：{self.sop.steps[index].name}", rois, labels
 
     def _monitor_frame(self, packet, snapshot):
-        mode = self._display_mode()
-        if mode == "all" or not packet.classes:
-            return packet.preview_display
+        if "objects" not in self._display_groups:
+            return packet.frame
+        show_masks, min_score = self._overlay_options(packet)
+        # Evidence frames may already contain ROI lines. Only the separate model
+        # preview is safe to reuse when the shared display options match.
+        if (not self._step_display and packet.model_display is not None and show_masks == packet.show_masks
+                and min_score == packet.min_score):
+            return packet.model_display
+        return draw_detections(packet.frame, self._monitor_detections(packet, snapshot),
+                               packet.classes, min_score, show_masks)
+
+    def _monitor_detections(self, packet, snapshot):
+        if not self._step_display:
+            return packet.result.detections
         _context, _rois, labels = self._step_context(snapshot)
-        detections = [d for d in packet.result.detections if d.label in labels]
-        return draw_detections(packet.frame, detections, packet.classes, packet.min_score, packet.show_masks)
+        return [d for d in packet.result.detections if d.label in labels]
+
+    def _overlay_options(self, packet):
+        show_masks = packet.show_masks if self._overlay_show_masks is None else self._overlay_show_masks
+        min_score = packet.min_score if self._overlay_min_score is None else self._overlay_min_score
+        return show_masks, min_score
+
+    def set_display_groups(self, groups):
+        """Apply shared category choices without changing engine input or SOP rules."""
+        self._display_groups = frozenset(group for group in groups if group in DISPLAY_GROUPS)
+        self._redraw_display()
+
+    def set_step_display(self, enabled):
+        self._step_display = bool(enabled)
+        self._redraw_display()
+
+    def set_overlay_options(self, show_masks, min_score):
+        """Redraw the last preview immediately, including while playback is paused."""
+        self._overlay_show_masks = bool(show_masks)
+        self._overlay_min_score = float(min_score)
+        self._redraw_display()
+
+    def _redraw_display(self):
+        if self._last_packet is not None:
+            self.video.set_frame(self._monitor_frame(self._last_packet, self._snapshot))
+        self._refresh_regions(self._tracking_status, self._snapshot)
 
     def set_regions_visible(self, visible):
         self.video.set_regions_visible(visible)
         self._refresh_regions(self._tracking_status, self._snapshot)
 
-    def _display_mode(self):
-        return "all" if self.display_all_check.isChecked() else "step"
-
     def _refresh_regions(self, status="等待影像定位", snapshot=None):
-        mode = self._display_mode()
+        group_text = display_group_summary(self._display_groups)
         if self.sop is None:
             self.video.set_rois([])
             self.tracking_label.setText("")
-            mode_name = "全開" if mode == "all" else "逐一"
-            self.display_summary.setText(f"{mode_name}｜等待 SOP 與影像")
+            self.display_summary.setText(f"{group_text}｜等待 SOP 與影像")
             return
-        context, current, labels = self._step_context(snapshot)
-        selected = self.sop.rois if mode == "all" else [r for r in self.sop.rois if r.name in current]
-        tracking_lost = (self.sop.workpiece is not None and self._transform is None
-                         and (self._last_transform is None or self._tracking_misses >= 2))
+        context, current, _labels = self._step_context(snapshot)
+        selected = filter_display_rois(self.sop.rois, self._display_groups)
+        if self._step_display:
+            selected = [roi for roi in selected if roi.name in current]
+        tracking_lost = self._transform is None
         display_transform = self._transform
-        if display_transform is None and self._last_transform is not None:
+        if display_transform is None and self._last_transform is not None and self._show_tracking_alerts:
             display_transform = self._last_transform
-        if display_transform is None and self.sop.workpiece is not None:
-            display_transform = np.array([[1., 0., 0.], [0., 1., 0.]])
         visible = display_rois(selected, display_transform)
-        stale = {roi.name for roi in selected if tracking_lost and roi.anchor == "workpiece"}
-        self.video.set_rois(visible, current if mode == "step" else set(), stale=stale)
+        visible_names = {roi.name for roi in visible}
+        stale = {roi.name for roi in selected
+                 if tracking_lost and roi.anchor == "workpiece" and roi.name in visible_names}
+        self.video.set_rois(visible, current & {r.name for r in selected}, stale=stale)
         hidden = len(selected) - len(visible)
-        mode_text = "全開｜所有結果" if mode == "all" else "逐一｜目前工序"
+        unknown = sum(roi.anchor == "workpiece" for roi in selected) if display_transform is None else 0
+        outside = hidden - unknown
         self.tracking_label.setToolTip(status)
-        if mode == "all":
-            packet = self._last_packet
-            detected = sum(d.score >= packet.min_score for d in packet.result.detections) if packet else 0
-            classes = len(packet.classes) if packet else 0
-            self.display_summary.setText(
-                f"全開｜目前顯示 {detected} 個物件｜模型共 {classes} 類｜位置 {len(visible)}/{len(selected)}")
+        packet = self._last_packet
+        if "objects" in self._display_groups:
+            detected = sum(d.score >= self._overlay_options(packet)[1]
+                           for d in self._monitor_detections(packet, snapshot)) if packet else 0
+            object_text = f"目前顯示 {detected} 個物件｜模型共 {len(packet.classes) if packet else 0} 類"
         else:
-            label_text = "、".join(sorted(labels)) or "無指定物件"
-            roi_text = "、".join(r.name for r in selected) or "整個畫面／無指定位置"
-            self.display_summary.setText(f"逐一｜{context}\n物件：{label_text}｜位置：{roi_text}")
+            object_text = "物件已隱藏"
+        prefix = "逐一任務｜" if self._step_display else ""
+        self.display_summary.setText(
+            f"{prefix}{group_text}｜{object_text}｜區域 {len(visible)}/{len(selected)}\n{context}")
         if not selected:
-            self.tracking_label.setText("目前工序不使用工作區域" if mode == "step"
-                                        else "全開｜目前沒有工作區域")
-        elif stale and not hidden:
+            self.tracking_label.setText(f"{group_text}｜目前沒有顯示區域")
+        elif stale:
             self.tracking_label.setText(
-                f"{mode_text}｜區域 {len(visible)}/{len(selected)}｜位置跟隨暫停｜顯示最後位置，條件停止累積")
-        elif hidden:
+                f"{group_text}｜區域 {len(visible)}/{len(selected)}｜位置跟隨暫停｜"
+                "顯示最後已確認位置（舊位置，僅供參考），跟隨條件停止累積"
+                + (f"｜{outside} 個區域超出畫面" if outside else ""))
+        elif unknown:
             self.tracking_label.setText(
-                f"{mode_text}｜區域 {len(visible)}/{len(selected)}｜{hidden} 個區域超出畫面｜條件停止累積")
+                f"{group_text}｜區域 {len(visible)}/{len(selected)}｜尚未取得已確認位置｜"
+                f"未顯示 {unknown} 個跟隨區域，跟隨條件停止累積")
+        elif outside:
+            self.tracking_label.setText(
+                f"{group_text}｜區域 {len(visible)}/{len(selected)}｜{outside} 個區域超出畫面｜跟隨條件停止累積")
         elif self.sop.workpiece:
-            state = "位置跟隨正常" if self._transform is not None or self._last_transform is not None else "位置跟隨準備中"
-            self.tracking_label.setText(f"{mode_text}｜區域 {len(visible)}/{len(selected)}｜{state}")
+            state = "位置跟隨正常" if self._transform is not None else "位置跟隨準備中"
+            self.tracking_label.setText(f"{group_text}｜區域 {len(visible)}/{len(selected)}｜{state}")
         else:
-            self.tracking_label.setText(f"{mode_text}｜已顯示 {len(visible)} 個固定區域" if visible else
-                                        f"{mode_text}｜目前工序未指定區域")
+            self.tracking_label.setText(f"{group_text}｜已顯示 {len(visible)} 個固定區域")
         if not self.video.regions_visible:
-            detail = self.tracking_label.text().replace("已顯示", "已設定").replace("顯示最後位置", "保留最後位置")
+            detail = self.tracking_label.text().replace("已顯示", "已設定").replace("顯示最後已確認位置", "保留最後已確認位置")
             self.tracking_label.setText(f"區域框線已隱藏｜{detail}")
-
-    def _on_display_mode_changed(self, _button, checked):
-        if not checked:
-            return
-        self._refresh_regions(self._tracking_status, self._snapshot)
-        if self._last_packet is not None:
-            self.video.set_frame(self._monitor_frame(self._last_packet, self._snapshot))
 
     def on_events(self, events: list[EngineEvent]):
         for event in events:
@@ -612,7 +698,8 @@ class RunPage(QWidget):
             item.setToolTip(event.message)
             self.log.insertItem(0, item)
             if event.kind == "alarm":
-                QApplication.beep()
+                if self._show_workflow_alerts:
+                    QApplication.beep()
                 self._show_alarm(event.message)
         while self.log.count() > 300:
             self.log.takeItem(self.log.count() - 1)
@@ -661,9 +748,9 @@ class RunPage(QWidget):
         self.confirm_button.setEnabled(not step.conditions)
 
         c = self._colors
-        if runtime.violation_alarmed or runtime.sequence_alarmed or runtime.too_fast_alarmed:
+        if self._show_workflow_alerts and (runtime.violation_alarmed or runtime.sequence_alarmed or runtime.too_fast_alarmed):
             banner_color = c["stop"]
-        elif runtime.timeout_alarmed:
+        elif self._show_workflow_alerts and runtime.timeout_alarmed:
             banner_color = "#ef6c00"
         else:
             banner_color = "#1565c0"
@@ -672,15 +759,20 @@ class RunPage(QWidget):
         lines = []
         if not step.conditions:
             lines.append(f"<span style='color:{c['warn']}'>此工序沒有自動條件，完成後請按「人工確認完成」</span>")
-        for result in snapshot.results:
+        frame = self._last_packet.result if self._last_packet is not None else None
+        for index, result in enumerate(snapshot.results, 1):
             if result.error:
-                lines.append(f"<span style='color:{c['warn']}'>暫停判定：{result.error}</span>")
+                detail = escape(condition_error_text(result, frame, self.sop))
+                lines.append(f"<span style='color:{c['warn']}'>完成條件 {index} 暫停判定：{detail}</span>")
             else:
                 mark, color = ("成立", c["ok"]) if result.met else ("未成立", c["ng"])
                 lines.append(f"<span style='color:{color}'>{mark} {result.condition.describe()}"
                              f"　（{result.detail or f'目前 {result.count}'}）</span>")
-        for result in snapshot.forbidden_results:
-            if result.met:
+        for index, result in enumerate(snapshot.forbidden_results, 1):
+            if result.error:
+                detail = escape(condition_error_text(result, frame, self.sop))
+                lines.append(f"<span style='color:{c['warn']}'>警告條件 {index} 無法判斷：{detail}</span>")
+            elif result.met:
                 lines.append(f"<span style='color:{c['ng']}'>違規：{result.condition.describe()}</span>")
         if step.timeout_sec > 0:
             remaining = step.timeout_sec - (snapshot.now - runtime.started_at)
@@ -708,7 +800,10 @@ class RunPage(QWidget):
             self._set_instruction("等待重置條件成立後開始下一輪")
             self.progress.setFormat("重置條件 %p%")
             self.progress.setValue(round(snapshot.progress * 100))
-            lines = [f"{'成立' if r.met else '未成立'} {r.condition.describe()}" for r in snapshot.results]
+            frame = self._last_packet.result if self._last_packet is not None else None
+            lines = [("重置條件無法判斷：" + escape(condition_error_text(r, frame, self.sop))
+                      if r.error else f"{'成立' if r.met else '未成立'} {escape(r.condition.describe())}")
+                     for r in snapshot.results]
             self.condition_label.setText("<br>".join(lines))
         else:
             self._set_next_step(0, "（下一輪）")
@@ -737,6 +832,9 @@ class RunPage(QWidget):
 
     def _on_start_clicked(self):
         if not self._running:
+            if self._tracking_configuration_error():
+                self._update_start_availability()
+                return
             self._emit_context()
             self.start_requested.emit()
         elif self._confirm("停止作業", "停止後本輪將記為「中止」。確定要停止作業嗎？"):

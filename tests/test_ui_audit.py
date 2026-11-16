@@ -12,7 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt
@@ -111,13 +111,16 @@ class WholeUIAuditTests(unittest.TestCase):
         cls.app = fixtures.WorkbenchQtTests.app
 
     def setUp(self):
+        import cv2 as native_cv
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         for patcher in (patch("sop_app.ui.main_window.RECORDS_DIR", Path(self.directory.name)),
                         patch.object(MainWindow, "_load_settings", return_value={}),
                         patch.object(MainWindow, "_save_settings"),
                         patch("sop_app.ui.main_window.VideoPipeline.start"),
-                        patch("sop_app.ui.main_window.cv2.require", return_value=Mock())):
+                        # All modules share this LazyOpenCV instance. The audit
+                        # uses real overlay rendering but never opens a camera.
+                        patch("sop_app.ui.main_window.cv2.require", return_value=native_cv)):
             patcher.start(); self.addCleanup(patcher.stop)
         self.window = MainWindow(defer_initial_sop=True)
         self.addCleanup(self.close_window)

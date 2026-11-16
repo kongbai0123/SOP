@@ -42,13 +42,13 @@ class PipelineTracking:
     """模擬背景管線：逐幀定位並把結果與工件識別碼放進畫面封包（介面不再自行定位）。"""
 
     def __init__(self, workpiece):
-        self.locator = WorkpieceLocator(workpiece)
+        self.locator = WorkpieceLocator(workpiece, adaptive_budget=True)
         self.key = workpiece_key(workpiece)
 
     def packet(self, image, timestamp):
-        transform, status = self.locator.locate(image)
+        transform, status = self.locator.locate(image, timestamp=timestamp)
         result = FrameResult(image.shape[1], image.shape[0], timestamp, workpiece_transform=transform,
-                             tracking_status=status, workpiece_key=self.key)
+                             tracking_status=status, tracking_state=self.locator.state, workpiece_key=self.key)
         return FramePacket(image, image.copy(), result, None, 10, 5)
 
 
@@ -290,7 +290,8 @@ class EditorTests(unittest.TestCase):
         self.assertIn('grip＠左側 出現', editor.step_editors[0].header_row.toolTip())
         packet = FramePacket(scene(), scene(), FrameResult(640, 480, 0, detection_valid=True), None, 10, 5)
         editor.on_packet(packet)
-        self.assertIn('左側（固定畫面）', editor.roi_rows[0].toolTip())
+        self.assertIn('左側（固定畫面', editor.roi_rows[0].toolTip())
+        self.assertIn('操作區', editor.roi_rows[0].toolTip())
         self.assertIn('條件本幀成立', editor.roi_rows[0].toolTip())
         editor.edit_steps_button.setChecked(True)
         self.app.processEvents()
@@ -331,9 +332,9 @@ class EditorTests(unittest.TestCase):
         run.start_requested.connect(lambda: started.append(True))
         run.start_button.click()
         self.assertEqual(started, [True])
-        run.display_all_check.setChecked(True)
-        self.assertEqual([r.name for r in run.video._rois], ['桌面','安裝位置'])
-        self.assertEqual(run.video._stale, {'安裝位置'})
+        self.assertEqual([r.name for r in run.video._rois], ['桌面'])
+        self.assertEqual(run.video._stale, set())
+        self.assertIn('尚未取得已確認位置', run.tracking_label.text())
         packet = FramePacket(frame, frame.copy(), FrameResult(640,480,0), None,10,5)
         pipeline = PipelineTracking(sop.workpiece)
         for _ in range(3):
@@ -349,7 +350,7 @@ class EditorTests(unittest.TestCase):
         blank = np.zeros_like(frame)
         run.on_packet(pipeline.packet(blank, 2))
         self.assertEqual([r.name for r in run.video._rois], ['桌面','安裝位置'])
-        self.assertEqual(run.video._stale, set())
+        self.assertEqual(run.video._stale, {'安裝位置'})
         run.on_packet(pipeline.packet(blank, 3))
         self.assertEqual(run.video._stale, {'安裝位置'})
         self.assertIn('位置跟隨暫停', run.tracking_label.text())
@@ -358,13 +359,13 @@ class EditorTests(unittest.TestCase):
         run.set_running(True)
         for _ in range(3):
             run.on_packet(packet)
-        self.assertEqual([r.name for r in run.video._rois], ['桌面','安裝位置'])
-        self.assertEqual(run.video._stale, {'安裝位置'})
+        self.assertEqual([r.name for r in run.video._rois], ['桌面'])
+        self.assertEqual(run.video._stale, set())
         run.clear_video('中斷')
         self.assertEqual(run.video._rois, [])
         self.assertIsNone(run._transform)
 
-    def test_monitor_hides_frame_by_frame_tracking_details_when_step_has_no_region(self):
+    def test_monitor_keeps_regions_when_current_step_has_no_region(self):
         frame = scene()
         sop = SOPDefinition(
             workpiece=capture_workpiece(frame, TARGET),
@@ -373,11 +374,14 @@ class EditorTests(unittest.TestCase):
         run = RunPage()
         self.addCleanup(run.close)
         run.set_sop(sop)
-        texts = {run.tracking_label.text()}
+        self.assertEqual(run.video._rois, [])
+        pipeline = PipelineTracking(sop.workpiece)
         for index, image in enumerate([frame, frame, frame, np.zeros_like(frame), frame]):
-            run.on_packet(FramePacket(image, image, FrameResult(640,480,index), None,10,5))
-            texts.add(run.tracking_label.text())
-        self.assertEqual(texts, {'目前工序不使用工作區域'})
+            run.on_packet(pipeline.packet(image, index / 30))
+            self.assertEqual([roi.name for roi in run.video._rois], ['安裝位置'])
+            self.assertEqual(run.video._stale, {'安裝位置'} if index == 3 else set())
+        self.assertEqual([roi.name for roi in run.video._rois], ['安裝位置'])
+        self.assertIn('區域 1/1', run.tracking_label.text())
         self.assertNotIn('特徵', run.tracking_label.text())
 
     def test_direct_handlebar_setup_binds_visible_condition_and_saves(self):
@@ -458,7 +462,7 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(editor.sop.rois[0].anchor, 'workpiece')
         self.assertNotIn('車把手主工件', [roi.name for roi in editor.video._rois])
 
-    def test_monitor_step_and_all_modes_filter_objects(self):
+    def test_monitor_categories_keep_all_regions_and_objects_across_steps(self):
         left = ROI('左',[(.1,.1),(.3,.1),(.3,.4),(.1,.4)])
         right = ROI('右',[(.6,.1),(.8,.1),(.8,.4),(.6,.4)])
         sop = SOPDefinition(rois=[left,right], steps=[
@@ -477,32 +481,35 @@ class EditorTests(unittest.TestCase):
         packet = FramePacket(raw, np.full_like(raw,255), result, engine.snapshot(),10,5,None,
                              ('left_part','right_part','noise'),.5,False)
         run.on_packet(packet)
-        self.assertEqual([r.name for r in run.video._rois],['左'])
-        self.assertIn('目前流程 1：左步驟',run.display_summary.text())
-        self.assertIn('left_part',run.display_summary.text())
-        self.assertGreater(run.video._image.pixelColor(15,15).red(), 0)
-        self.assertEqual(run.video._image.pixelColor(85,75).red(), 0)
-        run.display_all_check.setChecked(True)
         self.assertEqual([r.name for r in run.video._rois],['左','右'])
+        self.assertEqual(run.video._highlight, {'左'})
+        self.assertIn('目前流程 1：左步驟',run.display_summary.text())
         self.assertIn('目前顯示 3 個物件',run.display_summary.text())
         self.assertIn('模型共 3 類',run.display_summary.text())
-        # 左側完成後，同一個 snapshot 切到右側，舊框立即消失。
+        rendered = run._monitor_frame(packet, packet.snapshot)
+        self.assertTrue(np.any(rendered))
+        self.assertFalse(np.all(rendered == 255))  # Never use evidence frame with burned-in ROI lines.
+        run.set_display_groups({'operation'})
+        self.assertTrue(np.array_equal(run._monitor_frame(packet, packet.snapshot), raw))
+        self.assertEqual([r.name for r in run.video._rois],['左','右'])
+        run.set_display_groups({'operation', 'objects', 'installation'})
+        # 左側完成後，只改右側加亮；啟用分類的其他區域與物件仍常駐。
         engine.update(FrameResult(100,100,1,[detections[0]]))
         packet.snapshot = engine.snapshot()
-        run.display_step_check.setChecked(True)
         run.on_packet(packet)
-        self.assertEqual([r.name for r in run.video._rois],['右'])
+        self.assertEqual([r.name for r in run.video._rois],['左','右'])
+        self.assertEqual(run.video._highlight, {'右'})
         self.assertIn('目前流程 2：右步驟',run.display_summary.text())
+        self.assertIn('目前顯示 3 個物件',run.display_summary.text())
 
     def test_monitor_new_sop_cannot_reuse_old_transform(self):
         run = RunPage()
         self.addCleanup(run.close)
         run._transform = IDENTITY.copy()
         run.set_sop(SOPDefinition(rois=[ROI('新位置',TARGET,'workpiece')]))
-        run.display_all_check.setChecked(True)
         self.assertIsNone(run._transform)
         self.assertEqual(run.video._rois, [])
-        self.assertIn('區域超出畫面', run.tracking_label.text())
+        self.assertIn('尚未取得已確認位置', run.tracking_label.text())
 
     def test_capture_bind_preview_and_reload(self):
         editor = EditorPage()
@@ -552,9 +559,12 @@ class EditorTests(unittest.TestCase):
         engine.update(packet.result)
         packet.snapshot = engine.snapshot()
         run.on_packet(packet)
+        self.assertEqual(run.video._rois, [])
+        self.assertEqual(run.video._stale, set())
+        self.assertIn('尚未取得已確認位置', run.tracking_label.text())
+        run.on_packet(pipeline.packet(frame, 2))
         self.assertEqual([roi.name for roi in run.video._rois], ['壓合位置'])
-        self.assertEqual(run.video._stale, {'壓合位置'})
-        self.assertIn('位置跟隨暫停', run.tracking_label.text())
+        self.assertEqual(run.video._stale, set())
         editor.close()
         run.close()
 

@@ -87,7 +87,7 @@ class FollowROIEditingTests(unittest.TestCase):
         page = self.page()
         layout = page.region_tools.layout()
         self.assertEqual([layout.itemAt(i).widget() for i in range(layout.count())],
-                         [page.draw_button, page.edit_rois_button, page.live_button])
+                         [page.region_anchor_combo, page.draw_button, page.edit_rois_button, page.live_button])
         self.assertEqual(page.target_button.text(), "框選參考工件")
 
     def test_latest_raw_frame_and_exact_pose_used_without_replacing_reference_or_conditions(self):
