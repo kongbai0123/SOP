@@ -402,8 +402,9 @@ class EditorTests(unittest.TestCase):
         editor.add_step_button.click()
         step = editor.step_editors[0]
         editor._open_step_settings(step.step)
-        step.completion_method.setCurrentIndex(step.completion_method.findData('auto'))
+        self.assertEqual(step.completion_method.currentData(), 'auto')
         conditions = step.condition_table
+        conditions.add_button.click()
         label = conditions.field_widget(0, 'label')
         label.setCurrentIndex(label.findData('grip'))
         region = conditions.field_widget(0, 'roi')

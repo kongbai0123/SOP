@@ -90,6 +90,18 @@ class WorkpieceLocator:
     MAX_LOCAL_SEARCH_SIDE = 640
     MAX_FLOW_POINTS = 240
     MAX_RANSAC_ITERS = 1000
+    # 距離輪廓：參考輪廓至少此比例在畫面內才評分；出畫部分不算支持也不算反證。
+    CONTOUR_MIN_VISIBLE = .75
+    # 上次確認角度與光流角度另以補零外框比對（工件尺寸的此比例），找回部分出畫的工件。
+    CONTOUR_PAD = .25
+    CONTOUR_CACHE_LIMIT = 256
+    # ±42° 以外分三組；連續兩次找不到後才與既有兩組交替，不拖慢常見角度的恢復。
+    CONTOUR_WIDE_ANGLES = tuple(a for a in range(-174, 181, 6) if abs(a) > 42)
+    CONTOUR_WIDE_GROUPS = 3
+    # 粗搜 0.9/1.0/1.1 之間的細搜：步距 0.025 連續涵蓋 0.85～1.15，0.95、1.05 也搜得到。
+    # 單組粗搜角度相隔 12°，角度細搜取 ±6° 才連續涵蓋。
+    CONTOUR_FINE_SCALES = (-.05, -.025, 0., .025, .05)
+    CONTOUR_FINE_DEGREES = 6
 
     def __init__(self, workpiece: Workpiece, *, adaptive_budget=False):
         self.budget = TrackingBudget() if adaptive_budget else None
@@ -131,6 +143,9 @@ class WorkpieceLocator:
         self._contour_cache = {}
         self._contour_group = 0
         self._contour_hint = None
+        self._contour_attempts = 0   # 上次輪廓接受後的連續搜尋次數
+        self._contour_wide = 0
+        self._flow_matrix = None
         self._last_absolute_stage = None
         self._template_group_index = 0
         self._motion_filter = AdaptiveMotionFilter(self.corners, self.CORRECTION_RATIO)
@@ -150,6 +165,7 @@ class WorkpieceLocator:
         self._flow_src = None
         self._flow_dst = None
         self._flow_age = 0
+        self._flow_matrix = None
         self._last_verified_timestamp = None
         self._previous_source_timestamp = None
         self._time_recheck_due = False
@@ -266,7 +282,7 @@ class WorkpieceLocator:
             results[stage] = "ok"
             for image, expected in stage_views:
                 self.metrics = {"diagnostics": {}}
-                self._template_group_index = 0
+                self._template_group_index = self._contour_attempts = 0
                 matrix, _count = estimate(image)
                 if matrix is None:
                     results[stage] = self.metrics["diagnostics"].get(stage, {}).get("reason", "no_valid_match")
@@ -275,7 +291,7 @@ class WorkpieceLocator:
                 if results[stage] != "ok":
                     break
         self.metrics = {}
-        self._template_group_index = 0
+        self._template_group_index = self._contour_attempts = 0
         self._disabled_stages = {stage for stage, result in results.items() if result != "ok"}
         if "ok" not in results.values():
             details = "；".join(f"{self._STAGE_NAMES[stage]}：{self._CHECK_REASONS.get(result, '無法定位')}"
@@ -363,6 +379,8 @@ class WorkpieceLocator:
             flowed = self._estimate_flow(gray)
             self.metrics.setdefault("stages_ms", {})["flow"] = (time.perf_counter() - flow_started) * 1000
             self.metrics.setdefault("outcomes", {})["flow"] = "accepted" if flowed[0] is not None else "no_valid_match"
+        # 光流當下角度只讓輪廓搜尋多比一個角度，不提供位置或分數。
+        self._flow_matrix = flowed[0]
         if flowed[0] is not None:
             age = self._flow_age
             weak = self.budget is not None and flowed[1] < 20 and age >= self.MIN_RECHECK_FRAMES
@@ -465,7 +483,7 @@ class WorkpieceLocator:
         if selected is None and not preferred_attempted:
             selected = self.budget.select_stage(list(expensive), now, spent)
         for stage in expensive:
-            if stage != selected:
+            if stage != selected and stage not in self.metrics.get("stages_ms", {}):
                 self.metrics.setdefault("skipped", []).append(stage)
                 self._diagnose(stage, "one_recovery_stage_per_frame" if selected else "compute_budget_deferred")
         if selected is not None:
@@ -829,22 +847,87 @@ class WorkpieceLocator:
                                "entries": {}, "shrink": shrink, "edges": selected}
         return self._contour_cache
 
-    @staticmethod
-    def _contour_entry(cache, angle, scale):
+    @classmethod
+    def _contour_entry(cls, cache, angle, scale):
         key = (round(float(angle), 3), round(float(scale), 3))
-        if key not in cache["entries"]:
-            cloud = cache["cloud"]
-            affine = cv2.getRotationMatrix2D(tuple(cache["polygon"].mean(axis=0)), float(angle), float(scale))
-            moved = cloud @ affine[:, :2].T + affine[:, 2]
-            lo = np.floor(moved.min(axis=0)).astype(int) - 1
-            hi = np.ceil(moved.max(axis=0)).astype(int) + 2
-            # Build in an expanded canvas, so rotation never clips the stem or
-            # leaves only a small matching fraction of the reference contour.
-            affine[:, 2] -= lo
-            template = cv2.warpAffine(cache["edges"], affine, tuple(hi - lo))
-            template = np.float32(template > 90)
-            cache["entries"][key] = (template, affine)
-        return cache["entries"][key]
+        entries = cache["entries"]
+        if key in entries:
+            # Full-circle angles and fine steps create many templates; keep
+            # only the most recently used ones so memory stays bounded.
+            entries[key] = entries.pop(key)
+            return entries[key]
+        cloud = cache["cloud"]
+        affine = cv2.getRotationMatrix2D(tuple(cache["polygon"].mean(axis=0)), float(angle), float(scale))
+        moved = cloud @ affine[:, :2].T + affine[:, 2]
+        lo = np.floor(moved.min(axis=0)).astype(int) - 1
+        hi = np.ceil(moved.max(axis=0)).astype(int) + 2
+        # Build in an expanded canvas, so rotation never clips the stem or
+        # leaves only a small matching fraction of the reference contour.
+        affine[:, 2] -= lo
+        template = cv2.warpAffine(cache["edges"], affine, tuple(hi - lo))
+        template = np.float32(template > 90)
+        if len(entries) >= cls.CONTOUR_CACHE_LIMIT:
+            del entries[next(iter(entries))]
+        entries[key] = (template, affine)
+        return entries[key]
+
+    @staticmethod
+    def _wrap_angle(angle):
+        return (float(angle) + 180.) % 360. - 180.
+
+    @staticmethod
+    def _visible_mass(template, origin, size, frame_shape):
+        """Template mass inside the frame at each matchTemplate position.
+
+        Output (row, col) puts the template's top-left corner at frame pixel
+        origin + (col, row); a zero border outside the frame adds nothing.
+        """
+        th, tw = template.shape
+        integral = cv2.integral(template)
+        ys, xs = origin[1] + np.arange(size[0]), origin[0] + np.arange(size[1])
+        r0, r1 = np.clip(-ys, 0, th), np.clip(frame_shape[0] - ys, 0, th)
+        c0, c1 = np.clip(-xs, 0, tw), np.clip(frame_shape[1] - xs, 0, tw)
+        return integral[r1][:, c1] - integral[r0][:, c1] - integral[r1][:, c0] + integral[r0][:, c0]
+
+    def _contour_scores(self, image, origin, template, frame_shape):
+        """Mean distance-field support over the template contour inside the frame."""
+        ccorr = cv2.matchTemplate(image, template, cv2.TM_CCORR)
+        total = max(float(template.sum()), 1.)
+        if (min(origin) >= 0 and origin[0] + image.shape[1] <= frame_shape[1]
+                and origin[1] + image.shape[0] <= frame_shape[0]):
+            return ccorr / total
+        mass = self._visible_mass(template, origin, ccorr.shape, frame_shape)
+        return np.where(mass >= self.CONTOUR_MIN_VISIBLE * total,
+                        ccorr / np.maximum(mass, 1.), -1.).astype(np.float32)
+
+    def _contour_angles(self, shape):
+        """Angles for this search, and the subset also compared past the frame border.
+
+        Two bounded groups alternate across +/-42 degrees; 0 is always a
+        competitor. After two failed searches every other call scans a third
+        of the remaining circle, so a part resting at any rotation is found
+        without slowing common recovery. Hints only choose angles to match
+        across the whole current image; they never supply a pose or score.
+        """
+        failed = self._contour_attempts
+        self._contour_attempts += 1
+        if failed >= 2 and failed % 2 == 0:
+            step = self.CONTOUR_WIDE_GROUPS
+            angles = (0, *self.CONTOUR_WIDE_ANGLES[self._contour_wide % step::step])
+            self._contour_wide += 1
+        else:
+            groups = ((0, -42, -30, -18, -6, 6, 18, 30, 42),
+                      (0, -36, -24, -12, 12, 24, 36))
+            angles = groups[self._contour_group % 2] if self.budget else tuple(range(-42, 43, 6))
+            self._contour_group += 1
+        hints = [self._wrap_angle(self._contour_hint if self._contour_hint is not None else 0.)]
+        if self._flow_matrix is not None:
+            # Normalized flow matrix -> pixel rotation; template angles are counter-clockwise.
+            m, (h, w) = self._flow_matrix, shape
+            current = self._wrap_angle(round(-np.degrees(np.arctan2(m[1, 0] * h, m[0, 0] * w))))
+            # A nearby confirmed angle is the same candidate; pay for one padded search.
+            hints = [angle for angle in hints if abs(self._wrap_angle(angle - current)) > 3] + [current]
+        return tuple(dict.fromkeys((*map(self._wrap_angle, angles), *hints))), set(hints)
 
     def _estimate_contour(self, full_gray):
         """Absolute contour recovery for low-texture parts, including rotation.
@@ -852,11 +935,14 @@ class WorkpieceLocator:
         A distance field tolerates small projected edge changes of a real 3-D
         object. It still needs a unique location and support across the part;
         neither flow continuity nor last frame's position can confirm it.
+        Contour outside the frame is neither support nor counter-evidence, but
+        most of the part must be visible and every visible quadrant must agree.
         """
         factor = min(1., 480 / max(full_gray.shape))
         shape = (round(full_gray.shape[0] * factor), round(full_gray.shape[1] * factor))
         cache = self._contour_reference(shape)
         cloud, polygon = cache["cloud"], cache["polygon"]
+        angles, padded_angles = self._contour_angles(shape)
         if len(cloud) < 60 or (np.ptp(cloud, axis=0) < np.ptp(polygon, axis=0) * .5).any():
             return None, 0
         gray = cv2.resize(full_gray, (shape[1], shape[0]))
@@ -865,77 +951,96 @@ class WorkpieceLocator:
             return None, 0
         distance = cv2.distanceTransform(255 - edges, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
         near = np.exp(-distance ** 2 / (2 * 2.5 ** 2)).astype(np.float32)
-        # Two bounded groups cover +/-42 degrees; 0 is always a competitor.
-        groups = ((0, -42, -30, -18, -6, 6, 18, 30, 42),
-                  (0, -36, -24, -12, 12, 24, 36))
-        angles = groups[self._contour_group % 2] if self.budget else tuple(range(-42, 43, 6))
-        if self._contour_hint is not None:
-            # This only picks an angle to search across the entire current
-            # image. A hint never supplies a translation, score or valid pose.
-            angles = tuple(dict.fromkeys((*angles, self._contour_hint)))
-        self._contour_group += 1
+        # A zero border lets a partly out-of-frame part be compared at all;
+        # only hinted angles pay for it, and scores use in-frame contour only.
+        pad = int(np.ceil(self.CONTOUR_PAD * np.ptp(polygon, axis=0).max()))
+        padded = cv2.copyMakeBorder(near, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
         maps = []
         for angle in angles:
+            image, origin = (padded, (-pad, -pad)) if angle in padded_angles else (near, (0, 0))
             for scale in (.9, 1., 1.1):
                 template, affine = self._contour_entry(cache, angle, scale)
-                if template.shape[1] > shape[1] or template.shape[0] > shape[0]:
+                if template.shape[1] > image.shape[1] or template.shape[0] > image.shape[0]:
                     continue
-                scores = cv2.matchTemplate(near, template, cv2.TM_CCORR) / max(float(template.sum()), 1.)
+                scores = self._contour_scores(image, origin, template, shape)
                 _, score, _, location = cv2.minMaxLoc(scores)
-                maps.append((float(score), np.asarray(location, np.float64), scores, affine,
-                             template.shape, angle, scale))
+                maps.append((float(score), np.add(location, origin, dtype=np.float64), scores, affine,
+                             template.shape, angle, scale, origin))
         if not maps:
             return None, 0
         best = max(maps, key=lambda m: m[0])
         # Only refine near a plausible measured global peak. Fine matching uses
         # a small crop, rather than repeating a whole-image search 35 times.
         if best[0] >= .55:
-            coarse_angle, coarse_scale = best[5:7]
             coarse_centre = polygon.mean(axis=0) @ best[3][:, :2].T + best[3][:, 2] + best[1]
-            for angle in np.arange(coarse_angle - 3, coarse_angle + 3.01, 1.):
-                for scale in (coarse_scale - .025, coarse_scale, coarse_scale + .025):
-                    template, affine = self._contour_entry(cache, angle, scale)
-                    centre = polygon.mean(axis=0) @ affine[:, :2].T + affine[:, 2]
-                    predicted = coarse_centre - centre
-                    lo = np.maximum(np.floor(predicted - 4).astype(int), 0)
-                    hi = np.minimum(np.ceil(predicted + 5).astype(int) + template.shape[::-1], shape[::-1])
-                    crop = near[lo[1]:hi[1], lo[0]:hi[0]]
-                    if crop.shape[0] < template.shape[0] or crop.shape[1] < template.shape[1]:
-                        continue
-                    scores = cv2.matchTemplate(crop, template, cv2.TM_CCORR) / max(float(template.sum()), 1.)
-                    _, score, _, location = cv2.minMaxLoc(scores)
-                    if score > best[0]:
-                        best = (float(score), np.asarray(location, np.float64) + lo, scores,
-                                affine, template.shape, float(angle), float(scale))
-        score, location, _, affine, _, angle, scale = best
+            searched = set()
+
+            def refine(angle, scale):
+                nonlocal best
+                angle, scale = self._wrap_angle(angle), round(float(scale), 4)
+                if (angle, scale) in searched:
+                    return
+                searched.add((angle, scale))
+                template, affine = self._contour_entry(cache, angle, scale)
+                centre = polygon.mean(axis=0) @ affine[:, :2].T + affine[:, 2]
+                predicted = coarse_centre - centre + pad
+                lo = np.maximum(np.floor(predicted - 4).astype(int), 0)
+                hi = np.minimum(np.ceil(predicted + 5).astype(int) + template.shape[::-1], padded.shape[::-1])
+                crop = padded[lo[1]:hi[1], lo[0]:hi[0]]
+                if crop.shape[0] < template.shape[0] or crop.shape[1] < template.shape[1]:
+                    return
+                origin = tuple(lo - pad)
+                scores = self._contour_scores(crop, origin, template, shape)
+                _, score, _, location = cv2.minMaxLoc(scores)
+                if score > best[0]:
+                    best = (float(score), np.add(location, origin, dtype=np.float64), scores,
+                            affine, template.shape, angle, scale, origin)
+
+            # Coordinate search keeps the crop count near a 3x7 grid: angle
+            # across one group's spacing, then scale, then the joint neighbours.
+            angle, scale = best[5:7]
+            for step in range(-self.CONTOUR_FINE_DEGREES, self.CONTOUR_FINE_DEGREES + 1):
+                refine(angle + step, scale)
+            for step in self.CONTOUR_FINE_SCALES:
+                refine(best[5], scale + step)
+            angle, scale = best[5:7]
+            for turn in (-1, 0, 1):
+                for step in (-.025, 0., .025):
+                    refine(angle + turn, scale + step)
+        score, location, _, affine, _, angle, scale, _ = best
         centre = polygon.mean(axis=0) @ affine[:, :2].T + affine[:, 2] + location
         competitor = -1.
-        for _, _, scores, other, _, other_angle, _ in maps:
+        for _, _, scores, other, _, other_angle, _, origin in maps:
             excluded = scores.copy()
             other_centre = polygon.mean(axis=0) @ other[:, :2].T + other[:, 2]
             # Nearby angles are the same pose; distinctly different rotations
             # at the same centre are still competing explanations.
-            if abs(other_angle - angle) <= 12:
-                cv2.circle(excluded, tuple(np.int32(np.round(centre - other_centre))), 20, -1., -1)
+            if abs(self._wrap_angle(other_angle - angle)) <= 12:
+                cv2.circle(excluded, tuple(np.int32(np.round(centre - other_centre - origin))), 20, -1., -1)
             competitor = max(competitor, float(excluded.max()))
-        values = dict(best_score=round(score, 3), competitor_score=round(competitor, 3),
-                      method="contour_distance", angle=angle, scale=scale)
-        if score < .65 or score - competitor < .10:
-            self._diagnose("template", "score_below_threshold" if score < .65 else "ambiguous", **values)
-            return None, 0
         affine = affine.copy()
         affine[:, 2] += location
         moved = cloud @ affine[:, :2].T + affine[:, 2]
+        inside = (moved >= 0).all(axis=1) & (moved <= np.subtract(shape[::-1], 1)).all(axis=1)
+        values = dict(best_score=round(score, 3), competitor_score=round(competitor, 3),
+                      method="contour_distance", angle=angle, scale=round(float(scale), 3),
+                      visible=round(float(inside.mean()), 3))
+        if score < .65 or score - competitor < .10:
+            self._diagnose("template", "score_below_threshold" if score < .65 else "ambiguous", **values)
+            return None, 0
         sampled = cv2.remap(near, np.float32(moved[:, 0]).reshape(1, -1),
                             np.float32(moved[:, 1]).reshape(1, -1), cv2.INTER_LINEAR).ravel()
         cells = (cloud >= (cloud.min(axis=0) + cloud.max(axis=0)) / 2).astype(int)
-        support = [float(sampled[(cells == (x, y)).all(axis=1)].mean())
-                   for y in (0, 1) for x in (0, 1) if np.count_nonzero((cells == (x, y)).all(axis=1)) >= 20]
+        # Per-quadrant check on in-frame contour only: a quadrant that has
+        # left the frame drops out, but every visible one must still agree.
+        quadrants = [(cells == (x, y)).all(axis=1) & inside for y in (0, 1) for x in (0, 1)]
+        support = [float(sampled[cell].mean()) for cell in quadrants if np.count_nonzero(cell) >= 20]
         if len(support) < 3 or min(support) < .4:
             self._diagnose("template", "geometry_rejected", support=support, **values)
             return None, 0
         self._diagnose("template", "accepted", support=support, **values)
         self._contour_hint = angle
+        self._contour_attempts = 0
         rh, rw = self._reference_gray.shape
         to_full = np.diag([full_gray.shape[1] / shape[1], full_gray.shape[0] / shape[0]])
         affine = to_full @ affine @ np.diag([*cache["shrink"], 1.])

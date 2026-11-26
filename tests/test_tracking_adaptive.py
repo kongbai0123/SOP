@@ -121,6 +121,24 @@ class AdaptiveTrackingTests(unittest.TestCase):
             self.assertGreaterEqual(second[name], 0.)
         self.assertGreaterEqual(locator.metrics['tracking_ms'], sum(second.values()))
 
+    def test_preferred_template_failure_preserves_diagnostic_and_not_skipped(self):
+        locator = self.locator()
+        locator._last_absolute_stage = 'template'
+        locator._verification_failed = False
+
+        def failing_template(gray):
+            locator._diagnose('template', 'score_below_threshold', score=.12, threshold=.5)
+            return None, 0
+
+        with patch.object(locator, '_estimate_features', return_value=(None, 0)), \
+             patch.object(locator, '_estimate_template', side_effect=failing_template):
+            self.assertIsNone(locator.locate(self.reference)[0])
+        self.assertIn('template', locator.metrics['stages_ms'])
+        self.assertNotIn('template', locator.metrics.get('skipped', []))
+        self.assertEqual(locator.metrics['diagnostics']['template']['reason'], 'score_below_threshold')
+        self.assertIn('sift', locator.metrics.get('skipped', []))
+        self.assertEqual(locator.metrics['diagnostics']['sift']['reason'], 'compute_budget_deferred')
+
 
 class RecoveryBudgetSchedulingTests(unittest.TestCase):
     def test_forced_due_stages_are_staggered_and_fair(self):

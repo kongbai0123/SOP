@@ -46,7 +46,7 @@ def main():
         window.show()
         progress.report(100, "主介面已開啟")
         # 關閉前置視窗後才讀取 SOP，避免錯誤對話框被前置視窗遮住。
-        QTimer.singleShot(0, window._open_initial_sop)
+        QTimer.singleShot(0, lambda: window._open_initial_sop(auto_connect_camera=True))
         progress.close()
         return app.exec()
     finally:

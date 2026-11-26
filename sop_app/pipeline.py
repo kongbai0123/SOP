@@ -70,13 +70,13 @@ class CameraSource:
     ended = False
 
     def __init__(self, index: int, width: int = 1280, height: int = 720, *,
-                 preferences=None, settings_token=None):
+                 preferences=None, settings_token=None, directshow_only=False):
         from .camera_controls import apply_controls, read_controls, saved_camera_changes
         self.label = f"攝影機 {index}"
         self.source_key = f"camera:{index}"
         self.settings_token = settings_token
         self.capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-        if not self.capture.isOpened():
+        if not directshow_only and not self.capture.isOpened():
             self.capture.release()
             self.capture = cv2.VideoCapture(index)
         if not self.capture.isOpened():
@@ -198,6 +198,7 @@ class VideoPipeline(QThread):
     model_progress = Signal(str, str)       # stage, requested source path
     model_timing = Signal(object)
     source_changed = Signal(str)           # 來源名稱，空字串 = 已中斷
+    source_change_finished = Signal()
     camera_available = Signal(bool)
     camera_controls_ready = Signal(object, object)
     camera_configuration_ready = Signal(object)  # source identity + accepted changes + final readback
@@ -243,10 +244,11 @@ class VideoPipeline(QThread):
         self._pacer = InferencePacer()
 
     # ---- 介面執行緒呼叫 --------------------------------------------------------
-    def open_camera(self, index: int, preferences=None, settings_token=None):
+    def open_camera(self, index: int, preferences=None, settings_token=None, *, directshow_only=False):
         preferences = copy.deepcopy(preferences or {})
+        options = {"directshow_only": True} if directshow_only else {}
         self._commands.put(("source", lambda: CameraSource(index, preferences=preferences,
-                                                         settings_token=settings_token)))
+                                                         settings_token=settings_token, **options)))
 
     def open_file(self, path: str, loop: bool = True):
         self._commands.put(("source", lambda: FileSource(path, loop)))
@@ -287,7 +289,7 @@ class VideoPipeline(QThread):
         self._commands.put(("restart", None))
 
     def confirm_step(self):
-        """只確認無自動條件的工序；有條件的工序必須用 skip_step 明確跳過。"""
+        """只確認使用人工確認的工序。跳過工序使用 skip_step。"""
         self._commands.put(("confirm", None))
 
     def skip_step(self):
@@ -595,7 +597,10 @@ class VideoPipeline(QThread):
                                  allow_unavailable=action == "restore")
             done.wait()
         elif command == "source":
-            self._set_source(payload, recorder)
+            try:
+                self._set_source(payload, recorder)
+            finally:
+                self.source_change_finished.emit()
         elif command == "model":
             self._start_model_load(payload)
         elif command == "model_ready":

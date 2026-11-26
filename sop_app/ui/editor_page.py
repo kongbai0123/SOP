@@ -30,6 +30,7 @@ from .editor_wheel_guard import install_editor_wheel_guard
 from .step_editor import StepEditor, field_pair, flow_row
 from .step_settings_drawer import StepSettingsDrawer
 from .video_widget import VideoWidget
+from .multi_camera_view import CameraPreviewPane
 from .toggle_switch import ToggleSwitch
 from .workbench_widgets import install_readability_guard, workbench_styles
 
@@ -340,7 +341,8 @@ class EditorPage(QWidget):
         self.center_layout = QVBoxLayout(pane)
         self.center_layout.setContentsMargins(0, 0, 0, 0)
         self.center_layout.setSpacing(4)
-        self.center_layout.addWidget(self.video, 1)
+        self.preview_pane = CameraPreviewPane(self.video)
+        self.center_layout.addWidget(self.preview_pane, 1)
         self.center_layout.addWidget(self.view_bar)
         self.center_layout.addWidget(self.guide_label)
         return pane
@@ -604,18 +606,19 @@ class EditorPage(QWidget):
                 else:
                     self.center_layout.removeWidget(self.tools_pane)
                     self.root_layout.addWidget(self.tools_pane)
-            self.center_layout.setStretchFactor(self.video, 0 if tools_under_image else 1)
+            self.center_layout.setStretchFactor(self.preview_pane, 0 if tools_under_image else 1)
             self.settings_pane.setVisible(steps_shown)
         self.settings_pane.setFixedWidth(left)
         if mode == "narrow":
             self.tools_pane.setMinimumWidth(0)
             self.tools_pane.setMaximumWidth(16777215)
             # Keep the image readable; the tools scroll in the remaining height.
-            self.video.setFixedHeight(max(135, min(round(center * 9 / 16), int(height * 0.5))))
+            self.preview_pane.setFixedHeight(max(self.preview_pane.minimum_preview_height,
+                                                min(round(center * 9 / 16), int(height * 0.5))))
         else:
             self.tools_pane.setFixedWidth(right)
-            self.video.setMinimumHeight(135)
-            self.video.setMaximumHeight(16777215)
+            self.preview_pane.setMinimumHeight(self.preview_pane.minimum_preview_height)
+            self.preview_pane.setMaximumHeight(16777215)
         self.root_layout.activate()
 
     def _focus_image(self, auto=True):
@@ -847,7 +850,7 @@ class EditorPage(QWidget):
 
     def _add_step(self, index=None):
         insert_at = len(self.sop.steps) if index is None else max(0, min(len(self.sop.steps), index + 1))
-        step = Step(name=f"工序 {len(self.sop.steps) + 1}")
+        step = Step(name=f"工序 {len(self.sop.steps) + 1}", completion_method="auto")
         self.sop.steps.insert(insert_at, step)
         self._clear_roi_history()
         self._rebuild_steps(step, reveal=step)
@@ -895,7 +898,7 @@ class EditorPage(QWidget):
 
     def _refresh_setup_summary(self):
         invalid = sum(bool(self._step_issues(step)) for step in self.sop.steps)
-        manual = sum(not step.conditions and not self._step_issues(step) for step in self.sop.steps)
+        manual = sum(step.is_manual and not self._step_issues(step) for step in self.sop.steps)
         model = {"unselected": "未選擇", "selected": "已選路徑，尚未載入", "loading": "載入中", "available": "可用", "failed": "失敗"}[self._model_state]
         self.setup_summary.setText(f"模型：{model}　工序 {len(self.sop.steps) - invalid}/{len(self.sop.steps)} 已設定"
                                    f"（自動 {len(self.sop.steps) - invalid - manual} · 人工確認 {manual} · 待修正 {invalid}）　作業區域 {len(self.sop.rois)} 個")
@@ -1059,8 +1062,13 @@ class EditorPage(QWidget):
         """One-frame result in the production engine's terms; time windows are not accumulated."""
         errors = list(dict.fromkeys(check.error for check in judged.completion_results + judged.forbidden_results
                                     if check.error))
-        if not step.conditions:
-            parts, state = ["需手動確認：未設定自動完成條件"], "neutral"
+        reminder_rule = step.forbidden_action == "remind"
+        if reminder_rule and (judged.forbidden_met or judged.forbidden_blocked):
+            parts, state = ["正式執行暫停完成判定，直到確認提醒條件解除"], "warning"
+        elif step.is_manual:
+            parts, state = ["依工序設定需手動確認"], "neutral"
+        elif not step.conditions:
+            parts, state = ["請新增完成條件"], "warning"
         elif judged.completion_blocked:
             parts, state = ["完成條件本幀無法判斷：正式執行暫停累積"], "warning"
         elif judged.completion_met:
@@ -1070,14 +1078,16 @@ class EditorPage(QWidget):
             parts, state = ["本幀條件未成立"], "neutral"
         if step.forbidden:
             hold, ratio = violation_window(step)
+            label = "提醒" if reminder_rule else "違規"
             if judged.forbidden_blocked:
-                parts.append("違規條件本幀無法判斷")
+                parts.append(f"{label}條件本幀無法判斷")
                 state = "warning" if state != "ng" else state
             elif judged.forbidden_met:
-                parts.append(f"本幀違規條件成立（觀察窗 {hold:g} 秒、至少 {ratio:.0%} 影格成立且最新一幀成立才警報）")
-                state = "ng"
+                signal = "提醒" if reminder_rule else "警報"
+                parts.append(f"本幀{label}條件成立（觀察窗 {hold:g} 秒、至少 {ratio:.0%} 影格成立且最新一幀成立才{signal}）")
+                state = "warning" if reminder_rule else "ng"
             else:
-                parts.append("違規條件本幀未成立")
+                parts.append(f"{label}條件本幀未成立")
         if errors:
             parts.append("；".join(errors))
         return "單幀預覽：" + " · ".join(parts), state
@@ -1099,7 +1109,7 @@ class EditorPage(QWidget):
         rois, result = self.sop.roi_map(), self._preview_result
         _, reset_results = evaluate_conditions(self.sop.cycle.reset_conditions, result, rois)
         self.reset_table.set_live_results(reset_results)
-        positives, violations, roi_checks = 0, 0, {}
+        positives, violations, reminders, roi_checks = 0, 0, 0, {}
         for editor in self.step_editors:
             step = editor.step
             judged = evaluate_step(step, result, rois)
@@ -1108,10 +1118,19 @@ class EditorPage(QWidget):
             for condition, check in zip(step.conditions, judged.completion_results):
                 if condition.roi:
                     roi_checks.setdefault(condition.roi, []).append(check)
-            positives += bool(step.conditions and judged.completion_met)
-            violations += bool(step.forbidden and judged.forbidden_met)
+            reminder_rule = step.forbidden_action == "remind"
+            reminder_blocked = reminder_rule and (judged.forbidden_met or judged.forbidden_blocked)
+            positives += bool(step.conditions and judged.completion_met and not reminder_blocked)
+            if step.forbidden and judged.forbidden_met:
+                if reminder_rule:
+                    reminders += 1
+                else:
+                    violations += 1
             editor.set_preview(*self._step_preview(step, judged))
-        self.live_label.setText(f"單幀預覽：{positives} 道工序完成條件成立 · {violations} 道違規條件成立")
+        preview = f"單幀預覽：{positives} 道工序完成條件成立 · {violations} 道違規條件成立"
+        if reminders:
+            preview += f" · {reminders} 道提醒條件成立"
+        self.live_label.setText(preview)
         statuses = []
         for row in self.roi_rows:
             checks = roi_checks.get(row.roi.name, [])
@@ -1815,7 +1834,10 @@ class EditorPage(QWidget):
         self.sop.workpiece = None
         self.sop.rois = [r for r in self.sop.rois if r.name not in dependent]
         for step in self.sop.steps:
-            step.conditions = [c for c in step.conditions if c.roi not in dependent]
+            remaining = [c for c in step.conditions if c.roi not in dependent]
+            if step.completion_method is None and step.conditions and not remaining:
+                step.completion_method = "auto"
+            step.conditions = remaining
             step.forbidden = [c for c in step.forbidden if c.roi not in dependent]
         for editor in self.step_editors:
             editor._automatic_conditions = [c for c in editor._automatic_conditions if c.roi not in dependent]
@@ -1831,7 +1853,7 @@ class EditorPage(QWidget):
         self._update_cycle_summary()
         self._update_live()
         self.tracking_label.setText("尚未設定工件跟隨；固定區域與工序已保留。")
-        self.guide_label.setText("已清除工件跟隨設定。需人工確認的工序會直接顯示在原位置。")
+        self.guide_label.setText("已清除工件跟隨設定。請檢查受影響工序的完成條件。")
         self._mark_modified()
         if restart and packet is not None:
             self._packet = packet
@@ -2016,11 +2038,13 @@ class EditorPage(QWidget):
             return "請先停止正式監控，再開始編輯器試跑。"
         if self._current_step() is None:
             return "請先新增工序。"
+        steps = self.sop.steps if self.validation_mode.currentData() == "flow" else [self._current_step()]
+        if any(not step.is_manual and not step.conditions for step in steps):
+            return "請新增完成條件後再開始自動判定試跑。"
         if self.freeze_check.isChecked() or self.reference_button.isChecked():
             return "目前為凍結／參考影像；請返回即時畫面。"
         if self._packet is None or self._packet_arrived_at is None or time.monotonic() - self._packet_arrived_at > 3:
             return "等待即時影像；請先連線影像來源。"
-        steps = self.sop.steps if self.validation_mode.currentData() == "flow" else [self._current_step()]
         needs_model = any(step.conditions or step.forbidden for step in steps)
         if self.validation_mode.currentData() == "flow":
             needs_model |= bool(self.sop.cycle.reset_conditions)
@@ -2080,15 +2104,18 @@ class EditorPage(QWidget):
         alert = trial.alert(include_tracking=self._show_tracking_alerts,
                             include_workflow=self._show_workflow_alerts)
         alert_text = alert["text"] if not self._production_running else ""
+        reminder = bool(alert_text) and alert.get("severity") == "reminder"
         self.validation_alert.setText(alert_text)
+        set_state(self.validation_alert, "reminder" if reminder else "ng")
         self.validation_alert.setVisible(bool(alert_text))
-        self.video.set_alert(alert_text, alert["regions"] if alert_text and alert["active"] else ())
         alert_regions = set(alert["regions"]) if alert_text and alert["active"] else set()
+        self.video.set_alert(alert_text, alert_regions, reminder=reminder)
         if alert_regions != self._active_alert_regions:
             self._active_alert_regions = alert_regions
             self._refresh_video_rois()
         self.validation_status.setText(trial.message if trial.engine is not None or trial.message.startswith("無法") else blocker or trial.message)
-        set_state(self.validation_status, "ng" if alert_text else "warning" if trial.stale or blocker else "running" if trial.running else "neutral")
+        set_state(self.validation_status, "ng" if alert_text and not reminder else
+                  "warning" if reminder or trial.stale or blocker else "running" if trial.running else "neutral")
         metrics = trial.metrics()
         self.validation_target.setText(metrics["target"])
         count_text = "條件 " + metrics["count"]
@@ -2108,8 +2135,7 @@ class EditorPage(QWidget):
         self.validation_ratio.setText("比例 " + metrics["ratio"].replace("≥", "至少"))
         self.validation_start.setEnabled(not trial.running and not blocker)
         self.validation_stop.setEnabled(trial.running)
-        manual = trial.running and trial.engine is not None and trial.engine.phase.value == "running" and not trial.engine.sop.steps[trial.engine.index].conditions
-        self.validation_confirm.setEnabled(manual)
+        self.validation_confirm.setEnabled(trial.manual_confirmation_available)
         lines = [trial.message]
         lines.extend(event.message for event in trial.events)
         detail = "\n".join(lines)
@@ -2169,10 +2195,18 @@ class EditorPage(QWidget):
 
     def _step_issues(self, step: Step) -> list[str]:
         issues = []
-        if step.completion_mode not in ("all", "any"):
+        if step.completion_method not in (None, "auto", "manual"):
             issues.append("完成方式無效")
+        elif step.is_manual and step.conditions:
+            issues.append("人工確認工序不可含有完成條件")
+        elif not step.is_manual and not step.conditions:
+            issues.append("請新增完成條件")
+        if step.completion_mode not in ("all", "any"):
+            issues.append("完成條件組合方式無效")
         if step.forbidden_mode not in ("all", "any"):
             issues.append("違規方式無效")
+        if step.forbidden_action not in ("ng", "remind"):
+            issues.append("違規處理方式無效")
         if not 0 < step.ratio <= 1:
             issues.append("成立比例無效")
         rois = self.sop.roi_map()

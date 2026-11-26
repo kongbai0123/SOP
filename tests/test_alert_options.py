@@ -85,6 +85,12 @@ class AlertOptionsTests(unittest.TestCase):
             page.set_sop(sop or definition())
         return page
 
+    def update_run(self, page, engine, result):
+        events = engine.update(result)
+        page.on_events(events)
+        page.on_packet(packet(result, engine.snapshot()))
+        return events
+
     def window(self, saved=None):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -120,7 +126,7 @@ class AlertOptionsTests(unittest.TestCase):
             page.on_packet(packet(result, engine.snapshot()))
             self.assertTrue(any(event.kind == "alarm" for event in events))
             self.assertFalse(engine.cycle_ok)
-            self.assertTrue(page._pending_alarms)
+            self.assertTrue(engine.snapshot().steps[0].active_violation)
             self.assertTrue(page.alarm_panel.isHidden())
             self.assertFalse(page._flash_timer.isActive())
             self.assertEqual(page.alarm_slot.minimumHeight(), 0)
@@ -139,30 +145,138 @@ class AlertOptionsTests(unittest.TestCase):
         acknowledged.assert_not_called()
         self.assertEqual(sop.to_dict(), original)
 
-    def test_hiding_and_restoring_pending_alarms_never_acknowledges_or_replays_sound(self):
-        page = self.page(RunPage)
-        engine = SOPEngine(definition())
-        engine.start(0)
+    def test_hiding_and_restoring_violation_never_acknowledges_or_replays_sound(self):
+        sop = definition()
+        page = self.page(RunPage, sop)
+        engine = SOPEngine(sop)
+        page.set_running(True)
+        page.on_events(engine.start(0))
         acknowledged = Mock()
         page.alarm_ack_requested.connect(acknowledged)
         with patch("sop_app.ui.run_page.QApplication.beep") as beep:
-            page.on_events(engine.update(frame(hand=True)))
+            self.update_run(page, engine, frame(hand=True))
             beep.assert_called_once()
             self.assertFalse(page.alarm_panel.isHidden())
             self.assertTrue(page._flash_timer.isActive())
-            pending, count = list(page._pending_alarms), page.log.count()
+            message, count = page.alarm_text.text(), page.log.count()
             page.set_alert_options(True, False)
             self.assertTrue(page.alarm_panel.isHidden())
             self.assertFalse(page._flash_timer.isActive())
             self.assertFalse(page._flash_on)
-            self.assertEqual(page._pending_alarms, pending)
             page.set_alert_options(False, True)
             self.assertFalse(page.alarm_panel.isHidden())
             self.assertTrue(page._flash_timer.isActive())
-            self.assertEqual(page._pending_alarms, pending)
+            self.assertEqual(page.alarm_text.text(), message)
             self.assertEqual(page.log.count(), count)
             beep.assert_called_once()
         acknowledged.assert_not_called()
+
+    def test_violation_dismisses_on_confirmed_clear_without_acknowledging_or_undoing_ng(self):
+        sop = definition(following=True)
+        sop.rois[0].anchor = "workpiece"
+        sop.steps[0].forbidden_hold_sec = .2
+        page = self.page(RunPage, sop)
+        engine = SOPEngine(sop)
+        page.set_running(True)
+        page.on_events(engine.start(0))
+        acknowledged = Mock()
+        page.alarm_ack_requested.connect(acknowledged)
+
+        with patch("sop_app.ui.run_page.QApplication.beep"):
+            self.update_run(page, engine, frame(.01, matrix=IDENTITY, sop=sop))
+            normal_banner = page.video._banner_color.name()
+            self.update_run(page, engine, frame(.05, hand=True, matrix=IDENTITY, sop=sop))
+            events = self.update_run(page, engine, frame(.26, hand=True, matrix=IDENTITY, sop=sop))
+            self.assertEqual([e.data.get("alarm") for e in events if e.kind == "alarm"], ["violation"])
+            self.assertFalse(page.alarm_panel.isHidden())
+            self.assertTrue(page.alarm_ack_button.isHidden())
+            self.assertTrue(page._flash_timer.isActive())
+            self.assertNotEqual(page.video._banner_color.name(), normal_banner)
+            self.assertEqual(page.step_overview._card(0).kind, "ng")
+
+            self.update_run(page, engine, frame(.31, sop=sop))
+            self.assertFalse(page.alarm_panel.isHidden())
+            self.assertEqual(page.step_overview._card(0).kind, "ng")
+            self.update_run(page, engine, frame(.32, matrix=IDENTITY, sop=sop))
+            self.assertTrue(page.alarm_panel.isHidden())
+            self.assertFalse(page._flash_timer.isActive())
+            self.assertEqual(page.video._banner_color.name(), normal_banner)
+            self.assertEqual(page.step_overview._card(0).kind, "active")
+            self.assertIn("有警報", page.step_overview._card(0).detail)
+            self.assertTrue(engine.snapshot().steps[0].violation_alarmed)
+            self.assertFalse(engine.cycle_ok)
+
+            self.update_run(page, engine, frame(.37, hand=True, matrix=IDENTITY, sop=sop))
+            self.assertTrue(page.alarm_panel.isHidden())
+            events = self.update_run(page, engine, frame(.62, hand=True, matrix=IDENTITY, sop=sop))
+            self.assertFalse(page.alarm_panel.isHidden())
+            self.assertEqual(page.step_overview._card(0).kind, "ng")
+            self.assertFalse(any(e.kind == "alarm" for e in events))
+            violation_log = [page.log.item(i).text() for i in range(page.log.count())
+                             if "違規：" in page.log.item(i).text()]
+            self.assertEqual(len(violation_log), 1)
+            events = self.update_run(page, engine, frame(.70, done=True, matrix=IDENTITY, sop=sop))
+            self.assertTrue(page.alarm_panel.isHidden())
+            self.assertEqual(page.step_overview._card(0).kind, "ng")
+            self.assertTrue(any(e.kind == "cycle_completed" and e.data.get("result") == "NG" for e in events))
+        acknowledged.assert_not_called()
+
+    def test_reminder_clears_automatically_and_allows_ok_in_monitor(self):
+        sop = definition()
+        sop.steps[0].forbidden_action = "remind"
+        page = self.page(RunPage, sop)
+        engine = SOPEngine(sop)
+        page.set_running(True)
+        page.on_events(engine.start(0))
+        acknowledged = Mock()
+        page.alarm_ack_requested.connect(acknowledged)
+
+        with patch("sop_app.ui.run_page.QApplication.beep") as beep:
+            events = self.update_run(page, engine, frame(.1, hand=True, done=True))
+            self.assertEqual([e.kind for e in events], ["reminder"])
+            self.assertFalse(page.alarm_panel.isHidden())
+            self.assertEqual(page.alarm_panel.property("reminder"), "true")
+            self.assertTrue(page.alarm_ack_button.isHidden())
+            self.assertFalse(page._flash_timer.isActive())
+            self.assertEqual(page.step_overview._card(0).kind, "warn")
+            self.assertEqual(page.progress.format(), "等待提醒解除")
+            self.assertTrue(engine.cycle_ok)
+
+            self.update_run(page, engine, frame(.2, valid=False))
+            self.assertFalse(page.alarm_panel.isHidden())
+            page.set_alert_options(True, False)
+            self.assertTrue(page.alarm_panel.isHidden())
+            page.set_alert_options(True, True)
+            self.assertFalse(page.alarm_panel.isHidden())
+            events = self.update_run(page, engine, frame(.3, done=True))
+            self.assertTrue(any(e.kind == "cycle_completed" and e.data["result"] == "OK" for e in events))
+            self.assertTrue(page.alarm_panel.isHidden())
+            self.assertEqual(page.step_overview._card(0).kind, "ok")
+            beep.assert_not_called()
+        acknowledged.assert_not_called()
+
+    def test_clearing_violation_keeps_timeout_available_for_manual_acknowledgement(self):
+        sop = definition()
+        sop.steps[0].timeout_sec = .25
+        page = self.page(RunPage, sop)
+        engine = SOPEngine(sop)
+        page.set_running(True)
+        page.on_events(engine.start(0))
+        acknowledged = Mock()
+        page.alarm_ack_requested.connect(acknowledged)
+        with patch("sop_app.ui.run_page.QApplication.beep"):
+            self.update_run(page, engine, frame(.10, hand=True))
+            self.update_run(page, engine, frame(.30, hand=True))
+            self.update_run(page, engine, frame(.40))
+        self.assertFalse(page.alarm_panel.isHidden())
+        self.assertFalse(page.alarm_ack_button.isHidden())
+        self.assertIn("超時", page.alarm_text.text())
+        self.assertNotIn("違規", page.alarm_text.text())
+        acknowledged.assert_not_called()
+        page.alarm_ack_button.click()
+        self.assertTrue(page.alarm_panel.isHidden())
+        acknowledged.assert_called_once()
+        self.assertFalse(engine.cycle_ok)
 
     def test_tracking_off_shows_confirmed_regions_but_never_unlabelled_old_position(self):
         sop = definition(following=True)
@@ -216,6 +330,32 @@ class AlertOptionsTests(unittest.TestCase):
         self.assertEqual(page.video._alert_regions, {"C1盒"})
         self.assertEqual(list(trial.events), events)
         self.assertFalse(trial.engine.cycle_ok)
+
+    def test_editor_reminder_highlights_region_and_trial_completes_ok_after_correction(self):
+        sop = definition()
+        sop.steps[0].forbidden_action = "remind"
+        page = self.page(EditorPage, sop)
+        page.set_model_state("available")
+        trial = page._validation
+        trial.start(page.sop, "single", 0, 0)
+        page.on_packet(packet(frame(.1, hand=True, done=True)))
+
+        self.assertFalse(page.validation_alert.isHidden())
+        self.assertEqual(page.validation_alert.property("state"), "reminder")
+        self.assertTrue(page.video._alert_reminder)
+        self.assertEqual(page.video._alert_regions, {"C1盒"})
+        self.assertIn("暫停", page.validation_elapsed.text())
+        self.assertIn("0 道工序完成條件成立", page.live_label.text())
+        self.assertIn("1 道提醒條件成立", page.live_label.text())
+        self.assertTrue(trial.engine.cycle_ok)
+
+        page.on_packet(packet(frame(.2, done=True)))
+        self.assertTrue(page.validation_alert.isHidden())
+        self.assertFalse(page.video._alert_reminder)
+        self.assertEqual(page.video._alert_regions, set())
+        self.assertIn("單步驗證完成：OK", page.validation_status.text())
+        self.assertIn("提醒：", page.validation_details.toPlainText())
+        self.assertNotIn("本輪已NG", page.validation_details.toPlainText())
 
     def test_editor_tracking_only_overlay_obeys_tracking_not_workflow_switch(self):
         sop = definition(following=True)

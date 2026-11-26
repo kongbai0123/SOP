@@ -34,6 +34,7 @@ class VideoWidget(QWidget):
         self._banner_single_line = False
         self._alert = ""
         self._alert_regions: set[str] = set()
+        self._alert_reminder = False
         self._draw_mode = False
         self._drag_start: QPointF | None = None
         self._drag_end: QPointF | None = None
@@ -70,12 +71,13 @@ class VideoWidget(QWidget):
             self.setToolTip(text if self._banner_single_line else "")
             self.update()
 
-    def set_alert(self, text: str, regions: Iterable[str] = ()):
+    def set_alert(self, text: str, regions: Iterable[str] = (), *, reminder: bool = False):
         """Overlay an alert without changing the source frame or locator banner."""
         text = text.strip()
         regions = set(regions) if text else set()
-        if text != self._alert or regions != self._alert_regions:
-            self._alert, self._alert_regions = text, regions
+        reminder = bool(text) and reminder
+        if (text, regions, reminder) != (self._alert, self._alert_regions, self._alert_reminder):
+            self._alert, self._alert_regions, self._alert_reminder = text, regions, reminder
             self.update()
 
     @property
@@ -154,7 +156,9 @@ class VideoWidget(QWidget):
             points = self._edit_drag['preview'] if self._edit_drag and self._edit_drag['name'] == roi.name else roi.points
             polygon = QPolygonF([self._to_widget(rect, x, y) for x, y in points])
             if alarmed:
-                pen, fill = QPen(QColor("#ff5252"), 3), QColor(255, 82, 82, 45)
+                outline = QColor("#ffb242" if self._alert_reminder else "#ff5252")
+                pen, fill = QPen(outline, 3), QColor(outline)
+                fill.setAlpha(45)
             elif roi.name in self._stale:
                 pen, fill = QPen(QColor("#ff9800"), 2, Qt.PenStyle.DashLine), QColor(255, 152, 0, 25)
             elif roi.name == self._selected:
@@ -237,7 +241,9 @@ class VideoWidget(QWidget):
         height = min(self.height(), measured.height() + 16)
         top = rect.y() - height if rect.y() >= height else min(rect.y(), self.height() - height)
         band = QRectF(rect.x(), top, rect.width(), height)
-        painter.fillRect(band, QColor(183, 28, 28, 242))
+        background = QColor("#9a5700" if self._alert_reminder else "#b71c1c")
+        background.setAlpha(242)
+        painter.fillRect(band, background)
         painter.setFont(font)
         painter.setPen(QColor("white"))
         painter.drawText(band.adjusted(12, 8, -12, -8),

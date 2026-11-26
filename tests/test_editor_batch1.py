@@ -219,7 +219,7 @@ class EditorPreviewAndSummaryTests(QtTests):
         editor.step_editors[0].condition_table.select_condition(0)
         editor.step_editors[0].condition_table._remove_row(0)
         self.assertEqual(editor.sop.steps[0].conditions, [])
-        self.assertIn("人工確認 1", editor.setup_summary.text())
+        self.assertIn("待修正 1", editor.setup_summary.text())
         editor.step_editors[0].condition_table.undo_delete_button.click()
         self.assertEqual(editor.sop.steps[0].conditions[0].label, "grip")
         self.assertIn("自動 1", editor.setup_summary.text())
@@ -271,6 +271,24 @@ class MainWindowBatchOneTests(QtTests):
     def close_window(self):
         self.window.dirty = False
         self.window.close()
+
+    def test_new_sop_starts_with_an_automatic_draft_and_saves_that_choice(self):
+        self.window.dirty = False
+        self.window.new_button.click()
+        step = self.window.editor.sop.steps[0]
+        self.assertEqual(step.completion_method, "auto")
+        self.assertEqual(step.conditions, [])
+
+        path = self.root / "automatic-draft.json"
+        self.assertTrue(self.window._write(path, new_file=True))
+        with patch("sop_app.ui.main_window.QMessageBox.critical") as error, \
+             patch.object(self.window.pipeline, "isRunning", return_value=True), \
+             patch.object(self.window.pipeline, "start_engine") as start:
+            self.window._start_run()
+        start.assert_not_called()
+        self.assertIn("請新增完成條件", error.call_args.args[-1])
+        self.window._open_path(path)
+        self.assertEqual(self.window.editor.step_editors[0].completion_method.currentData(), "auto")
 
     def test_pending_save_ignores_repeated_requests_while_dialog_is_open(self):
         calls = []

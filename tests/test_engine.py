@@ -211,6 +211,49 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(alarms[0].data["alarm"], "violation")
         self.assertFalse(engine.cycle_ok)
 
+    def test_wrong_pick_reminder_waits_for_clear_then_completes_automatically(self):
+        step = Step("取 R", conditions=[appear("R")], forbidden=[appear("L")],
+                    hold_sec=.5, forbidden_hold_sec=.2, forbidden_action="remind")
+        engine = SOPEngine(make_sop(step, enabled=False))
+        engine.start(0.)
+        events, _ = run(engine, 0., 1., det("R"), det("L"))
+        self.assertEqual(kinds(events), ["reminder"])
+        self.assertTrue(engine.snapshot().steps[0].reminder_blocked)
+        self.assertEqual(engine.snapshot().progress, 0.)
+        self.assertTrue(engine.cycle_ok)
+        self.assertFalse(engine.snapshot().steps[0].has_alarm)
+
+        unknown = frame(1., det("R"))
+        unknown.detection_valid = False
+        engine.update(unknown)
+        self.assertIsNotNone(engine.snapshot().steps[0].active_reminder)
+        self.assertEqual(engine.snapshot().progress, 0.)
+
+        self.assertNotIn("step_completed", kinds(engine.update(frame(3., det("R")))))
+        self.assertIsNone(engine.snapshot().steps[0].active_reminder)
+        self.assertFalse(engine.snapshot().steps[0].reminder_blocked)
+        self.assertNotIn("step_completed", kinds(engine.update(frame(3.4, det("R")))))
+        events = engine.update(frame(3.51, det("R")))
+        self.assertEqual(kinds(events), ["step_completed", "cycle_completed"])
+        self.assertEqual(events[-1].data["result"], "OK")
+
+    def test_reminder_rearms_and_does_not_mask_later_install_violation(self):
+        pick = Step("取 R", conditions=[appear("R")], forbidden=[appear("L")],
+                    hold_sec=.5, forbidden_hold_sec=0., forbidden_action="remind")
+        install = Step("安裝 R", conditions=[appear("R_done")], forbidden=[appear("wrong_side")], hold_sec=0.)
+        engine = SOPEngine(make_sop(pick, install, enabled=False))
+        engine.start(0.)
+        self.assertEqual(kinds(engine.update(frame(.1, det("L")))), ["reminder"])
+        self.assertEqual(kinds(engine.update(frame(.2, det("L")))), [])
+        engine.update(frame(.3))
+        self.assertEqual(kinds(engine.update(frame(.4, det("L")))), ["reminder"])
+        self.assertEqual(kinds(engine.update(frame(.5, det("R")))), [])
+        self.assertIn("step_completed", kinds(engine.update(frame(1.01, det("R")))))
+        alarm = engine.update(frame(1.1, det("wrong_side")))
+        self.assertEqual([event.data["alarm"] for event in alarm if event.kind == "alarm"], ["violation"])
+        events = engine.update(frame(1.2, det("R_done")))
+        self.assertEqual(events[-1].data["result"], "NG")
+
     def test_timeout_alarm_and_ng(self):
         engine = SOPEngine(make_sop(Step("A", conditions=[appear("a")], timeout_sec=2.0, hold_sec=0.5)))
         engine.start(0.0)
@@ -251,6 +294,16 @@ class EngineTests(unittest.TestCase):
         engine.confirm_step(t)                              # 跳過有條件的工序 → NG
         self.assertEqual(engine.runtimes[1].status, StepStatus.SKIPPED)
         self.assertFalse(engine.cycle_ok)
+
+    def test_automatic_step_without_conditions_waits_for_configuration(self):
+        engine = SOPEngine(make_sop(Step("自動判定", hold_sec=0, completion_method="auto")))
+        engine.start(0)
+        events, now = run(engine, 0, 2, det("a"))
+        self.assertEqual(events, [])
+        self.assertEqual(engine.confirm_manual_step(now), [])
+        self.assertEqual(engine.confirm_step(now), [])
+        self.assertEqual(engine.snapshot().progress, 0)
+        self.assertEqual(engine.runtimes[0].status, StepStatus.ACTIVE)
 
     def test_restart_cycle_emits_abort(self):
         engine = SOPEngine(make_sop(Step("A", conditions=[appear("a")])))

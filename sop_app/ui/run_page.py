@@ -22,6 +22,7 @@ from ..sop_schema import SOPDefinition
 from ..tracking import WorkpieceLocator, display_rois, workpiece_key
 from ..tracking_debug import TrackingDebug
 from .video_widget import VideoWidget
+from .multi_camera_view import CameraPreviewPane
 from .compact_layout import StatusText
 from .condition_diagnostics import condition_error_text
 from .step_overview import StepOverview
@@ -33,10 +34,12 @@ def run_palette(dark: bool) -> dict:
     colors = workbench_palette(dark)
     if dark:
         colors.update(ok="#81c995", active="#8ab4f8", warn="#fdd663", ng="#f28b82", pending="#9aa0a6",
-                      alarm_bg="#5c1a1a", alarm_fg="#ffdad6", alarm_flash="#8c1d18", start="#2e7d32", stop="#c62828")
+                      alarm_bg="#5c1a1a", alarm_fg="#ffdad6", alarm_flash="#8c1d18",
+                      reminder_bg="#3f2b11", reminder_fg="#ffe09b", start="#2e7d32", stop="#c62828")
     else:
         colors.update(ok="#2e7d32", active="#1565c0", warn="#ef6c00", ng="#c62828", pending="#78909c",
-                      alarm_bg="#ffebee", alarm_fg="#8e0000", alarm_flash="#ffcdd2", start="#2e7d32", stop="#c62828")
+                      alarm_bg="#ffebee", alarm_fg="#8e0000", alarm_flash="#ffcdd2",
+                      reminder_bg="#fff3cd", reminder_fg="#633900", start="#2e7d32", stop="#c62828")
     return colors
 
 
@@ -85,6 +88,8 @@ class RunPage(QWidget):
         self._debug = TrackingDebug()
         self._today: dict = {}
         self._pending_alarms: list[str] = []
+        self._active_violation: str | None = None
+        self._active_reminder: str | None = None
         self._flash_on = False
         self._dark = None
         self._colors = run_palette(False)
@@ -183,11 +188,11 @@ class RunPage(QWidget):
         trace.addWidget(self.work_order_edit, 2)
         trace.addWidget(self.serial_edit, 3)
 
-        # 警報需人工確認；未確認前持續閃爍，避免只響一聲就被忽略。
+        # 現場違規解除後自行收起，其他警報仍可人工確認。
         self.alarm_panel = QFrame()
         self.alarm_panel.setObjectName("alarmPanel")
         self.alarm_text = StatusText()
-        self.alarm_text.setAccessibleName("未確認警報，完整內容可查看提示或事件紀錄")
+        self.alarm_text.setAccessibleName("作業警報，完整內容可查看提示或事件紀錄")
         self.alarm_text.setFont(QFont(self.font().family(), 13, QFont.Weight.Bold))
         self.alarm_ack_button = QPushButton("確認警報")
         self.alarm_ack_button.setMinimumHeight(28)
@@ -274,7 +279,8 @@ class RunPage(QWidget):
         self.monitor_splitter.setSizes([600, 140])
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.video)
+        self.preview_pane = CameraPreviewPane(self.video)
+        splitter.addWidget(self.preview_pane)
         splitter.addWidget(self.monitor_splitter)
         splitter.setStretchFactor(0, 1)
         splitter.setSizes([1000, 420])
@@ -319,7 +325,6 @@ class RunPage(QWidget):
         self._dark = dark
         self._colors = c = run_palette(dark)
         self.step_overview.set_colors(c)
-        self.alarm_text.setStyleSheet(f"color:{c['alarm_fg']};")
         self.setStyleSheet(f"""
             QWidget#currentStepTitle {{ color:{c['active']}; font-size:16px; font-weight:bold; }}
             QWidget#nextStepTitle {{ color:{c['muted']}; font-size:13px; }}
@@ -328,8 +333,10 @@ class RunPage(QWidget):
             QLabel#sectionLabel {{ font-weight:bold; margin-top:6px; color:{c['fg']}; }}
             QFrame#alarmPanel {{ background:{c['alarm_bg']}; border:2px solid {c['ng']}; border-radius:6px; }}
             QFrame#alarmPanel[flash="true"] {{ background:{c['alarm_flash']}; }}
+            QFrame#alarmPanel[reminder="true"] {{ background:{c['reminder_bg']}; border-color:{c['warn']}; }}
             QFrame#alarmPanel QLabel {{ color:{c['alarm_fg']}; background:transparent; }}
         """)
+        self._render_pending_alarms()
         self._update_start_availability()
         if self.sop is not None and self._snapshot is not None and self._running:
             self._render_steps(self._snapshot)
@@ -352,25 +359,39 @@ class RunPage(QWidget):
         self._pending_alarms.append(message)
         self._render_pending_alarms()
 
+    def _set_active_alerts(self, violation: str | None, reminder: str | None):
+        if (self._active_violation, self._active_reminder) != (violation, reminder):
+            self._active_violation, self._active_reminder = violation, reminder
+            self._render_pending_alarms()
+
     def _render_pending_alarms(self):
-        """Apply presentation preferences without acknowledging recorded alarms."""
-        if not self._show_workflow_alerts or not self._pending_alarms:
+        """Display the active reminder unless a formal alarm takes priority."""
+        alarm = self._pending_alarms[-1] if self._pending_alarms else self._active_violation
+        message = alarm or self._active_reminder
+        if not self._show_workflow_alerts or not message:
             self._flash_timer.stop()
             self._set_alarm_flash(False)
             self.alarm_panel.hide()
             self._sync_alarm_slot()
             return
-        message = self._pending_alarms[-1]
+        reminder = not alarm
+        self.alarm_panel.setProperty("reminder", "true" if reminder else "false")
+        color = self._colors["reminder_fg" if reminder else "alarm_fg"]
+        self.alarm_text.setStyleSheet(f"color:{color};")
+        if reminder:
+            self._flash_timer.stop()
+        self._set_alarm_flash(False)
         count = len(self._pending_alarms)
         suffix = f"\n（共 {count} 筆未確認警報）" if count > 1 else ""
-        self.alarm_text.setText(f"警報：{message}{suffix}")
+        self.alarm_text.setText(message if reminder else f"警報：{message}{suffix}")
+        self.alarm_ack_button.setVisible(bool(self._pending_alarms))
         self.alarm_panel.show()
         self._sync_alarm_slot()
-        if not self._flash_timer.isActive():
+        if alarm and not self._flash_timer.isActive():
             self._flash_timer.start()
 
     def _flash_alarm(self):
-        if not self._show_workflow_alerts or not self._pending_alarms:
+        if not self._show_workflow_alerts or not (self._pending_alarms or self._active_violation):
             return
         self._set_alarm_flash(not self._flash_on)
 
@@ -384,18 +405,18 @@ class RunPage(QWidget):
         if not self._pending_alarms:
             return
         self._pending_alarms.clear()
-        self._flash_timer.stop()
-        self._set_alarm_flash(False)
-        self.alarm_panel.hide()
-        self._sync_alarm_slot()
+        self._render_pending_alarms()
         self.alarm_ack_requested.emit()
 
     def _sync_alarm_slot(self):
         # A normal alarm/ack must not repaginate an active SOP before its last
         # visible step finishes. Reserve the same strip throughout the run.
         self.alarm_panel.ensurePolished()
-        reserve = self._show_workflow_alerts and (self._running or self._pending_alarms)
-        height = self.alarm_panel.sizeHint().height() if reserve else 0
+        reserve = self._show_workflow_alerts and (self._running or self._pending_alarms or
+                                                 self._active_violation or self._active_reminder)
+        margins = self.alarm_panel.layout().contentsMargins()
+        button_height = self.alarm_ack_button.minimumHeight() + margins.top() + margins.bottom()
+        height = max(self.alarm_panel.sizeHint().height(), button_height) if reserve else 0
         self.alarm_slot.setMinimumHeight(max(0, height))
 
     def set_today_stats(self, stats: dict):
@@ -454,6 +475,8 @@ class RunPage(QWidget):
             self._transform = None
             self._tracking_misses = 0
         self._running = running
+        if not running:
+            self._set_active_alerts(None, None)
         self._sync_alarm_slot()
         self.step_overview.set_running(running)
         self.confirm_button.setEnabled(False)
@@ -507,6 +530,10 @@ class RunPage(QWidget):
         self._debug.capture(packet, self._transform, status, running=self._running)
         snapshot = packet.snapshot
         self._snapshot = snapshot
+        running_snapshot = self._running and snapshot is not None and snapshot.phase == Phase.RUNNING
+        runtime = snapshot.steps[snapshot.current_index] if running_snapshot else None
+        self._set_active_alerts(runtime.active_violation if runtime else None,
+                                runtime.active_reminder if runtime else None)
         self.video.set_frame(self._monitor_frame(packet, snapshot))
         self._refresh_regions(status, snapshot)
         if self.sop is None or snapshot is None or snapshot.phase == Phase.IDLE or not self._running:
@@ -687,7 +714,7 @@ class RunPage(QWidget):
             if event.kind == "step_started":
                 continue
             c = self._colors
-            color = {"alarm": c["ng"], "cycle_aborted": c["warn"]}.get(event.kind, c["fg"])
+            color = {"alarm": c["ng"], "reminder": c["warn"], "cycle_aborted": c["warn"]}.get(event.kind, c["fg"])
             if event.kind == "cycle_completed":
                 color = c["ok"] if event.data.get("result") == "OK" else c["warn"]
                 self._stats[event.data.get("result", "NG")] += 1
@@ -700,7 +727,8 @@ class RunPage(QWidget):
             if event.kind == "alarm":
                 if self._show_workflow_alerts:
                     QApplication.beep()
-                self._show_alarm(event.message)
+                if event.data.get("alarm") != "violation":
+                    self._show_alarm(event.message)
         while self.log.count() > 300:
             self.log.takeItem(self.log.count() - 1)
         self._update_stats()
@@ -745,20 +773,25 @@ class RunPage(QWidget):
         self._set_instruction(step.instruction)
         self.progress.setFormat("條件累積 %p%")
         self.progress.setValue(round(snapshot.progress * 100))
-        self.confirm_button.setEnabled(not step.conditions)
+        self.confirm_button.setEnabled(step.is_manual and not runtime.reminder_blocked)
 
         c = self._colors
-        if self._show_workflow_alerts and (runtime.violation_alarmed or runtime.sequence_alarmed or runtime.too_fast_alarmed):
+        if self._show_workflow_alerts and (runtime.active_violation or runtime.sequence_alarmed or runtime.too_fast_alarmed):
             banner_color = c["stop"]
         elif self._show_workflow_alerts and runtime.timeout_alarmed:
             banner_color = "#ef6c00"
+        elif self._show_workflow_alerts and runtime.active_reminder:
+            banner_color = "#9a5700"
         else:
             banner_color = "#1565c0"
         self.video.set_banner(f"進行中｜{title}", banner_color, single_line=True)
 
         lines = []
-        if not step.conditions:
-            lines.append(f"<span style='color:{c['warn']}'>此工序沒有自動條件，完成後請按「人工確認完成」</span>")
+        missing_completion = not step.is_manual and not step.conditions
+        if missing_completion:
+            lines.append(f"<span style='color:{c['warn']}'>請新增完成條件</span>")
+        elif step.is_manual and not runtime.reminder_blocked:
+            lines.append(f"<span style='color:{c['warn']}'>完成後請按「人工確認完成」</span>")
         frame = self._last_packet.result if self._last_packet is not None else None
         for index, result in enumerate(snapshot.results, 1):
             if result.error:
@@ -768,17 +801,24 @@ class RunPage(QWidget):
                 mark, color = ("成立", c["ok"]) if result.met else ("未成立", c["ng"])
                 lines.append(f"<span style='color:{color}'>{mark} {result.condition.describe()}"
                              f"　（{result.detail or f'目前 {result.count}'}）</span>")
+        reminder_rule = step.forbidden_action == "remind"
         for index, result in enumerate(snapshot.forbidden_results, 1):
             if result.error:
                 detail = escape(condition_error_text(result, frame, self.sop))
-                lines.append(f"<span style='color:{c['warn']}'>警告條件 {index} 無法判斷：{detail}</span>")
+                label = "提醒" if reminder_rule else "警告"
+                lines.append(f"<span style='color:{c['warn']}'>{label}條件 {index} 無法判斷：{detail}</span>")
             elif result.met:
-                lines.append(f"<span style='color:{c['ng']}'>違規：{result.condition.describe()}</span>")
+                label, color = ("提醒條件成立", c["warn"]) if reminder_rule else ("違規", c["ng"])
+                lines.append(f"<span style='color:{color}'>{label}：{result.condition.describe()}</span>")
         if step.timeout_sec > 0:
             remaining = step.timeout_sec - (snapshot.now - runtime.started_at)
             lines.append(f"<span style='color:{c['muted']}'>剩餘時間 {max(0, remaining):.0f} 秒</span>")
         if combine_results(snapshot.results, step.completion_mode)[1]:
             self.progress.setFormat("判定暫停")
+        elif runtime.reminder_blocked:
+            self.progress.setFormat("等待提醒解除" if runtime.active_reminder else "正在確認提醒條件")
+        elif missing_completion:
+            self.progress.setFormat("請新增完成條件")
         self.condition_label.setText("<br>".join(lines))
 
     def _render_cycle_done(self, snapshot: EngineSnapshot):

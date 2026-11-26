@@ -533,7 +533,13 @@ class StepOverview(QWidget):
         alarm = runtime is not None and runtime.has_alarm
         if alarm:
             detail += " · 有警報"
-        kind = ("ng" if alarm else "pending" if stopped else
+            if active:
+                alarm = (runtime.active_violation is not None or runtime.timeout_alarmed or runtime.sequence_alarmed
+                         or runtime.too_fast_alarmed or runtime.skipped_alarmed)
+        reminding = active and runtime is not None and runtime.active_reminder is not None
+        if reminding:
+            detail += " · 等待提醒解除"
+        kind = ("ng" if alarm else "warn" if reminding else "pending" if stopped else
                 {StepStatus.PENDING: "pending", StepStatus.ACTIVE: "active",
                  StepStatus.DONE: "ok", StepStatus.SKIPPED: "warn"}.get(status, "pending"))
         return _Card(index, self._names[index], detail, kind, active)

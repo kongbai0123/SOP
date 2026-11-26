@@ -12,12 +12,14 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+import numpy as np
 from PySide6.QtCore import QDate, QPoint, Qt, QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QImage
 from PySide6.QtWidgets import QApplication
 
-from sop_app.recorder import _MIGRATIONS, connect
+from sop_app.engine import EngineEvent
+from sop_app.recorder import AsyncRecorder, _MIGRATIONS, connect, query
 from sop_app.ui.record_summary import positioning_pauses, positioning_summary
 from sop_app.ui.records_page import RecordsPage
 
@@ -139,6 +141,44 @@ class RecordsPageTests(unittest.TestCase):
         self.assertIn("輪次 2", self.page.preview_caption.text())
         self.assertIn("警報／違規", self.page.preview_caption.text())
         self.assertFalse(self.page.preview.original.isNull())
+
+    def test_recoverable_reminder_is_recorded_with_evidence_without_requiring_acknowledgement(self):
+        recorder = AsyncRecorder(self.root)
+        self.addCleanup(recorder.close)
+        sop = ("取料測試", 1, "model-a")
+        recorder.handle([EngineEvent("cycle_started", 0, 1)], *sop)
+        recorder.handle([EngineEvent("reminder", 1, 1, 0, "取 R", "偵測到 L", {"alarm": "reminder"})],
+                        *sop, frame=np.zeros((24, 32, 3), dtype=np.uint8))
+        recorder.acknowledge_alarms("測試員")
+        recorder.handle([
+            EngineEvent("step_completed", 2, 1, 0, "取 R", data={"status": "done", "alarm": False}),
+            EngineEvent("cycle_completed", 2, 1, data={"result": "OK"}),
+        ], *sop)
+        self.assertTrue(recorder.close())
+
+        cycle_id, result = query(self.db_path, "SELECT id, result FROM cycles WHERE sop_name=?", (sop[0],))[0]
+        self.assertEqual(result, "OK")
+        self.assertEqual(query(self.db_path, "SELECT had_alarm FROM step_records WHERE cycle_id=?", (cycle_id,)),
+                         [(0,)])
+        self.assertEqual(query(self.db_path, "SELECT kind, acknowledged_at FROM alarms WHERE cycle_id=?", (cycle_id,)),
+                         [("reminder", None)])
+        self.page.refresh()
+        self.select_cycle(cycle_id)
+        self.assertEqual(self.page.alarms_title.text(), "提醒 1 筆")
+        self.assertEqual(self.page.alarms.item(0, 2).text(), "提醒：偵測到 L")
+        self.assertEqual(self.page.alarms.item(0, 3).text(), "不需確認")
+        self.page.alarms.selectRow(0)
+        self.assertIn(" · 提醒 · ", self.page.preview_caption.text())
+        self.assertFalse(self.page.preview.original.isNull())
+
+        target = self.root / "reminder.csv"
+        self.page.search.setText(sop[0])
+        self.assertEqual(self.page._export_records(target), 1)
+        with target.open(encoding="utf-8-sig", newline="") as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(row["結果"], "OK")
+        self.assertEqual(row["警報"], "0")
+        self.assertEqual(row["警報內容"], "提醒：偵測到 L")
 
     def test_switching_and_refresh_never_leave_an_old_image(self):
         self.select_cycle(1)

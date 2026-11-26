@@ -162,18 +162,72 @@ class StepSettingsDrawerTests(unittest.TestCase):
         drawer = page.step_settings
         self.assertFalse(drawer.findChildren(QTabWidget))
         for field in (card.instruction_edit, card.condition_table, card.hold_spin,
-                      card.timeout_spin, card.forbidden_table, card.forbidden_hold_spin):
+                      card.timeout_spin, card.forbidden_table, card.forbidden_hold_spin,
+                      card.forbidden_action):
             self.assertTrue(drawer.scroll.isAncestorOf(field))
             self.assertFalse(field.isHidden())
             self.assertTrue(field.isVisibleTo(drawer.scroll.widget()))
 
-    def test_removing_last_completion_condition_can_still_be_undone(self):
+    def test_recoverable_violation_can_be_selected_and_reopened(self):
+        page = self.page()
+        card = self.open(page, 0)
+        self.assertFalse(card.forbidden_action.isEnabled())
+        self.assertEqual(card.forbidden_action.currentData(), "ng")
+        card.forbidden_table.add_button.click()
+        forbidden_label = card.forbidden_table.field_widget(0, "label")
+        forbidden_label.setCurrentIndex(forbidden_label.findData("other"))
+        self.assertTrue(card.forbidden_action.isEnabled())
+        card.forbidden_action.setCurrentIndex(card.forbidden_action.findData("remind"))
+
+        saved = page.sop.to_dict()
+        self.assertEqual(saved["schema_version"], 5)
+        self.assertEqual(saved["steps"][0]["forbidden_action"], "remind")
+        self.assertNotIn("forbidden_action", saved["steps"][1])
+        restored = SOPDefinition.from_dict(saved)
+        self.assertEqual(restored.validate(["part", "other"])[0], [])
+        page.set_sop(restored)
+        card = self.open(page, 0)
+        self.assertEqual(card.forbidden_action.currentData(), "remind")
+        card.forbidden_action.setCurrentIndex(card.forbidden_action.findData("ng"))
+        saved = page.sop.to_dict()
+        self.assertEqual(saved["schema_version"], 4)
+        self.assertNotIn("forbidden_action", saved["steps"][0])
+        self.assertEqual(SOPDefinition.from_dict(saved).steps[0].forbidden_action, "ng")
+
+        saved["steps"][0]["forbidden_action"] = "unexpected"
+        self.assertTrue(any("違規處理方式無效" in issue for issue in
+                            SOPDefinition.from_dict(saved).validate()[0]))
+
+    def test_new_step_defaults_to_automatic_and_keeps_it_when_reopened(self):
+        page = self.page([])
+        page.add_step_button.click()
+        card = self.open(page, 0)
+        self.assertEqual(card.completion_method.currentData(), "auto")
+        self.assertTrue(card.condition_table.add_button.isEnabled())
+        self.assertEqual(card.step.conditions, [])
+        self.assertIn("請新增完成條件", card.summary_label.text())
+        self.assertFalse(page.validation_start.isEnabled())
+
+        page.set_sop(SOPDefinition.from_dict(page.sop.to_dict()))
+        card = self.open(page, 0)
+        self.assertEqual(card.completion_method.currentData(), "auto")
+        self.assertTrue(card.condition_table.add_button.isEnabled())
+        card.completion_method.setCurrentIndex(card.completion_method.findData("manual"))
+
+        page.set_sop(SOPDefinition.from_dict(page.sop.to_dict()))
+        card = self.open(page, 0)
+        self.assertEqual(card.completion_method.currentData(), "manual")
+        self.assertFalse(card.condition_table.add_button.isEnabled())
+        self.assertNotIn("請新增完成條件", card.summary_label.text())
+
+    def test_removing_last_completion_condition_keeps_automatic_and_can_be_undone(self):
         original = Condition(label="part", min_count=3)
         page = self.page([Step("A", conditions=[original])])
         card = self.open(page, 0)
         card.condition_table.field_widget(0, "remove").click()
         self.assertEqual(card.step.conditions, [])
-        self.assertEqual(card.completion_method.currentData(), "manual")
+        self.assertEqual(card.completion_method.currentData(), "auto")
+        self.assertIn("請新增完成條件", card.summary_label.text())
         self.assertTrue(card.condition_table.undo_delete_button.isEnabled())
         card.condition_table.undo_delete_button.click()
         self.assertEqual(card.step.conditions, [original])

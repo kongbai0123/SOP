@@ -8,6 +8,19 @@ import numpy as np
 from sop_app.tracking import WorkpieceLocator, capture_workpiece
 
 
+POINTS = [(0.22, .12), (.78, .12), (.78, .67), (.22, .67)]
+
+
+def moved_part(background, mask, affine):
+    moved = background.copy()
+    moved[cv2.warpAffine(mask, affine, (640, 480)) > 128] = 215
+    return cv2.cvtColor(moved, cv2.COLOR_BGR2GRAY)
+
+
+def normalized(affine):
+    return np.diag([1 / 640, 1 / 480]) @ affine @ np.diag([640, 480, 1])
+
+
 def fixture():
     background = np.full((480, 640, 3), 140, np.uint8)
     cv2.line(background, (0, 75), (639, 75), (30, 30, 30), 3)
@@ -94,8 +107,63 @@ class ContourRecoveryTests(unittest.TestCase):
         for x in range(30, 640, 55):
             cv2.line(distractor, (x, 0), (x, 479), (215, 215, 215), 7)
         gray = cv2.cvtColor(distractor, cv2.COLOR_BGR2GRAY)
-        for _ in range(2):
+        # Also covers every full-circle group reached after repeated failures.
+        for _ in range(8):
             self.assertIsNone(locator._estimate_contour(gray)[0])
+
+    def test_part_resting_beyond_bounded_angles_is_found_after_failures(self):
+        background, reference, mask = fixture()
+        locator = WorkpieceLocator(capture_workpiece(reference, POINTS), adaptive_budget=True)
+        affine = cv2.getRotationMatrix2D((320, 220), 120, 1.)
+        affine[:, 2] += (10, 20)
+        gray = moved_part(background, mask, affine)
+        outputs = [locator._estimate_contour(gray)[0] for _ in range(7)]
+        # The two bounded groups cannot see it; one of the three full-circle
+        # groups, interleaved after two failures, must find it unambiguously.
+        self.assertIsNone(outputs[0])
+        self.assertIsNone(outputs[1])
+        found = [value for value in outputs[2:] if value is not None]
+        self.assertTrue(found)
+        np.testing.assert_allclose(found[0], normalized(affine), atol=.015)
+        # Thereafter the accepted angle is searched on every call.
+        self.assertIsNotNone(locator._estimate_contour(gray)[0])
+
+    def test_flow_angle_is_searched_beyond_bounded_angles(self):
+        background, reference, mask = fixture()
+        locator = WorkpieceLocator(capture_workpiece(reference, POINTS), adaptive_budget=True)
+        affine = cv2.getRotationMatrix2D((320, 220), 60, 1.)
+        gray = moved_part(background, mask, affine)
+        self.assertIsNone(locator._estimate_contour(gray)[0])
+        # Flow only proposes its current angle; the pose is matched afresh.
+        locator._flow_matrix = normalized(affine) + [[0., 0., .1], [0., 0., -.1]]
+        actual = locator._estimate_contour(gray)[0]
+        self.assertIsNotNone(actual)
+        np.testing.assert_allclose(actual, normalized(affine), atol=.015)
+
+    def test_partly_out_of_frame_part_is_found_from_visible_contour(self):
+        background, reference, mask = fixture()
+        locator = WorkpieceLocator(capture_workpiece(reference, POINTS), adaptive_budget=True)
+        affine = np.float64([[1, 0, 0], [0, 1, -120]])   # stem top leaves the frame
+        actual = locator._estimate_contour(moved_part(background, mask, affine))[0]
+        self.assertIsNotNone(actual)
+        np.testing.assert_allclose(actual, normalized(affine), atol=.015)
+        self.assertLess(locator.metrics['diagnostics']['template']['visible'], 1.)
+
+    def test_mostly_out_of_frame_part_is_not_accepted(self):
+        background, reference, mask = fixture()
+        locator = WorkpieceLocator(capture_workpiece(reference, POINTS), adaptive_budget=True)
+        gray = moved_part(background, mask, np.float64([[1, 0, 0], [0, 1, -235]]))
+        for _ in range(3):
+            self.assertIsNone(locator._estimate_contour(gray)[0])
+
+    def test_contour_template_cache_is_bounded(self):
+        _, reference, _ = fixture()
+        locator = WorkpieceLocator(capture_workpiece(reference, POINTS), adaptive_budget=True)
+        cache = locator._contour_reference((360, 480))
+        for angle in range(-180, 180):
+            locator._contour_entry(cache, angle, 1.)
+        self.assertLessEqual(len(cache['entries']), WorkpieceLocator.CONTOUR_CACHE_LIMIT)
+        self.assertIs(locator._contour_entry(cache, 179, 1.), cache['entries'][(179., 1.)])
 
 
 if __name__ == '__main__':

@@ -8,7 +8,9 @@ import os
 from pathlib import Path
 from typing import Sequence
 
-SCHEMA_VERSION = 4
+BASE_SCHEMA_VERSION = 4
+REMINDER_SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 CONDITION_TYPES = {"appear": "出現", "disappear": "消失"}
 
 
@@ -59,6 +61,14 @@ class Step:
     forbidden_ratio: float | None = None     # None = 沿用 ratio
     min_duration_sec: float = 0.0  # 自動完成早於此秒數 → 「工時過短」警報（0 = 不檢查）
     trial_notice_interval_sec: float = 2.0  # 後續試跑違規訊息最小間隔；畫面警示不延遲
+    forbidden_action: str = "ng"  # ng / remind：判定 NG 或提醒並等待解除
+    completion_method: str | None = None  # auto / manual；舊檔省略時由完成條件推導
+
+    @property
+    def is_manual(self) -> bool:
+        if self.completion_method is None:
+            return not self.conditions
+        return self.completion_method == "manual"
 
 
 @dataclass
@@ -94,7 +104,21 @@ class SOPDefinition:
         return any(condition.roi in following for condition in conditions)
 
     def to_dict(self) -> dict:
-        return {"schema_version": SCHEMA_VERSION, **asdict(self)}
+        data = asdict(self)
+        schema_version = BASE_SCHEMA_VERSION
+        for step in data["steps"]:
+            if step["forbidden_action"] == "ng":
+                del step["forbidden_action"]
+            else:
+                # Older versions read every violation as NG and must reject this file.
+                schema_version = max(schema_version, REMINDER_SCHEMA_VERSION)
+            legacy_method = "auto" if step["conditions"] else "manual"
+            if step["completion_method"] is None:
+                del step["completion_method"]
+            elif step["completion_method"] != legacy_method:
+                # Older readers would interpret an empty automatic step as manual.
+                schema_version = SCHEMA_VERSION
+        return {"schema_version": schema_version, **data}
 
     @classmethod
     def from_dict(cls, data: dict) -> "SOPDefinition":
@@ -136,6 +160,8 @@ class SOPDefinition:
                 forbidden_ratio=_optional_float(s.get("forbidden_ratio")),
                 min_duration_sec=float(s.get("min_duration_sec", 0.0)),
                 trial_notice_interval_sec=float(s.get("trial_notice_interval_sec", 2.0)),
+                forbidden_action=str(s.get("forbidden_action", "ng")),
+                completion_method=s.get("completion_method"),
             ) for s in data.get("steps", [])],
         )
 
@@ -189,11 +215,20 @@ class SOPDefinition:
             if not step.name.strip():
                 warnings.append(f"工序 {index}：名稱空白，作業紀錄將難以辨識")
             if step.completion_mode not in ("all", "any"):
+                errors.append(f"{where}：完成條件組合無效")
+            if step.completion_method not in (None, "auto", "manual"):
                 errors.append(f"{where}：完成方式無效")
             if step.forbidden_mode not in ("all", "any"):
                 errors.append(f"{where}：違規判定方式無效")
-            if not step.conditions:
-                warnings.append(f"{where} 沒有完成條件，執行時需手動確認")
+            if step.forbidden_action not in ("ng", "remind"):
+                errors.append(f"{where}：違規處理方式無效")
+            if step.is_manual:
+                if step.conditions:
+                    errors.append(f"{where}：人工確認工序不可含有完成條件")
+                else:
+                    warnings.append(f"{where} 沒有完成條件，執行時需手動確認")
+            elif not step.conditions:
+                errors.append(f"{where}：自動判定需要完成條件，請新增完成條件")
             if not 0 < step.ratio <= 1:
                 errors.append(f"{where}：成立比例需介於 1%～100%")
             if step.forbidden_ratio is not None and not 0 < step.forbidden_ratio <= 1:

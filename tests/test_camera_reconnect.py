@@ -10,9 +10,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication
 
+from sop_app.auxiliary_preview import PreviewFrame
+from sop_app.camera_discovery import CameraDevice, CameraDiscoveryResult
 from sop_app.engine import Phase
 from sop_app.frame_pacing import InferencePacer
 from sop_app.pipeline import CameraSource, VideoPipeline
@@ -26,7 +28,7 @@ class CameraReconnectTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
-    def window(self, settings=None, stations=False):
+    def window(self, settings=None, stations=False, *, load_initial_sop=False):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -43,7 +45,10 @@ class CameraReconnectTests(unittest.TestCase):
                            ("SOPS_DIR", root / "sops"), ("APP_SETTINGS", settings_path)):
             stack.enter_context(patch(f"sop_app.ui.main_window.{name}", path))
         stack.enter_context(patch.object(MainWindow, "_bind_station_logging"))
-        stack.enter_context(patch.object(MainWindow, "_open_initial_sop"))
+        if load_initial_sop:
+            stack.enter_context(patch("sop_app.ui.main_window.initial_sop_path", return_value=None))
+        else:
+            stack.enter_context(patch.object(MainWindow, "_open_initial_sop"))
         stack.enter_context(patch("sop_app.ui.main_window.cv2.require"))
         stack.enter_context(patch("sop_app.ui.main_window.VideoPipeline.start"))
         stack.enter_context(patch("sop_app.ui.main_window.VideoPipeline.shutdown", return_value=True))
@@ -63,6 +68,148 @@ class CameraReconnectTests(unittest.TestCase):
                 "changes": {"fps": ("manual", fps)},
                 "values": {"fps": 30.},
                 "messages": [f"攝影機 FPS：要求 {fps}，驅動回報 30"]}
+
+    def test_discovery_lists_connected_cameras_and_preserves_source_without_opening_it(self):
+        window, _root = self.window({"source": "camera:6"})
+        with patch.object(window._camera_discovery, "request", return_value=True) as search, \
+                patch.object(window.pipeline, "open_camera") as open_camera:
+            window._search_cameras()
+            search.assert_called_once()
+            self.assertFalse(window.connect_source_button.isEnabled())
+            window._on_cameras_found(CameraDiscoveryResult((CameraDevice(0, "Built-in"), CameraDevice(6, "USB"))))
+        self.assertEqual([window.source_combo.itemData(i) for i in range(window.source_combo.count())],
+                         ["camera:0", "camera:6", "file"])
+        self.assertEqual(window.source_combo.currentData(), "camera:6")
+        self.assertIn("USB", window.source_combo.currentText())
+        self.assertTrue(window.connect_source_button.isEnabled())
+        open_camera.assert_not_called()
+
+        window._on_cameras_found(CameraDiscoveryResult())
+        self.assertEqual(window.source_combo.currentData(), "file")
+        self.assertEqual(window.source_combo.count(), 1)
+        self.assertEqual(window.settings["source"], "camera:6")
+
+    def test_startup_automatically_connects_the_saved_camera_once(self):
+        window, _root = self.window({"source": "camera:6", "camera_profiles": {"camera:6": {"fps": 25}}},
+                                    load_initial_sop=True)
+        result = CameraDiscoveryResult((CameraDevice(0, "Built-in"), CameraDevice(6, "USB")))
+        with patch.object(window._camera_discovery, "request", return_value=True), \
+                patch.object(window.pipeline, "open_camera") as open_camera:
+            window._open_initial_sop(auto_connect_camera=True)
+            open_camera.assert_not_called()
+            window._on_cameras_found(result)
+            open_camera.assert_called_once_with(6, {"fps": 25}, window._camera_settings_token,
+                                                directshow_only=True)
+
+            window._on_source_change_finished()
+            window._search_cameras()
+            window._on_cameras_found(result)
+            self.assertEqual(open_camera.call_count, 1)
+
+    def test_startup_connects_an_available_camera_without_replacing_missing_preference(self):
+        window, _root = self.window({"source": "camera:6"}, load_initial_sop=True)
+        original = window._settings_path.read_bytes()
+        with patch.object(window._camera_discovery, "request", return_value=True), \
+                patch.object(window.pipeline, "open_camera") as open_camera:
+            window._open_initial_sop(auto_connect_camera=True)
+            window._on_cameras_found(CameraDiscoveryResult((CameraDevice(2, "USB"),)))
+            open_camera.assert_called_once_with(2, {}, window._camera_settings_token, directshow_only=True)
+        self.assertEqual(window.source_combo.currentData(), "camera:2")
+        self.assertEqual(window._settings_path.read_bytes(), original)
+
+    def test_startup_leaves_image_source_idle_when_it_should_not_connect(self):
+        camera = CameraDiscoveryResult((CameraDevice(0, "USB"),))
+        for settings, result, cancel in [
+            ({"source": "file"}, camera, False),
+            ({"source": "camera:0"}, CameraDiscoveryResult(), False),
+            ({"source": "camera:0"}, CameraDiscoveryResult(error="Unavailable"), False),
+            ({"source": "camera:0"}, camera, True),
+        ]:
+            with self.subTest(settings=settings, result=result, cancel=cancel):
+                window, _root = self.window(settings, load_initial_sop=True)
+                with patch.object(window._camera_discovery, "request", return_value=True), \
+                        patch.object(window.pipeline, "open_camera") as open_camera, \
+                        patch("sop_app.ui.main_window.QFileDialog.getOpenFileName") as file_dialog:
+                    window._open_initial_sop(auto_connect_camera=True)
+                    if cancel:
+                        window._disconnect_source()
+                        window._on_source_change_finished()
+                    window._on_cameras_found(result)
+                    open_camera.assert_not_called()
+                    file_dialog.assert_not_called()
+                self.assertEqual(window._source_label, "")
+
+    def test_selected_preview_stays_separate_and_releases_before_becoming_primary(self):
+        window, _root = self.window()
+        window._on_cameras_found(CameraDiscoveryResult((CameraDevice(0, "Main"), CameraDevice(1, "Second"))))
+        frame = PreviewFrame(image=np.zeros((100, 100, 3), dtype=np.uint8))
+        with patch.object(window._auxiliary_preview, "set_cameras") as select, \
+                patch.object(window._auxiliary_preview, "snapshot", return_value={1: frame}), \
+                patch.object(window._auxiliary_preview, "is_released", return_value=False) as released, \
+                patch.object(window.pipeline, "open_camera") as open_camera:
+            camera_action = next(action for action in window.multi_screen_menu.actions() if "Second" in action.text())
+            camera_action.trigger()
+            self.assertEqual(set(select.call_args.args[0]), {1})
+            self.assertFalse(window.run_page.preview_pane.auxiliary.isHidden())
+            self.assertFalse(window.editor.preview_pane.auxiliary.isHidden())
+            with patch.object(window.run_page.preview_pane.auxiliary, "set_frame") as draw:
+                window._update_auxiliary_previews()
+                self.assertEqual(draw.call_args.args[0], 1)
+                self.assertIs(draw.call_args.args[1], frame.image)
+            open_camera.assert_not_called()
+
+            window.source_combo.setCurrentIndex(window.source_combo.findData("camera:1"))
+            window._connect_source()
+            open_camera.assert_not_called()
+            self.assertEqual(set(select.call_args.args[0]), set())
+            self.assertTrue(window.run_page.preview_pane.auxiliary.isHidden())
+            self.assertFalse(window.connect_source_button.isEnabled())
+
+            released.return_value = True
+            window._update_auxiliary_previews()
+            open_camera.assert_called_once()
+            self.assertEqual(open_camera.call_args.args[0], 1)
+            self.assertTrue(open_camera.call_args.kwargs["directshow_only"])
+            window._on_source_changed("")
+            window._on_source_changed("攝影機 1")
+            window._on_source_change_finished()
+            self.assertTrue(window.connect_source_button.isEnabled())
+            self.assertTrue(window.run_page.preview_pane.auxiliary.isHidden())
+
+    def test_discovered_camera_does_not_fall_back_to_a_different_backend_index(self):
+        capture = Mock()
+        capture.isOpened.return_value = False
+        with patch("sop_app.pipeline.cv2.VideoCapture", return_value=capture) as video_capture:
+            with self.assertRaisesRegex(RuntimeError, "無法開啟攝影機"):
+                CameraSource(1, directshow_only=True)
+        self.assertEqual(video_capture.call_count, 1)
+        capture.release.assert_called_once()
+
+    def test_preview_layout_syncs_pages_and_saves_the_ratio_for_each_direction(self):
+        window, _root = self.window()
+        monitor = window.run_page.preview_pane
+        editor = window.editor.preview_pane
+        actions = window._preview_orientation_actions
+        self.assertTrue(actions["horizontal"].isChecked())
+        monitor.split_ratio_changed.emit(.65)
+        actions["vertical"].trigger()
+        self.assertFalse(actions["horizontal"].isChecked())
+        self.assertTrue(actions["vertical"].isChecked())
+        for pane in (monitor, editor):
+            self.assertEqual(pane._splitter.orientation(), Qt.Orientation.Vertical)
+        editor.split_ratio_changed.emit(.58)
+        window._flush_preview_layout()
+        saved = json.loads(window._settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["preview_layout"], {"orientation": "vertical", "horizontal": .65, "vertical": .58})
+
+        reopened, _other_root = self.window(saved)
+        self.assertTrue(reopened._preview_orientation_actions["vertical"].isChecked())
+        for pane in (reopened.run_page.preview_pane, reopened.editor.preview_pane):
+            self.assertEqual(pane._splitter.orientation(), Qt.Orientation.Vertical)
+            self.assertEqual(pane._ratio, .58)
+        reopened._preview_orientation_actions["horizontal"].trigger()
+        self.assertEqual(reopened.run_page.preview_pane._ratio, .65)
+        self.assertEqual(reopened.editor.preview_pane._ratio, .65)
 
     def test_startup_preferences_and_readback_complete_before_capture_thread_starts(self):
         events = []

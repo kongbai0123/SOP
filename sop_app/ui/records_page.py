@@ -315,7 +315,7 @@ class RecordsPage(QWidget):
         self.preview = SnapshotPreview()
         self.preview_caption = text_label("", "mutedLabel")
         self.alarms_title = _title("警報")
-        self.alarms = _table(["時間", "工序", "警報原因", "確認"], 4, 2)
+        self.alarms = _table(["時間", "工序", "原因", "確認"], 4, 2)
         self.alarms.itemSelectionChanged.connect(lambda: self._preview_from(self.alarms))
         self.alarms_empty = text_label("", "mutedLabel")
         self.positioning_summary = text_label("", "mutedLabel")
@@ -451,6 +451,12 @@ class RecordsPage(QWidget):
             return message
         return f"{label}：{message}" if message else label
 
+    @staticmethod
+    def _alarm_acknowledgement(kind, acknowledged_at, by, day):
+        if kind == "reminder":
+            return "不需確認"
+        return f"{_short_time(acknowledged_at, day)} {by}".strip() if acknowledged_at else "未確認"
+
     def _clear_preview(self, text="選擇工序或警報以預覽歷史截圖"):
         self._preview_key = None
         self.preview.show_message(text)
@@ -546,14 +552,21 @@ class RecordsPage(QWidget):
         self.alarms.blockSignals(True)
         _fill(self.alarms, [(_short_time(created, day), f"{step} · {name}" if name else step,
                              self._alarm_reason(kind, message),
-                             f"{_short_time(acked, day)} {by}".strip() if acked else "未確認")
+                             self._alarm_acknowledgement(kind, acked, by, day))
                             for _id, created, step, name, kind, message, acked, by, snapshot in alarms],
               [row[0] for row in alarms])
         for row, (record_id, created, step, name, kind, _message, _acked, _by, snapshot) in enumerate(alarms):
+            label = ALARM_TEXT.get(kind, kind)
+            evidence_type = label if kind == "reminder" else f"警報／{label}"
             self.alarms.item(row, 0).setData(Qt.ItemDataRole.UserRole,
-                {"record_id": record_id, "snapshot": snapshot, "caption": f"輪次 {cycle_id} · 工序 {step} {name} · 警報／{ALARM_TEXT.get(kind, kind)} · {created or '時間未記錄'}"})
+                {"record_id": record_id, "snapshot": snapshot,
+                 "caption": f"輪次 {cycle_id} · 工序 {step} {name} · {evidence_type} · {created or '時間未記錄'}"})
         self.alarms.blockSignals(False)
-        self.alarms_title.setText(f"警報 {len(alarms)} 筆" if alarms else "警報")
+        reminder_count = sum(row[4] == "reminder" for row in alarms)
+        alarm_count = len(alarms) - reminder_count
+        counts = [f"{label} {count} 筆" for label, count in
+                  (("警報", alarm_count), ("提醒", reminder_count)) if count]
+        self.alarms_title.setText(" · ".join(counts) or "警報")
         self._show_table(self.alarms, self.alarms_empty, alarms, "本輪無警報。")
         text, summaries = positioning_summary(events, {row[1]: row[2] for row in steps})
         self.positioning_summary.setText(text)

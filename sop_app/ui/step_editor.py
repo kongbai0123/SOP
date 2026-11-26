@@ -143,9 +143,17 @@ class StepEditor(QFrame):
         self.completion_method.setAccessibleName("工序完成方式")
         self.completion_method.addItem("自動判定", "auto")
         self.completion_method.addItem("人工確認", "manual")
-        self.completion_method.setCurrentIndex(0 if step.conditions else 1)
+        self.completion_method.setCurrentIndex(1 if step.is_manual else 0)
         self.completion_mode = self.mode_choice(step.completion_mode)
         self.forbidden_mode = self.mode_choice(step.forbidden_mode)
+        self.forbidden_action = QComboBox()
+        self.forbidden_action.setAccessibleName("違規處理方式")
+        self.forbidden_action.addItem("判定 NG", "ng")
+        self.forbidden_action.addItem("提醒，解除後繼續", "remind")
+        self.forbidden_action.setCurrentIndex(max(0, self.forbidden_action.findData(step.forbidden_action)))
+        self.forbidden_action.setToolTip(
+            "可更正的取料錯誤可設為提醒。解除後重新觀察完成條件，本輪不因這筆提醒判 NG。"
+            "錯放或錯裝等需判定 NG 的情況，請選「判定 NG」。")
         self.hold_spin = self.seconds(step.hold_sec, 60)
         self.ratio_spin = self.percent(round(step.ratio * 100), 1)
         self.timeout_spin = self.seconds(step.timeout_sec, 3600, special="不限時")
@@ -156,8 +164,8 @@ class StepEditor(QFrame):
         self.forbidden_ratio_spin.setSpecialValueText("沿用完成")
         self.trial_notice_interval_spin = self.seconds(step.trial_notice_interval_sec,
                                                        max(3600, step.trial_notice_interval_sec), special="不限制")
-        self.trial_notice_interval_spin.setToolTip("同一工序的後續違規提示寫入試跑紀錄的最小間隔。首次警報立即記錄；畫面警示與區域標紅始終即時更新，不受此間隔延遲。0 秒仍只在違規狀態改變時記錄。")
-        self.forbidden_hold_spin.setToolTip("違規判定的滑動觀察秒數；這段時間內的成立影格比例達標，且最新一幀成立才警報。0 秒為當幀判定；沿用完成會使用上方的完成觀察時間。")
+        self.trial_notice_interval_spin.setToolTip("同一工序的後續違規提示寫入試跑紀錄的最小間隔。首次觸發立即記錄，畫面也即時更新。0 秒仍只在違規狀態改變時記錄。")
+        self.forbidden_hold_spin.setToolTip("違規判定的滑動觀察秒數。這段時間內的成立影格比例達標，且最新一幀成立時，才觸發該規則。0 秒為當幀判定。「沿用完成」會使用上方的完成觀察時間。")
         self.forbidden_ratio_spin.setToolTip("觀察時間內，違規條件組合成立的影格數占總影格數的比例，用來容許短暫漏檢。這不是模型信心度或物件落在區域內的比例；沿用完成會使用上方的完成成立比例。")
         self.condition_table = ConditionRows("completion", "新增完成條件", "尚未設定完成條件")
         self.forbidden_table = ConditionRows("violation", "新增違規條件", "未設定違規條件")
@@ -226,9 +234,12 @@ class StepEditor(QFrame):
             ("觀察時間", self.hold_spin), ("成立比例", self.ratio_spin),
             ("超時", self.timeout_spin), ("最短工時", self.min_duration_spin))), self.timing_note)
         self.forbidden_note = text_label("", "mutedLabel")
-        self.forbidden_row = section(group_label("違規檢查（選填）", "violation"), parameter_grid((
-            ("判定", self.forbidden_mode), ("觀察", self.forbidden_hold_spin),
-            ("成立比例", self.forbidden_ratio_spin), ("訊息間隔", self.trial_notice_interval_spin))), self.forbidden_note, self.forbidden_table)
+        self.forbidden_row = section(group_label("違規檢查（選填）", "violation"),
+                                     field_pair("觸發後", self.forbidden_action), parameter_grid((
+                                         ("判定", self.forbidden_mode), ("觀察", self.forbidden_hold_spin),
+                                         ("成立比例", self.forbidden_ratio_spin),
+                                         ("訊息間隔", self.trial_notice_interval_spin))),
+                                     self.forbidden_note, self.forbidden_table)
         self.status_row = QWidget()
         status_layout = QVBoxLayout(self.status_row)
         status_layout.setContentsMargins(0, 0, 0, 0)
@@ -252,7 +263,7 @@ class StepEditor(QFrame):
         for spin in (self.hold_spin, self.ratio_spin, self.timeout_spin, self.min_duration_spin,
                      self.forbidden_hold_spin, self.forbidden_ratio_spin, self.trial_notice_interval_spin):
             spin.valueChanged.connect(self._save)
-        for box in (self.completion_mode, self.forbidden_mode):
+        for box in (self.completion_mode, self.forbidden_mode, self.forbidden_action):
             box.currentIndexChanged.connect(self._save)
         self.completion_method.currentIndexChanged.connect(self._on_completion_method)
         self._loading = False
@@ -321,13 +332,14 @@ class StepEditor(QFrame):
         if self._loading:
             return
         conditions = self.condition_table.conditions()
-        if self.completion_method.currentData() == "manual":
+        self.step.completion_method = self.completion_method.currentData()
+        if self.step.is_manual:
             if conditions:
                 self._automatic_conditions = copy.deepcopy(conditions)
             self.condition_table.set_conditions([])
         elif not conditions:
-            # An incomplete automatic condition remains explicit and can be
-            # validated; merely opening a manual step never creates one.
+            # Give an explicit switch to automatic an editable row when there
+            # are no previous rules to restore.
             restored = self._automatic_conditions or [Condition()]
             self.condition_table.set_conditions(restored)
         self._save()
@@ -340,6 +352,7 @@ class StepEditor(QFrame):
         step.instruction = self.instruction_edit.toPlainText()
         step.completion_mode = self.completion_mode.currentData()
         step.forbidden_mode = self.forbidden_mode.currentData()
+        step.forbidden_action = self.forbidden_action.currentData()
         step.hold_sec = round(self.hold_spin.value(), 2)
         step.ratio = self.ratio_spin.value() / 100
         step.timeout_sec = self.timeout_spin.value()
@@ -347,9 +360,12 @@ class StepEditor(QFrame):
         step.forbidden_hold_sec = None if self.forbidden_hold_spin.value() < 0 else round(self.forbidden_hold_spin.value(), 2)
         step.forbidden_ratio = None if self.forbidden_ratio_spin.value() == 0 else self.forbidden_ratio_spin.value() / 100
         step.trial_notice_interval_sec = round(self.trial_notice_interval_spin.value(), 2)
-        step.conditions = self.condition_table.conditions()
+        conditions = self.condition_table.conditions()
+        if step.completion_method is None and step.conditions and not conditions:
+            step.completion_method = "auto"
+        step.conditions = conditions
         step.forbidden = self.forbidden_table.conditions()
-        if step.conditions:
+        if not step.is_manual:
             self._automatic_conditions = copy.deepcopy(step.conditions)
         self.update_summary()
         self.changed.emit()
@@ -372,20 +388,23 @@ class StepEditor(QFrame):
         step = self.step
         mode = {"all": "全部成立", "any": "任一成立"}
         lines = [f"說明：{step.instruction.strip()}"] if step.instruction.strip() else []
-        if step.conditions:
+        if step.is_manual:
+            parts = ["完成：人工確認"]
+        elif step.conditions:
             parts = [f"完成（{mode.get(step.completion_mode, step.completion_mode)}）："
                      + "、".join(condition.describe() for condition in step.conditions),
                      f"觀察 {self._seconds(step.hold_sec)}、成立比例 {step.ratio:.0%}"]
         else:
-            parts = ["完成：人工確認"]
+            parts = ["完成：自動判定（請新增完成條件）"]
         if step.timeout_sec > 0:
             parts.append(f"超時 {self._seconds(step.timeout_sec)}")
-        if step.conditions and step.min_duration_sec > 0:
+        if not step.is_manual and step.min_duration_sec > 0:
             parts.append(f"最短工時 {self._seconds(step.min_duration_sec)}")
         lines.append(" · ".join(parts))
         if step.forbidden:
             hold, ratio = violation_window(step)
-            lines.append(f"違規（{mode.get(step.forbidden_mode, step.forbidden_mode)}）："
+            action = "提醒，解除後繼續" if step.forbidden_action == "remind" else "違規"
+            lines.append(f"{action}（{mode.get(step.forbidden_mode, step.forbidden_mode)}）："
                          + "、".join(condition.describe() for condition in step.forbidden)
                          + f"，觀察 {self._seconds(hold)}、成立比例 {ratio:.0%}")
         else:
@@ -393,7 +412,7 @@ class StepEditor(QFrame):
         return "\n".join(lines)
 
     def update_summary(self):
-        manual = not self.step.conditions
+        manual = self.step.is_manual
         blocked = self.completion_method.blockSignals(True)
         self.completion_method.setCurrentIndex(1 if manual else 0)
         self.completion_method.blockSignals(blocked)
@@ -415,13 +434,14 @@ class StepEditor(QFrame):
         self.timing_note.setText(
             "人工確認不使用完成觀察時間、成立比例或最短工時。違規設為「沿用完成」時，仍會使用上方對應數值。" if manual else
             "觀察時間與成立比例用來確認完成條件持續成立；超時 0 秒為不限時，最短工時 0 秒為不檢查。")
-        for widget in (self.forbidden_mode, self.forbidden_hold_spin, self.forbidden_ratio_spin,
-                       self.trial_notice_interval_spin):
+        for widget in (self.forbidden_mode, self.forbidden_action, self.forbidden_hold_spin,
+                       self.forbidden_ratio_spin, self.trial_notice_interval_spin):
             widget.setEnabled(bool(self.step.forbidden))
         hold, ratio = violation_window(self.step)
+        action = "發出提醒" if self.step.forbidden_action == "remind" else "警報"
         self.forbidden_note.setText(
             f"目前違規觀察 {self._seconds(hold)}、成立比例 {ratio:.0%}。"
-            f"最近觀察窗內，至少 {ratio:.0%} 的判定影格符合違規組合，且最新一幀成立才警報。"
+            f"最近觀察窗內，至少 {ratio:.0%} 的判定影格符合違規組合，且最新一幀成立才{action}。"
             "設為「沿用完成」時，使用「時間與限制」中的數值。"
             f"試跑訊息間隔 {self.step.trial_notice_interval_sec:g} 秒，只限制重複紀錄；畫面警示即時更新。"
             if self.step.forbidden else "選填。人工確認與自動判定工序皆可加入違規條件。")

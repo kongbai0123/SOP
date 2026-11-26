@@ -53,7 +53,9 @@ class EditorValidation:
         self._clear_alert()
         self._stopped = False
         self._accept_events(self.engine.start(now))
-        self.message = "試跑中（不寫入正式作業紀錄）"
+        step = self.engine.sop.steps[self.engine.index]
+        self.message = ("請新增完成條件" if not step.is_manual and not step.conditions
+                        else "試跑中（不寫入正式作業紀錄）")
 
     def update(self, frame: FrameResult):
         if not self.running or self.engine is None:
@@ -69,13 +71,19 @@ class EditorValidation:
         self._accept_events(events, frame)
         self._update_violation_notice(events)
         if self.running:
+            step = self.engine.sop.steps[self.engine.index]
             if self.engine.phase == Phase.CYCLE_DONE:
                 self.message = ("本輪完成，等待重置／下一輪（沿用原引擎規則）" if self.engine.sop.cycle.enabled
                                 else "本輪完成，已停用自動開始下一輪")
             elif any(result.error for result in self.engine.snapshot().results):
                 self.message = "辨識／定位無法確認，條件停止累積"
-            elif not self.engine.sop.steps[self.engine.index].conditions:
+            elif self.engine.runtimes[self.engine.index].reminder_blocked:
+                runtime = self.engine.runtimes[self.engine.index]
+                self.message = "等待提醒解除" if runtime.active_reminder else "正在確認提醒條件"
+            elif step.is_manual:
                 self.message = "等待人工確認"
+            elif not step.conditions:
+                self.message = "請新增完成條件"
             else:
                 self.message = "試跑中（不寫入正式作業紀錄）"
 
@@ -104,12 +112,17 @@ class EditorValidation:
             self.message = ("本輪完成，等待重置／下一輪（沿用原引擎規則）" if self.engine.sop.cycle.enabled
                                 else "本輪完成，已停用自動開始下一輪")
 
+    @property
+    def manual_confirmation_available(self) -> bool:
+        engine = self.engine
+        return (self.running and engine is not None and engine.phase == Phase.RUNNING
+                and engine.sop.steps[engine.index].is_manual
+                and not engine.runtimes[engine.index].reminder_blocked)
+
     def confirm(self):
-        if not self.running or self.engine is None or self.engine.phase != Phase.RUNNING:
+        if not self.manual_confirmation_available:
             return
-        if self.engine.sop.steps[self.engine.index].conditions:
-            return  # Editor confirmation never skips an automatic step.
-        events = self.engine.confirm_step(self.last_timestamp or 0.0)
+        events = self.engine.confirm_manual_step(self.last_timestamp or 0.0)
         self._accept_events(events, self.last_frame)
         self._update_violation_notice(events)
 
@@ -164,6 +177,9 @@ class EditorValidation:
         if not self.running or self.stale or self.engine is None or self.engine.phase != Phase.RUNNING:
             return None
         engine = self.engine
+        step = engine.sop.steps[engine.index]
+        if step.forbidden_action == "remind":
+            return None
         snapshot = engine.snapshot()
         results = snapshot.forbidden_results
         # Use the actual engine window. In any mode C2 -> C3 shares the same
@@ -174,7 +190,6 @@ class EditorValidation:
         matched = [(index, result) for index, result in enumerate(results) if result.met and not result.error]
         if not matched:
             return None
-        step = engine.sop.steps[snapshot.current_index]
         descriptions = "、".join(result.condition.describe() for _index, result in matched)
         regions = tuple(dict.fromkeys(result.condition.roi for _index, result in matched if result.condition.roi))
         signature = (snapshot.cycle, snapshot.current_index, tuple(index for index, _result in matched))
@@ -224,7 +239,7 @@ class EditorValidation:
     def alert(self, *, include_tracking=True, include_workflow=True) -> dict[str, str | tuple[str, ...] | bool]:
         """Current engine-confirmed warning, or clearly labelled display history.
 
-        Reading this method never creates events. Only active violations return
+        Reading this method never creates events. Only active alerts return
         regions, so stopped/stale trials cannot leave live warning outlines.
         """
         blank = dict(text="", regions=(), active=False)
@@ -250,6 +265,14 @@ class EditorValidation:
                 break
         last_display = (self._last_display_alarm or self._last_alarm) if include_workflow else None
         if last_display is None:
+            if self.running and include_workflow and snapshot.phase == Phase.RUNNING:
+                message = snapshot.steps[snapshot.current_index].active_reminder
+                if message:
+                    regions = tuple(dict.fromkeys(result.condition.roi for result in snapshot.forbidden_results
+                                                  if result.met and not result.error and result.condition.roi))
+                    if unavailable:
+                        message += "；辨識／位置無法確認，暫停相關條件判斷"
+                    return dict(text=message, regions=regions, active=True, severity="reminder")
             return {**blank, "text": "辨識／位置無法確認，暫停相關條件判斷" if unavailable and self.running else ""}
         prefix = "已停止試跑；" if self._stopped else "單步驗證完成；" if self.completed else ""
         summary = last_display.data.get("summary", last_display.message)
@@ -272,7 +295,8 @@ class EditorValidation:
             return ""
         snapshot = self.engine.snapshot()
         if snapshot.phase == Phase.RUNNING:
-            groups = (("完成", snapshot.results), ("警告", snapshot.forbidden_results))
+            label = "提醒" if self.engine.sop.steps[snapshot.current_index].forbidden_action == "remind" else "警告"
+            groups = (("完成", snapshot.results), (label, snapshot.forbidden_results))
         elif snapshot.phase == Phase.CYCLE_DONE and self.engine.sop.cycle.enabled:
             groups = (("重置", snapshot.results),)
         else:
@@ -293,9 +317,11 @@ class EditorValidation:
             return {**blank, "target": target + "（設定已過期）"}
         now = self.last_timestamp or 0.0
         if self.completed:
+            if step.is_manual:
+                return dict(target=target, count="人工確認", elapsed="已完成", ratio="不套用")
             _, results = evaluate_conditions(step.conditions, self.last_frame, engine.rois, step.completion_mode) if self.last_frame else (False, [])
-            return dict(target=target, count=f"{sum(r.met for r in results)}/{len(results)}" if results else "人工確認",
-                        elapsed="已完成", ratio=f"達標 ≥ {step.ratio:.0%}" if step.conditions else "不套用")
+            return dict(target=target, count=f"{sum(r.met for r in results)}/{len(step.conditions)}",
+                        elapsed="已完成", ratio=f"達標 ≥ {step.ratio:.0%}")
         if engine.phase == Phase.CYCLE_DONE and not engine.sop.cycle.enabled:
             return dict(target=f"第 {engine.cycle} 輪已完成 · 自動開始下一輪已停用",
                         count="不套用", elapsed="已完成", ratio="不套用")
@@ -311,8 +337,12 @@ class EditorValidation:
         count = "無法判斷" if invalid else f"{sum(r.met for r in results)}/{len(results)}" if results else "—"
         if engine.phase == Phase.CYCLE_DONE:
             target = f"第 {engine.cycle} 輪已完成 · 驗證重置條件"
-        elif not step.conditions:
+        elif snapshot.steps[snapshot.current_index].reminder_blocked:
+            return dict(target=target, count=count, elapsed="暫停", ratio="—")
+        elif step.is_manual:
             return dict(target=target, count="人工確認", elapsed="不套用", ratio="不套用")
+        elif not step.conditions:
+            return dict(target=target, count="未設定", elapsed="—", ratio="—")
         observed = min(window.span, max(0.0, now - window._started))
         return dict(target=target, count=count,
                     elapsed="—" if invalid else f"{observed:.1f}/{window.span:g} 秒",

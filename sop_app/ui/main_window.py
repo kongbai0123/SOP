@@ -10,12 +10,14 @@ import logging
 from dataclasses import replace
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QFont, QKeySequence
+from PySide6.QtCore import Qt, QSignalBlocker, QTimer, Signal
+from PySide6.QtGui import QAction, QActionGroup, QFont, QKeySequence
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QGridLayout, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMessageBox, QProgressBar, QPushButton,
                                QToolBar, QToolButton, QWidget)
 
+from ..auxiliary_preview import AuxiliaryPreview
+from ..camera_discovery import CameraDiscovery, CameraDiscoveryResult
 from ..model_bundle import ModelBundleError, ModelInfo, read_model_info
 from ..model_eta import ModelETA, ModelLoadProgress, model_key, stage_key
 from ..frame_pacing import InferencePacer
@@ -34,6 +36,7 @@ from .run_page import RunPage
 from .workbench_widgets import PageStack, application_styles, install_readability_guard
 
 VIDEO_FILTER = "影片 (*.mp4 *.avi *.mov *.mkv *.wmv);;所有檔案 (*)"
+PREVIEW_ORIENTATIONS = {"horizontal": "左右分割", "vertical": "上下分割"}
 
 
 class MainWindow(QMainWindow):
@@ -65,6 +68,26 @@ class MainWindow(QMainWindow):
         self._pending_inference_fps = 0
         self._camera_settings_token = 0
         self._pending_camera_settings_token = None
+        self._camera_devices: dict[int, str] | None = None
+        self._camera_searching = False
+        self._camera_search_error = ""
+        self._auto_connect_camera = False
+        self._auxiliary_indices: set[int] = set()
+        self._auxiliary_preview = AuxiliaryPreview()
+        self._shown_auxiliary_frames = {}
+        self._active_camera: int | None = None
+        self._opening_camera: int | None = None
+        self._pending_camera_open = None
+        self._source_changing = False
+        self._camera_discovery = CameraDiscovery(self)
+        self._camera_discovery.finished.connect(self._on_cameras_found)
+        self._auxiliary_timer = QTimer(self)
+        self._auxiliary_timer.setInterval(85)
+        self._auxiliary_timer.timeout.connect(self._update_auxiliary_previews)
+        self._preview_layout_save_timer = QTimer(self)
+        self._preview_layout_save_timer.setSingleShot(True)
+        self._preview_layout_save_timer.setInterval(300)
+        self._preview_layout_save_timer.timeout.connect(self._save_preview_layout)
         self._model_started = None
         self._model_stage = ""
         self._model_eta = None
@@ -91,6 +114,7 @@ class MainWindow(QMainWindow):
         self.pipeline.events_ready.connect(self._on_events)
         self.pipeline.model_loaded.connect(self._on_model_loaded)
         self.pipeline.source_changed.connect(self._on_source_changed)
+        self.pipeline.source_change_finished.connect(self._on_source_change_finished)
         self.pipeline.engine_state.connect(self._on_engine_state)
         self.pipeline.status.connect(lambda text: self.statusBar().showMessage(text, 6000))
         self.pipeline.error.connect(self._notify_error)
@@ -129,6 +153,10 @@ class MainWindow(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.setCentralWidget(self.tabs)
 
+        for page in (self.run_page, self.editor):
+            pane = page.preview_pane
+            pane.split_ratio_changed.connect(lambda ratio, origin=pane: self._remember_preview_ratio(ratio, origin))
+        self._restore_preview_layout()
         self._build_header()
         self._build_toolbar()
         self.pipeline.camera_available.connect(self.camera_button.setEnabled)
@@ -249,23 +277,38 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
         toolbar.addWidget(QLabel("影像來源"))
         self.source_combo = QComboBox()
-        for index in range(4):
-            self.source_combo.addItem(f"攝影機 {index}", f"camera:{index}")
-        self.source_combo.addItem("影片檔…", "file")
-        self.source_combo.setCurrentIndex(max(0, self.source_combo.findData(self.settings.get("source", "camera:0"))))
+        self.source_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.source_combo.setMinimumContentsLength(16)
+        self._populate_sources(self.settings.get("source", "camera:0"))
         toolbar.addWidget(self.source_combo)
-        connect_button = QPushButton("連線")
-        connect_button.clicked.connect(self._connect_source)
-        toolbar.addWidget(connect_button)
-        disconnect_button = QPushButton("中斷")
-        disconnect_button.clicked.connect(self._disconnect_source)
-        toolbar.addWidget(disconnect_button)
+        self.connect_source_button = QPushButton("連線")
+        self.connect_source_button.clicked.connect(self._connect_source)
+        toolbar.addWidget(self.connect_source_button)
+        self.disconnect_source_button = QPushButton("中斷")
+        self.disconnect_source_button.clicked.connect(self._disconnect_source)
+        toolbar.addWidget(self.disconnect_source_button)
         self.camera_button = QPushButton("攝影機參數…")
         self.camera_button.setEnabled(False)
         self.camera_button.clicked.connect(self._camera_settings)
         toolbar.addWidget(self.camera_button)
         self.source_status = QLabel("未連線")
         toolbar.addWidget(self.source_status)
+        self.multi_screen_button = QToolButton()
+        self.multi_screen_button.setToolTip("勾選其他攝影機、選擇分割方向。拖曳畫面間的分隔線可調整大小。")
+        self.multi_screen_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.multi_screen_menu = DisplayCategoriesMenu(self.multi_screen_button)
+        self.multi_screen_button.setMenu(self.multi_screen_menu)
+        orientation_group = QActionGroup(self.multi_screen_button)
+        self._preview_orientation_actions = {}
+        for orientation, label in PREVIEW_ORIENTATIONS.items():
+            action = QAction(label, orientation_group)
+            action.setCheckable(True)
+            orientation_group.addAction(action)
+            action.triggered.connect(lambda _checked=False, name=orientation: self._set_preview_orientation(name))
+            self._preview_orientation_actions[orientation] = action
+        toolbar.addWidget(self.multi_screen_button)
+        self.source_combo.currentIndexChanged.connect(self._update_camera_choices)
+        self._update_camera_choices()
         toolbar.addSeparator()
         self.mask_check = QCheckBox("顯示遮罩")
         self.mask_check.setChecked(True)
@@ -453,6 +496,11 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "無法切換工站", "紀錄系統未就緒，請重新啟動程式。")
             return
         self.editor._stop_validation()
+        self._flush_preview_layout()
+        self._auto_connect_camera = False
+        if self._pending_camera_open is not None:
+            self._pending_camera_open = None
+            self._on_source_change_finished()
         self._on_context_changed(self.run_page.context())
         self._pending_station = station
         self._pending_camera_settings_token = self._camera_settings_token
@@ -487,6 +535,7 @@ class MainWindow(QMainWindow):
         self._set_editor_station_paths()
         self.settings = self._load_settings()
         self.settings["station"] = station.name
+        self._restore_preview_layout()
         self.inference_fps.blockSignals(True)
         self.inference_fps.setValue(self._saved_inference_fps())
         self.inference_fps.blockSignals(False)
@@ -497,7 +546,13 @@ class MainWindow(QMainWindow):
         self.run_page.blockSignals(True)
         self.run_page.set_context(self.settings.get("run_context", {}))
         self.run_page.blockSignals(False)
-        self.source_combo.setCurrentIndex(max(0, self.source_combo.findData(self.settings.get("source", "camera:0"))))
+        self._pending_camera_open = None
+        self._active_camera = None
+        self._opening_camera = None
+        self._source_changing = False
+        self._auxiliary_indices.clear()
+        self._populate_sources(self.settings.get("source", "camera:0"))
+        self._update_camera_choices()
         self.records_page.set_records_directory(station.records)
         self._refresh_station_choices()
         self._requested_model = None
@@ -659,27 +714,248 @@ class MainWindow(QMainWindow):
             self.settings["inference_fps"] = fps
             self._save_settings()
 
-    def _disconnect_source(self):
+    @staticmethod
+    def _camera_index(source):
+        if isinstance(source, str) and source.startswith("camera:"):
+            number = source.removeprefix("camera:")
+            if number.isascii() and number.isdecimal():
+                return int(number)
+        return None
+
+    @staticmethod
+    def _camera_caption(index, name):
+        return f"攝影機 {index} · {name}" if name else f"攝影機 {index}"
+
+    def _populate_sources(self, preferred):
+        devices = self._camera_devices
+        # Keep manual indexes available if system discovery is unavailable.
+        if devices is None:
+            devices = dict.fromkeys(range(4), "")
+            saved_index = self._camera_index(preferred)
+            if saved_index is not None:
+                devices.setdefault(saved_index, "")
+        with QSignalBlocker(self.source_combo):
+            self.source_combo.clear()
+            for index, name in devices.items():
+                self.source_combo.addItem(self._camera_caption(index, name), f"camera:{index}")
+            self.source_combo.addItem("影片檔…", "file")
+            self.source_combo.setCurrentIndex(max(0, self.source_combo.findData(preferred)))
+
+    def _search_cameras(self):
+        if self._camera_discovery.request():
+            self._camera_searching = True
+            self._camera_search_error = ""
+            self._update_camera_choices()
+            self.statusBar().showMessage("正在搜尋攝影機…", 4000)
+
+    def _on_cameras_found(self, result: CameraDiscoveryResult):
+        auto_connect = self._auto_connect_camera
+        self._auto_connect_camera = False
+        self._camera_searching = False
+        self._camera_search_error = result.error
+        if result.error:
+            self.statusBar().showMessage("無法搜尋攝影機，仍可手動選擇影像來源", 6000)
+        else:
+            devices = {device.index: device.name for device in result.devices}
+            old_devices = self._camera_devices or {}
+            self._auxiliary_indices.intersection_update(
+                index for index, name in devices.items() if old_devices.get(index) == name)
+            self._camera_devices = devices
+            self._populate_sources(self.source_combo.currentData())
+            message = f"找到 {len(devices)} 支攝影機" if devices else "未找到攝影機，可選擇影片檔"
+            self.statusBar().showMessage(message, 6000)
+        self._update_camera_choices()
+        if (auto_connect and not result.error and not self._vision_error and not self._maintenance_busy
+                and not self._engine_running and not self._source_changing and not self._source_label):
+            index = self._camera_index(self.source_combo.currentData())
+            if index is not None:
+                self._queue_primary_camera(index)
+
+    def _reserved_cameras(self):
+        selected = self._camera_index(self.source_combo.currentData()) if not self._source_label else None
+        return {self._active_camera, selected, self._opening_camera} - {None}
+
+    def _update_camera_choices(self, _index=None):
+        reserved = self._reserved_cameras()
+        self.multi_screen_menu.clear()
+        if self._camera_searching or not self._camera_devices:
+            message = ("搜尋攝影機中…" if self._camera_searching else
+                       "無法搜尋攝影機" if self._camera_search_error else "未找到攝影機")
+            action = self.multi_screen_menu.addAction(message)
+            action.setEnabled(False)
+            action.setToolTip(self._camera_search_error)
+        for index, name in (self._camera_devices or {}).items():
+            label = self._camera_caption(index, name)
+            action = self.multi_screen_menu.addAction(f"{label}（主畫面）" if index in reserved else label)
+            action.setCheckable(True)
+            action.setChecked(index not in reserved and index in self._auxiliary_indices)
+            action.setEnabled(index not in reserved and not self._vision_error)
+            action.toggled.connect(lambda enabled, camera=index: self._toggle_auxiliary_camera(camera, enabled))
+        self.multi_screen_menu.addSeparator()
+        for orientation, action in self._preview_orientation_actions.items():
+            action.setChecked(self._preview_layout["orientation"] == orientation)
+            self.multi_screen_menu.addAction(action)
+        self.multi_screen_menu.addSeparator()
+        refresh = self.multi_screen_menu.addAction("重新搜尋攝影機")
+        refresh.setEnabled(not self._camera_searching)
+        refresh.triggered.connect(self._search_cameras)
+        self._sync_auxiliary_previews()
+        self.source_combo.setToolTip(self.source_combo.currentText())
+        self.connect_source_button.setEnabled(self._can_connect_source())
+        self.disconnect_source_button.setEnabled(not self._source_changing or self._pending_camera_open is not None)
+
+    def _can_connect_source(self):
+        initial_search = self._camera_searching and self._camera_devices is None
+        return not self._source_changing and (not initial_search or self.source_combo.currentData() == "file")
+
+    def _toggle_auxiliary_camera(self, index, enabled):
+        if enabled:
+            self._auxiliary_indices.add(index)
+        else:
+            self._auxiliary_indices.discard(index)
+        self._sync_auxiliary_previews()
+
+    def _restore_preview_layout(self):
+        saved = self.settings.get("preview_layout")
+        saved = saved if isinstance(saved, dict) else {}
+        orientation = saved.get("orientation")
+        self._preview_layout = {
+            "orientation": orientation if orientation in ("horizontal", "vertical") else "horizontal",
+        }
+        for name in PREVIEW_ORIENTATIONS:
+            ratio = saved.get(name)
+            valid = type(ratio) in (float, int) and 0 < ratio < 1
+            self._preview_layout[name] = ratio if valid else 0.5
+        self._apply_preview_splits()
+        self.editor._schedule_layout()
+
+    def _set_preview_orientation(self, orientation):
+        if orientation != self._preview_layout["orientation"]:
+            self._preview_layout["orientation"] = orientation
+            self._apply_preview_splits()
+            self.editor._schedule_layout()
+            self._preview_layout_save_timer.start()
+
+    def _remember_preview_ratio(self, ratio, origin):
+        orientation = self._preview_layout["orientation"]
+        self._preview_layout[orientation] = round(ratio, 4)
+        self._apply_preview_splits(skip=origin)
+        self._preview_layout_save_timer.start()
+
+    def _apply_preview_splits(self, *, skip=None):
+        orientation = self._preview_layout["orientation"]
+        for page in (self.run_page, self.editor):
+            if page.preview_pane is not skip:
+                page.preview_pane.set_split_layout(orientation, self._preview_layout[orientation])
+
+    def _save_preview_layout(self):
+        if self.settings.get("preview_layout") != self._preview_layout:
+            self.settings["preview_layout"] = self._preview_layout.copy()
+            self._save_settings()
+
+    def _flush_preview_layout(self):
+        if self._preview_layout_save_timer.isActive():
+            self._preview_layout_save_timer.stop()
+            self._save_preview_layout()
+
+    def _sync_auxiliary_previews(self):
+        selected = self._auxiliary_indices - self._reserved_cameras()
+        devices = [(index, name) for index, name in (self._camera_devices or {}).items() if index in selected]
+        self._shown_auxiliary_frames.clear()
+        self._auxiliary_preview.set_cameras([index for index, _name in devices])
+        for page in (self.run_page, self.editor):
+            page.preview_pane.set_devices(devices)
+        self.editor._schedule_layout()
+        count = len(devices)
+        self.multi_screen_button.setText(f"多屏顯示（{count + 1}）" if count else "多屏顯示")
+        self._set_auxiliary_timer(bool(count or self._pending_camera_open))
+
+    def _set_auxiliary_timer(self, needed):
+        if needed and not self._auxiliary_timer.isActive():
+            self._auxiliary_timer.start()
+        elif not needed:
+            self._auxiliary_timer.stop()
+
+    def _update_auxiliary_previews(self):
+        self._open_camera_when_released()
+        page = self.tabs.currentWidget()
+        frames = self._auxiliary_preview.snapshot()
+        if page is self.run_page or page is self.editor:
+            grid = page.preview_pane.auxiliary
+            for index, preview in frames.items():
+                if self._shown_auxiliary_frames.get(index) is preview:
+                    continue
+                if preview.image is None:
+                    grid.set_status(index, preview.status)
+                else:
+                    grid.set_frame(index, preview.image)
+                self._shown_auxiliary_frames[index] = preview
+        self._set_auxiliary_timer(bool(frames or self._pending_camera_open))
+
+    def _open_camera_when_released(self):
+        request = self._pending_camera_open
+        if request is None:
+            return
+        index, preferences, token, deadline = request
+        if self._auxiliary_preview.is_released(index):
+            self._pending_camera_open = None
+            self.disconnect_source_button.setEnabled(False)
+            options = {"directshow_only": True} if index in (self._camera_devices or {}) else {}
+            self.pipeline.open_camera(index, preferences, token, **options)
+        elif time.monotonic() >= deadline:
+            self._pending_camera_open = None
+            self._on_source_change_finished()
+            self.statusBar().showMessage("攝影機仍在關閉預覽，請稍後重新連線", 6000)
+
+    def _on_source_change_finished(self):
+        self._source_changing = False
+        self._opening_camera = None
+        self._update_camera_choices()
+
+    def _queue_primary_camera(self, index: int):
         self._camera_settings_token += 1
+        self._source_changing = True
+        self._opening_camera = index
+        self._pending_camera_open = (index, self._saved_camera_preferences(f"camera:{index}"),
+                                     self._camera_settings_token, time.monotonic() + 5)
+        self._update_camera_choices()
+        self._open_camera_when_released()
+
+    def _disconnect_source(self):
+        self._auto_connect_camera = False
+        if self._source_changing and self._pending_camera_open is None:
+            return
+        self._pending_camera_open = None
+        self._opening_camera = None
+        self._auxiliary_indices.clear()
+        self._camera_settings_token += 1
+        self._source_changing = True
+        self._update_camera_choices()
         self.pipeline.close_source()
 
     def _connect_source(self):
+        if not self._can_connect_source():
+            return
+        self._auto_connect_camera = False
         if self._vision_error:
             QMessageBox.warning(self, "影像功能不可用", self._vision_error)
             return
         source = self.source_combo.currentData()
-        if source.startswith("camera:"):
-            self._camera_settings_token += 1
-            self.pipeline.open_camera(int(source.split(":")[1]), self._saved_camera_preferences(source),
-                                      self._camera_settings_token)
-        else:
+        index = self._camera_index(source)
+        if index is not None:
+            self._queue_primary_camera(index)
+        elif source == "file":
             start_dir = self.settings.get("video_path") or str(self._data_root)
             path, _ = QFileDialog.getOpenFileName(self, "選擇影片", start_dir, VIDEO_FILTER)
             if not path:
                 return
             self._camera_settings_token += 1
+            self._source_changing = True
+            self._update_camera_choices()
             self.pipeline.open_file(path, loop=True)
             self.settings["video_path"] = path
+        else:
+            return
         self.settings["source"] = source
         self._save_settings()
 
@@ -759,6 +1035,8 @@ class MainWindow(QMainWindow):
 
     def _on_source_changed(self, label: str):
         self._source_label = label
+        self._active_camera = self._opening_camera if label else None
+        self._update_camera_choices()
         self._performance_tooltip_at = None
         self.fps_status.setToolTip("")
         self.run_page.clear_video("影像來源已變更，等待影像" if label else "影像來源已中斷")
@@ -836,6 +1114,7 @@ class MainWindow(QMainWindow):
             self.run_page.set_sop(self.editor.sop)
 
     def _on_tab_changed(self, index: int):
+        self._shown_auxiliary_frames.clear()
         button = self.nav_buttons.button(index) if hasattr(self, "nav_buttons") else None
         if button is not None and not button.isChecked():
             button.setChecked(True)
@@ -941,11 +1220,13 @@ class MainWindow(QMainWindow):
                                       f"{len(info.classes)} 類 · {device}")
 
     # ---- SOP 檔案 --------------------------------------------------------------
-    def _open_initial_sop(self):
+    def _open_initial_sop(self, *, auto_connect_camera=False):
+        self._auto_connect_camera = auto_connect_camera
+        self._search_cameras()
         path = initial_sop_path(self.settings, root=self._data_root) if self.current_station else initial_sop_path(self.settings)
         if path is not None:
             return self._open_path(path)
-        self._apply_sop(SOPDefinition(steps=[Step("工序 1")]), None)
+        self._apply_sop(SOPDefinition(steps=[Step("工序 1", completion_method="auto")]), None)
 
     def _open_path(self, path: Path):
         try:
@@ -1009,7 +1290,7 @@ class MainWindow(QMainWindow):
             return
         current = self.editor.sop
         sop = SOPDefinition(name="新 SOP", model_path=current.model_path, model_version_id=current.model_version_id,
-                            rois=copy.deepcopy(current.rois), steps=[Step("工序 1")],
+                            rois=copy.deepcopy(current.rois), steps=[Step("工序 1", completion_method="auto")],
                             workpiece=copy.deepcopy(current.workpiece))
         self._apply_sop(sop, None)
 
@@ -1019,6 +1300,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "開啟 SOP", str(self._sops_dir), "SOP 設定檔 (*.json)")
         if path:
             self._open_path(Path(path))
+            self._search_cameras()
 
     def _request_save(self, save_as=False) -> bool:
         """A modal file dialog runs a nested event loop; ignore repeated clicks meanwhile."""
@@ -1151,6 +1433,7 @@ class MainWindow(QMainWindow):
                 str(self._data_root / "backups" / f"station-{datetime.now():%Y%m%d-%H%M%S}.zip"), "工站備份 (*.zip)")
             if not path:
                 return
+        self._flush_preview_layout()
         self._maintenance_busy = True
         self.setEnabled(False)
         self.statusBar().showMessage("正在備份工站資料…" if action == "backup" else "正在驗證並還原工站資料…")
@@ -1164,6 +1447,7 @@ class MainWindow(QMainWindow):
         else:
             if action == "restore":
                 self.settings = self._load_settings()
+                self._restore_preview_layout()
                 if self.current_station:
                     self.settings["station"] = self.current_station.name
                 previous = Path(self.settings.get("last_sop") or "example_sop.json").name
@@ -1186,6 +1470,7 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             event.ignore()
             return
+        self._auto_connect_camera = False
         self.editor._stop_validation()
         if not self.pipeline.shutdown():
             self.statusBar().showMessage("影像來源正在關閉，請稍候再關閉視窗", 6000)
@@ -1193,6 +1478,9 @@ class MainWindow(QMainWindow):
             return
         if self._error_box is not None:
             self._error_box.close()
+        self._flush_preview_layout()
+        self._auxiliary_timer.stop()
+        self._auxiliary_preview.close()
         self._record_stats_timer.stop()
         if self._station_log_handler:
             logging.getLogger("sop").removeHandler(self._station_log_handler)

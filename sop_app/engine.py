@@ -31,7 +31,7 @@ class StepStatus(str, Enum):
 
 @dataclass
 class EngineEvent:
-    kind: str      # cycle_started / step_started / step_completed / alarm / cycle_completed / cycle_aborted
+    kind: str      # cycle_started / step_started / step_completed / alarm / reminder / cycle_completed / cycle_aborted
                    # position_lost / position_recovered；alarm 的 data["alarm"]：
                    # violation / timeout / too_fast / sequence / skipped
     time: float
@@ -99,7 +99,8 @@ class StepFrame:
 
 
 def evaluate_step(step: Step, frame: FrameResult, rois: dict[str, ROI]) -> StepFrame:
-    met, blocked, results = evaluate_condition_set(step.conditions, frame, rois, step.completion_mode)
+    conditions = [] if step.is_manual else step.conditions
+    met, blocked, results = evaluate_condition_set(conditions, frame, rois, step.completion_mode)
     forbidden_met, forbidden_blocked, forbidden_results = evaluate_condition_set(
         step.forbidden, frame, rois, step.forbidden_mode)
     return StepFrame(met, blocked, results, forbidden_met, forbidden_blocked, forbidden_results)
@@ -122,6 +123,9 @@ class StepRuntime:
     sequence_alarmed: bool = False
     too_fast_alarmed: bool = False
     skipped_alarmed: bool = False
+    active_violation: str | None = None  # 即時提示；已發生的違規另由 violation_alarmed 保留。
+    active_reminder: str | None = None
+    reminder_blocked: bool = False
 
     @property
     def has_alarm(self) -> bool:
@@ -211,13 +215,15 @@ class SOPEngine:
         """手動確認／跳過目前工序。有自動條件的工序被跳過時，本輪判定為 NG。"""
         if self.phase != Phase.RUNNING:
             return []
-        if self.sop.steps[self.index].conditions:
-            return self.skip_step(now)
-        return self._finish_step(now, StepStatus.DONE, manual=True)
+        step = self.sop.steps[self.index]
+        if step.is_manual:
+            return self.confirm_manual_step(now)
+        return self.skip_step(now) if step.conditions else []
 
     def confirm_manual_step(self, now: float) -> list[EngineEvent]:
-        """只確認沒有自動條件的工序；有條件的工序不會因誤按而被跳過。"""
-        if self.phase != Phase.RUNNING or self.sop.steps[self.index].conditions:
+        """只確認選用人工確認的工序。"""
+        if (self.phase != Phase.RUNNING or not self.sop.steps[self.index].is_manual
+                or self.runtimes[self.index].reminder_blocked):
             return []
         return self._finish_step(now, StepStatus.DONE, manual=True)
 
@@ -239,6 +245,9 @@ class SOPEngine:
         if self.phase == Phase.RUNNING:
             step, runtime = self.sop.steps[self.index], self.runtimes[self.index]
             judged = evaluate_step(step, frame, self.rois)
+            was_reminder_blocked = runtime.reminder_blocked
+            runtime.reminder_blocked = step.forbidden_action == "remind" and (
+                judged.forbidden_met or judged.forbidden_blocked)
             met, completion_blocked, self._results = (judged.completion_met, judged.completion_blocked,
                                                       judged.completion_results)
             invalid = completion_blocked
@@ -264,7 +273,11 @@ class SOPEngine:
             elif invalid or self._completion_invalid:
                 self._window.reset(now)
             self._completion_invalid = invalid
-            if not position_missing:
+            # Wait for positive evidence that the work area is clear and restart
+            # the completion window on the first frame after a correction.
+            if runtime.reminder_blocked or was_reminder_blocked:
+                self._window.reset(now)
+            if not position_missing and not runtime.reminder_blocked:
                 self._window.push(now, met)
             if not invalid and pose is not None:
                 self._last_valid_pose = pose.copy()
@@ -278,12 +291,7 @@ class SOPEngine:
                     self._forbidden_window.reset(now)
                 self._forbidden_invalid = forbidden_blocked
                 self._forbidden_window.push(now, forbidden_met)
-                if not runtime.violation_alarmed and self._forbidden_window.satisfied(now):
-                    runtime.violation_alarmed = True
-                    self.cycle_ok = False
-                    detail = "、".join(r.condition.describe() for r in self._forbidden_results if r.met)
-                    events.append(self._event("alarm", now, f"違規：進行「{step.name}」時偵測到 {detail}",
-                                              alarm="violation"))
+                events.extend(self._update_forbidden_alert(step, runtime, now, forbidden_met, forbidden_blocked))
 
             blocked = completion_blocked or forbidden_blocked
             if blocked != self._position_blocked:
@@ -298,7 +306,7 @@ class SOPEngine:
                 events.append(self._event("alarm", now, f"超時：「{step.name}」超過 {step.timeout_sec:g} 秒未完成",
                                           alarm="timeout"))
 
-            if step.conditions and not invalid and self._window.satisfied(now):
+            if not invalid and not runtime.reminder_blocked and self._window.satisfied(now):
                 duration = now - runtime.started_at
                 if step.min_duration_sec > 0 and duration < step.min_duration_sec:
                     runtime.too_fast_alarmed = True
@@ -327,6 +335,30 @@ class SOPEngine:
 
         return events
 
+    def _update_forbidden_alert(self, step: Step, runtime: StepRuntime, now: float,
+                                met: bool, blocked: bool) -> list[EngineEvent]:
+        if blocked:
+            return []
+        if not met:
+            runtime.active_reminder = runtime.active_violation = None
+            return []
+        reminder = step.forbidden_action == "remind"
+        active = runtime.active_reminder if reminder else runtime.active_violation
+        if active is None and not self._forbidden_window.satisfied(now):
+            return []
+        detail = "、".join(result.condition.describe() for result in self._forbidden_results if result.met)
+        message = f"進行「{step.name}」時偵測到 {detail}"
+        if reminder:
+            runtime.active_reminder = f"提醒：{message}"
+            return ([self._event("reminder", now, runtime.active_reminder, alarm="reminder")]
+                    if active is None else [])
+        runtime.active_violation = f"違規：{message}"
+        if runtime.violation_alarmed:
+            return []
+        runtime.violation_alarmed = True
+        self.cycle_ok = False
+        return [self._event("alarm", now, runtime.active_violation, alarm="violation")]
+
     def snapshot(self) -> EngineSnapshot:
         return EngineSnapshot(
             phase=self.phase, cycle=self.cycle, current_index=self.index, now=self._now,
@@ -352,7 +384,8 @@ class SOPEngine:
         runtime = self.runtimes[self.index]
         for later in range(self.index + 1, len(self.sop.steps)):
             step = self.sop.steps[later]
-            if later in self._sequence_alarmed or not any(c.type == "appear" for c in step.conditions):
+            if (later in self._sequence_alarmed or step.is_manual
+                    or not any(c.type == "appear" for c in step.conditions)):
                 continue
             slot = self._sequence_windows.get(later)
             if slot is None:
@@ -397,6 +430,7 @@ class SOPEngine:
         self.index = index
         self.runtimes[index].status = StepStatus.ACTIVE
         self.runtimes[index].started_at = now
+        self.runtimes[index].reminder_blocked = bool(step.forbidden) and step.forbidden_action == "remind"
         self._window.reset(now, step.hold_sec, step.ratio)
         self._forbidden_window.reset(now, *violation_window(step))
         self._sequence_windows.clear()   # 每道工序重新觀察後續工序，不沿用上一道的累積

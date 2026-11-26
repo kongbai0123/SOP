@@ -80,7 +80,7 @@ CREATE TABLE applied_jobs (job_key TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
 
 RESULT_TEXT = {"OK": "OK", "NG": "NG", "ABORTED": "中止", "INTERRUPTED": "中斷", "RUNNING": "進行中"}
 ALARM_TEXT = {"violation": "違規", "timeout": "超時", "too_fast": "工時過短", "sequence": "順序錯誤",
-              "skipped": "人工跳過"}
+              "skipped": "人工跳過", "reminder": "提醒"}
 
 
 def _now() -> str:
@@ -188,12 +188,12 @@ class Recorder:
                 self.db.execute("INSERT INTO positioning_events "
                                 "(cycle_id, step_index, kind, message, source_time, created_at) VALUES (?,?,?,?,?,?)",
                                 (cycle_id, event.step_index + 1, event.kind, event.message, event.time, stamp))
-            elif event.kind == "alarm":
+            elif event.kind in ("alarm", "reminder"):
+                kind = "reminder" if event.kind == "reminder" else event.data.get("alarm")
                 cursor = self.db.execute(
                     "INSERT INTO alarms (cycle_id, step_index, step_name, kind, message, created_at) "
                     "VALUES (?,?,?,?,?,?)",
-                    (cycle_id, event.step_index + 1, event.step_name, event.data.get("alarm"), event.message, stamp))
-                # NG 的證據比 OK 更重要：警報當下也保留畫面。
+                    (cycle_id, event.step_index + 1, event.step_name, kind, event.message, stamp))
                 snapshot = self._save_snapshot(frame, f"cycle{cycle_id:05d}_step{event.step_index + 1:02d}"
                                                       f"_alarm{cursor.lastrowid}", snapshot_jpeg)
                 if snapshot:
@@ -206,7 +206,7 @@ class Recorder:
             clause = " AND cycle_id IN (SELECT id FROM cycles WHERE session_id=?)" if session_id else ""
             params = (recorded_at or _now(), by) + ((session_id,) if session_id else ())
             cursor = self.db.execute("UPDATE alarms SET acknowledged_at=?, acknowledged_by=? "
-                                     "WHERE acknowledged_at IS NULL" + clause, params)
+                                     "WHERE acknowledged_at IS NULL AND kind IS NOT 'reminder'" + clause, params)
             if job_key:
                 self.db.execute("INSERT INTO applied_jobs VALUES (?,?)", (job_key, _now()))
         return cursor.rowcount
@@ -309,7 +309,7 @@ class AsyncRecorder:
             self._session = uuid.uuid4().hex
         with self._lock:
             self._live_sessions.add(self._session)
-        image = frame if any(e.kind in ("step_completed", "alarm") for e in events) else None
+        image = frame if any(e.kind in ("step_completed", "alarm", "reminder") for e in events) else None
         self._enqueue(dict(command="handle", session=self._session, at=_now(),
                            events=[asdict(e) for e in events], sop_name=sop_name,
                            sop_version=sop_version, model_version=model_version,
@@ -514,7 +514,11 @@ def export_csv(db_path: Path, target: Path, **filters) -> int:
         SELECT c.id, c.started_at, c.ended_at, c.duration_sec, c.result, c.sop_name, c.sop_version,
                c.model_version, c.station, c.operator, c.work_order, c.serial_no,
                s.step_index, s.step_name, s.status, s.duration_sec, s.manual, s.had_alarm, s.finished_at,
-               (SELECT GROUP_CONCAT(a.message, '；') FROM alarms a
+               (SELECT GROUP_CONCAT(
+                   CASE WHEN a.kind = 'reminder'
+                          AND LTRIM(a.message) NOT LIKE '提醒：%'
+                          AND LTRIM(a.message) NOT LIKE '提醒:%'
+                        THEN '提醒：' || a.message ELSE a.message END, '；') FROM alarms a
                  WHERE a.cycle_id = c.id AND a.step_index = s.step_index)
         FROM cycles c LEFT JOIN step_records s ON s.cycle_id = c.id
         {where} ORDER BY c.id, s.id""", tuple(params))
