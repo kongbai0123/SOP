@@ -1,0 +1,9 @@
+# Windows x64 CPU-only development and packaging environment.
+numpy==2.5.3
+opencv-python-headless==4.13.0.92
+PySide6>=6.8
+comtypes==1.4.16
+pygrabber==0.2
+onnxruntime==1.30.0
+# Used by tools/build_payload.py to generate the installer icon.
+Pillow>=10

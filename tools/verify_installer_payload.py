@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -30,7 +31,15 @@ def main():
     release = args.release.resolve()
     configuration = json.loads((ROOT / "installer/release-config.json").read_text(encoding="utf-8"))
     metadata = json.loads((release / "release-manifest.json").read_text(encoding="utf-8"))
-    inventory = json.loads((BUILD / ("nsis-" + configuration["productId"]) / "payload-manifest.json").read_text(encoding="utf-8"))
+    runtime = metadata.get("runtime", "torch")
+    product_id = metadata.get("productId", configuration["productId"])
+    if runtime not in ("torch", "onnx") or not re.fullmatch(
+        r"SOP\.WorkInstruction(?:\.Smoke\.[A-Za-z0-9_-]+)?", product_id
+    ):
+        raise ValueError("Unknown release identity or inference runtime profile")
+    suffix = "-onnx" if runtime == "onnx" else ""
+    inventory_path = BUILD / f"nsis-{product_id}{suffix}" / "payload-manifest.json"
+    inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
     inventory["productId"] = "SOP.WorkInstruction.Smoke.FullPayload." + uuid.uuid4().hex
     scratch = Path(tempfile.mkdtemp(prefix="real-payload-", dir=BUILD)).resolve()
     if scratch.parent != BUILD.resolve():
@@ -52,7 +61,7 @@ def main():
     environment["SOP_LAUNCH_DIAGNOSTICS"] = str(scratch / "launch-diagnostics.jsonl")
 
     def helper(action):
-        command = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        command = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive",
                    "-File", str(ROOT / "installer/deploy.ps1"), "-Action", action,
                    "-InstallDir", str(install), "-ProductId", inventory["productId"],
                    "-Version", metadata["version"], "-LogPath", str(log)]

@@ -54,6 +54,91 @@ function Get-SignatureSummary([string]$Path, [string]$Role) {
     return $result
 }
 
+function Get-PayloadSignatureInventory([string]$Root) {
+    $extensions = @('.exe', '.dll', '.pyd', '.ps1')
+    $components = New-Object 'System.Collections.Generic.List[object]'
+    $uninspected = New-Object 'System.Collections.Generic.List[object]'
+    $directories = New-Object 'System.Collections.Generic.Stack[System.IO.DirectoryInfo]'
+    $signatures = New-Object 'System.Collections.Generic.List[object]'
+    $prefix = $Root.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $entry = Join-Path $Root 'SOP.exe'
+    $entryStatus = 'Unavailable'
+    $status = 'Unavailable'
+
+    try {
+        $directory = Get-Item -LiteralPath $Root -Force -ErrorAction Stop
+        if (-not $directory.PSIsContainer) { throw 'PayloadDirectory must be an existing directory.' }
+        if ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw 'A reparse point cannot be used as the payload root.'
+        }
+        $directories.Push($directory)
+        $status = 'Collected'
+    } catch {
+        $uninspected.Add([ordered]@{ relativePath = '.'; reason = $_.Exception.Message })
+        if ($_.CategoryInfo.Category -eq 'ObjectNotFound') { $entryStatus = 'Missing' }
+    }
+
+    while ($directories.Count -gt 0) {
+        $directory = $directories.Pop()
+        try {
+            $children = @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)
+        } catch {
+            $relativePath = if ($directory.FullName -eq $Root) { '.' } else { $directory.FullName.Substring($prefix.Length) }
+            $uninspected.Add([ordered]@{ relativePath = $relativePath; reason = $_.Exception.Message })
+            continue
+        }
+        foreach ($child in $children) {
+            if (-not $child.PSIsContainer -and $child.Extension -notin $extensions) { continue }
+            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                $uninspected.Add([ordered]@{ relativePath = $child.FullName.Substring($prefix.Length); reason = 'Reparse point skipped.' })
+            } elseif ($child.PSIsContainer) {
+                $directories.Push($child)
+            } else {
+                $components.Add($child)
+            }
+        }
+    }
+
+    $hasEntry = $false
+    foreach ($component in ($components | Sort-Object FullName)) {
+        $role = 'payload-component'
+        if ($component.FullName -ieq $entry) {
+            $role = 'explicit-payload-entry'
+            $hasEntry = $true
+        }
+        $signature = Get-SignatureSummary $component.FullName $role
+        $signature.relativePath = $component.FullName.Substring($prefix.Length)
+        $signatures.Add($signature)
+        if ($signature.status -in @('Missing', 'Unavailable')) {
+            $reason = if ($signature.error) { $signature.error } else { 'File no longer available for inspection.' }
+            $uninspected.Add([ordered]@{ relativePath = $signature.relativePath; reason = $reason })
+        }
+    }
+    if (-not $hasEntry) {
+        if ($status -eq 'Collected' -and $uninspected.Count -eq 0) { $entryStatus = 'Missing' }
+        $signatures.Add([ordered]@{
+            role = 'explicit-payload-entry'; path = $entry; relativePath = 'SOP.exe'; status = $entryStatus
+        })
+        $uninspected.Add([ordered]@{ relativePath = 'SOP.exe'; reason = 'Entry executable not inspected.' })
+    }
+    if ($status -eq 'Collected' -and $uninspected.Count -gt 0) { $status = 'Partial' }
+
+    $statusCounts = [ordered]@{}
+    foreach ($signature in $signatures) {
+        $name = $signature.status
+        if (-not $statusCounts.Contains($name)) { $statusCounts[$name] = 0 }
+        $statusCounts[$name]++
+    }
+    $summary = [ordered]@{
+        status = $status; root = $Root; extensions = $extensions; fileCount = $components.Count
+        statusCounts = $statusCounts
+        unsignedPaths = @($signatures | Where-Object { $_.status -eq 'NotSigned' } | ForEach-Object { $_.relativePath })
+        nonValidPaths = @($signatures | Where-Object { $_.status -ne 'Valid' } | ForEach-Object { $_.relativePath })
+        uninspectedEntries = $uninspected.ToArray()
+    }
+    return [ordered]@{ summary = $summary; signatures = $signatures.ToArray() }
+}
+
 function Get-RelatedEvents([string]$LogName, [int[]]$Ids, $Names) {
     $result = [ordered]@{
         status = 'Unavailable'; logName = $LogName; eventIds = $Ids
@@ -123,7 +208,8 @@ $report = [ordered]@{
     policyOrTrustChangesPerformed = $false
     integrity = [ordered]@{ status = 'Unavailable'; manifestPath = $manifestPath; artifacts = @() }
     signatures = @()
-    payloadSignatureScope = 'Not requested. Pass -PayloadDirectory to inspect its SOP.exe without executing it.'
+    payloadSignatureScope = 'Not requested. Pass -PayloadDirectory to inspect executable and PowerShell files without running them.'
+    payloadSignatureInventory = [ordered]@{ status = 'NotRequested' }
     deviceGuard = [ordered]@{ status = 'Unavailable' }
     ciTool = [ordered]@{ status = 'Unavailable'; command = 'Windows System32/CiTool.exe -lp -json' }
     launchPermission = 'Not determined. A valid signature or a clean report does not guarantee execution on this or another PC.'
@@ -198,10 +284,14 @@ try {
 
 if ($PayloadDirectory) {
     $payloadRoot = [IO.Path]::GetFullPath($PayloadDirectory)
-    $payloadExe = Join-Path $payloadRoot 'SOP.exe'
-    [void]$protectedPaths.Add($payloadExe)
-    $report.signatures += Get-SignatureSummary $payloadExe 'explicit-payload-entry'
-    $report.payloadSignatureScope = 'Only SOP.exe in the explicitly supplied directory; no archive extraction or DLL signature sweep. Directory-to-ZIP equivalence is not established.'
+    $inventory = Get-PayloadSignatureInventory $payloadRoot
+    $report.payloadSignatureInventory = $inventory.summary
+    $report.signatures += $inventory.signatures
+    foreach ($signature in $inventory.signatures) {
+        [void]$protectedPaths.Add($signature.path)
+        [void]$targetNames.Add([IO.Path]::GetFileName($signature.path))
+    }
+    $report.payloadSignatureScope = 'Recursive .exe, .dll, .pyd, and .ps1 inspection in the supplied directory. Reparse points, archives, embedded installer components, and other script types are not inspected. Directory-to-ZIP equivalence is not established.'
 }
 
 try {

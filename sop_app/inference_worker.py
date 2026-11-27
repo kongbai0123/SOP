@@ -126,7 +126,7 @@ class InferenceWorker:
         return self._process is not None and self._process.is_alive()
 
     def start(self):
-        """Start imports and optionally queue the initial model without waiting."""
+        """Start the worker and optionally queue the initial model without waiting."""
         with self._lifecycle_lock:
             if self._closed.is_set():
                 raise InferenceWorkerClosed("模型程序已關閉")
@@ -308,20 +308,16 @@ class InferenceWorker:
 
 
 def _worker_main(connection, cancelled):
-    def bootstrap(report):
-        report("載入 AI 執行環境")
-        started = time.perf_counter()
-        import torch  # noqa: F401  This process never imports Qt.
-        report(f"AI 執行環境已載入（{time.perf_counter() - started:.2f} 秒）")
-
     def load_detector(path, report):
         from .model_bundle import read_model_info
         from .detector import create_detector
 
         report("讀取模型資訊")
-        return create_detector(read_model_info(path), progress=report)
+        info = read_model_info(path)
+        report("載入 AI 執行環境")
+        return create_detector(info, progress=report)
 
-    _serve(connection, cancelled, load_detector, bootstrap=bootstrap)
+    _serve(connection, cancelled, load_detector)
 
 
 def _serve(connection, cancelled, load_detector, *, bootstrap=None):

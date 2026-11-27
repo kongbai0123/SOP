@@ -65,7 +65,26 @@ powershell.exe -NoProfile -File .\tools\build_installer.ps1 -InstallBuildTools
 powershell.exe -NoProfile -File .\tools\build_installer.ps1 -SkipPayload -Rebuild
 ```
 
+### ONNX Runtime CPU 版
+
+可在獨立的 Windows x64 Python 環境安裝 `requirements-onnx.txt`，再建置不含 PyTorch、TorchVision 和 CUDA 的 CPU 版。兩種版本使用各自的建置與交付目錄。
+
+```powershell
+python tools/build_payload.py --runtime onnx --install-build-tools
+python tools/prepare_installer.py --runtime onnx
+```
+
+ONNX 版載入事先匯出並驗證的模型 ZIP。目前支援固定尺寸 FP32 的 YOLO26n 原始偵測輸出，模型包須有對應的類別順序與 ONNX 檔案 SHA-256。這一版適合已備妥相容 ONNX 模型的工站。既有 PyTorch 模型仍由原有建置設定支援。離線資料包供工站另行匯入已核准模型。
+
 設定來源為 `release-config.json`；應用程式版本來源維持 `sop_app/__init__.py`。目前通道為 test、只交付本機，簽章策略 optional；未提供憑證時產物標示 `NotSigned`。腳本不購買憑證、不改信任設定、不自動公開發布，也不建立自動更新服務。
+
+### 使用授權的發行簽章
+
+`prepare_installer.py --sign` 使用建置端已核准的 SignTool、目前使用者憑證存放區中的發行者憑證和 RFC 3161 時間戳服務。以 `--sign-tool`、`--signer-thumbprint` 和 `--timestamp-url` 明確指定這三項。若選擇 `signingPolicy: "required"`，也須提供這些參數。
+
+建置流程保留有效的原廠簽章。未簽章第三方檔案須經授權，並以 `--approved-unsigned` 指定元件相對名稱對應原始 SHA-256 的 JSON。雜湊、簽章或時間戳不符合要求時，簽章建置會失敗。簽章在隔離的建置副本上執行，交付雜湊以簽章完成後的檔案計算。
+
+安裝與移除會遵循目標機的 PowerShell 執行政策。部署驗證工具也依主機原有政策執行輔助腳本。受管電腦若拒絕執行，由工站 IT 按既有政策審查。
 
 ## 未簽章與其他 PC
 
@@ -101,7 +120,7 @@ SOP.exe --installer-smoke-test REPORT.json
 SOP.exe --installer-runtime-test REPORT.json
 ```
 
-後者另驗 PyTorch／TorchVision CPU tensor 與 NMS、Ultralytics import。實際結果另存交付目錄的 `verification.json`；沒有乾淨 VM、實機 GPU／攝影機驗收或 Authenticode 簽章時，不以本機測試冒稱已完成這些項目。
+後者依建置版本測試推論環境。PyTorch 版驗證 CPU tensor、TorchVision NMS 與 Ultralytics import。ONNX 版使用內建的小型 Identity 圖形驗證 ONNX Runtime CPU 推論。交付前仍須在目標機原有的安全政策下，使用最終成品測過安裝、啟動、實際攝影機與模型、正常完成及違規、移除。
 
 驗證完整資料包的解壓縮、逐檔校驗、換路徑啟動與移除，可執行：
 
@@ -125,7 +144,7 @@ powershell.exe -NoProfile -File .\tools\check_windows_trust.ps1 -ReleaseDirector
 
 交付資料夾也附有同一工具；在該資料夾開啟 PowerShell 時可執行 `powershell.exe -NoProfile -File .\check_windows_trust.ps1 -ReleaseDirectory . -OutputPath .\windows-trust-report.json`。原附報告來自建置機；若取得允許重新檢查，工具會更新自己的舊報告，請另指定檔名以保留歷史。退出 `0` 只代表完整性相符，仍需看政策事件並實際驗收。
 
-工具以串流計算 manifest 所列成品的 SHA-256 與大小，檢查 Setup 的 Authenticode 狀態。只有明確傳入 `-PayloadDirectory .\installer\.build\payload\SOP`，才另檢查該目錄內 `SOP.exe` 的簽章；不解壓縮、不掃描或啟動整包 DLL，也不認定該目錄與 ZIP 完全相同。退出碼 `0` 只表示 manifest 的檔案大小與雜湊相符，`2` 表示校驗失敗或不可用；簽章、政策資訊另逐項列於報告。
+工具以串流計算 manifest 所列成品的 SHA-256 與大小，並檢查 Setup 的 Authenticode 狀態。傳入 `-PayloadDirectory .\installer\.build\payload\SOP` 後，會遞迴檢查該目錄下的 EXE、DLL、PYD 與 PowerShell 腳本，分別列出未簽章、簽章無效及無法檢查的項目。檢查範圍限於展開的目錄，安裝器內嵌的元件及 ZIP 內容須另核對。退出碼 `0` 表示 manifest 的檔案大小與雜湊相符，`2` 表示校驗失敗或不可用。簽章與政策資訊另列於報告。
 
 報告盡可能讀取 `Win32_DeviceGuard` 原始欄位，以及系統提供的 `CiTool.exe -lp -json` 政策列表；不提權、不部署或重新整理政策。另分別檢查最近 24 小時各最多 100 筆 CodeIntegrity 3076／3077／3089，以及 AppLocker MSI and Script 8028／8029／8036／8038 事件，保留檔名或 ActivityID 關聯項目的完整 XML。可用 `-EventLookbackHours` 與 `-MaximumEvents` 調整有限範圍。缺少介面、權限不足與找不到事件會如實標示。這些資料無法完整涵蓋 Smart App Control、企業 App Control、AppLocker、防毒與其他限制；沒有事件或顯示有效簽章，均不能證明此機或其他 PC 允許啟動。分享報告前請檢查其中的本機路徑及事件資料。
 

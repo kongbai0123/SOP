@@ -27,45 +27,77 @@ def _smoke_worker(connection, cancelled):
 
 
 def _smoke_ai_worker(connection, cancelled):
-    """Check packaged native AI dependencies on CPU, without any model weights."""
+    """Exercise the packaged inference runtime with a small CPU-only check."""
     from .inference_worker import _error_record
     from .launcher import _diagnose
+    from .paths import FROZEN, RESOURCE_ROOT
 
     try:
-        # Ultralytics may initialize settings on import. Keep that incidental
-        # output isolated just like the UI's settings and SQLite records.
-        with tempfile.TemporaryDirectory(prefix="sop-runtime-smoke-") as temporary:
-            os.environ["YOLO_CONFIG_DIR"] = temporary
-            os.environ["YOLO_AUTOINSTALL"] = "false"
-            _diagnose("ai-before-torch-import")
-            import torch
-            _diagnose("ai-after-torch-import")
-            _diagnose("ai-before-torchvision-import")
-            import torchvision
-            _diagnose("ai-after-torchvision-import")
-            _diagnose("ai-before-ultralytics-import")
-            import ultralytics
-            _diagnose("ai-after-ultralytics-import")
-
-            _diagnose("ai-before-cpu-checks")
-            tensor = torch.tensor([1.0, 2.0], device="cpu")
-            boxes = torch.tensor([[0., 0., 2., 2.], [1., 1., 3., 3.]], device="cpu")
-            keep = torchvision.ops.nms(boxes, torch.tensor([0.9, 0.8]), 0.5)
-            _diagnose("ai-after-cpu-checks")
-            connection.send({"kind": "result", "id": 0, "result": {
-                "pid": os.getpid(), "frozen": bool(getattr(sys, "frozen", False)),
-                "executable": sys.executable,
-                "runtime": {"torch": torch.__version__, "torchvision": torchvision.__version__,
-                            "ultralytics": ultralytics.__version__},
-                "checks": {"torch_cpu": tensor.sum().item() == 3.0,
-                           "torchvision_nms": keep.tolist() == [0, 1],
-                           "ultralytics": bool(ultralytics.__version__)}}})
-            cancelled.wait(60)
+        profile = (RESOURCE_ROOT / "sop-runtime.txt").read_text(encoding="ascii").strip() if FROZEN else "torch"
+        if profile == "onnx":
+            runtime, checks = _check_onnx_runtime()
+        elif profile == "torch":
+            runtime, checks = _check_torch_runtime()
+        else:
+            raise ValueError(f"Unknown packaged inference runtime: {profile}")
+        connection.send({"kind": "result", "id": 0, "result": {
+            "pid": os.getpid(), "frozen": FROZEN, "executable": sys.executable,
+            "profile": profile, "runtime": runtime, "checks": checks}})
+        cancelled.wait(60)
     except Exception as exc:
         _diagnose("ai-runtime-error", [type(exc).__name__, str(exc)])
         connection.send({"kind": "fatal", "id": None, "error": _error_record(exc)})
     finally:
         connection.close()
+
+
+def _check_onnx_runtime():
+    import numpy as np
+    import onnxruntime as ort
+
+    # A self-contained Identity graph (IR 8, opset 13), with one float32 input.
+    graph = bytes.fromhex(
+        "08083a3f0a100a017812017922084964656e746974791209736f702d736d6f6b65"
+        "5a0f0a0178120a0a08080112040a020801620f0a0179120a0a08080112040a02080142040a00100d")
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    session = ort.InferenceSession(graph, sess_options=options, providers=["CPUExecutionProvider"])
+    value = np.array([3.], dtype=np.float32)
+    result = session.run(["y"], {"x": value})[0]
+    return {"onnxruntime": ort.__version__, "providers": session.get_providers()}, {
+        "onnx_identity": bool(np.array_equal(result, value)),
+        "onnx_cpu": session.get_providers() == ["CPUExecutionProvider"],
+        "without_torch": "torch" not in sys.modules,
+    }
+
+
+def _check_torch_runtime():
+    from .launcher import _diagnose
+
+    # Keep incidental Ultralytics settings isolated.
+    with tempfile.TemporaryDirectory(prefix="sop-runtime-smoke-") as temporary:
+        os.environ["YOLO_CONFIG_DIR"] = temporary
+        os.environ["YOLO_AUTOINSTALL"] = "false"
+        _diagnose("ai-before-torch-import")
+        import torch
+        _diagnose("ai-after-torch-import")
+        _diagnose("ai-before-torchvision-import")
+        import torchvision
+        _diagnose("ai-after-torchvision-import")
+        _diagnose("ai-before-ultralytics-import")
+        import ultralytics
+        _diagnose("ai-after-ultralytics-import")
+
+        _diagnose("ai-before-cpu-checks")
+        tensor = torch.tensor([1.0, 2.0], device="cpu")
+        boxes = torch.tensor([[0., 0., 2., 2.], [1., 1., 3., 3.]], device="cpu")
+        keep = torchvision.ops.nms(boxes, torch.tensor([0.9, 0.8]), 0.5)
+        _diagnose("ai-after-cpu-checks")
+        return {"torch": torch.__version__, "torchvision": torchvision.__version__,
+                "ultralytics": ultralytics.__version__}, {
+            "torch_cpu": tensor.sum().item() == 3.0, "torchvision_nms": keep.tolist() == [0, 1],
+            "ultralytics": bool(ultralytics.__version__),
+        }
 
 
 @contextmanager

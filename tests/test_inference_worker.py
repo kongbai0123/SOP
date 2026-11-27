@@ -10,9 +10,10 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from sop_app.inference_worker import (InferenceWorker, InferenceWorkerClosed,
-                                      InferenceWorkerError, _serve)
+                                      InferenceWorkerError, _serve, _worker_main)
 
 
 class FakeDetector:
@@ -66,6 +67,29 @@ def failed_bootstrap_worker(connection, cancelled):
         raise RuntimeError("runtime import failed") from error
 
     _serve(connection, cancelled, lambda path, report: None, bootstrap=bootstrap)
+
+
+def runtime_dispatch_worker(connection, cancelled):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "torch":
+            error = OSError("Windows blocked fake torch DLL")
+            error.winerror = 4551
+            raise error
+        return original_import(name, *args, **kwargs)
+
+    def create_detector(path, progress):
+        if path.name == "torch-model":
+            builtins.__import__("torch")
+        return FakeDetector(path, 1)
+
+    with patch("sop_app.model_bundle.read_model_info", side_effect=lambda path: path), \
+            patch("sop_app.detector.create_detector", side_effect=create_detector), \
+            patch("builtins.__import__", side_effect=guarded_import):
+        _worker_main(connection, cancelled)
 
 
 class InferenceWorkerTests(unittest.TestCase):
@@ -166,6 +190,16 @@ class InferenceWorkerTests(unittest.TestCase):
         self.assertEqual(caught.exception.winerror, 4551)
         self.assertEqual(caught.exception.remote_type, "OSError")
         self.assertIn("Windows blocked fake DLL", caught.exception.remote_traceback)
+
+    def test_torch_failure_during_loading_keeps_worker_available_for_another_runtime(self):
+        worker = self.worker(self.root / "torch-model", target=runtime_dispatch_worker)
+        with self.assertRaises(InferenceWorkerError) as caught:
+            worker.load_model(self.root / "torch-model")
+        self.assertEqual(caught.exception.winerror, 4551)
+        alternate = worker.load_model(self.root / "onnx-model")
+        self.assertEqual((alternate.info.model_version_id, alternate.info.process_id),
+                         ("onnx-model", worker.pid))
+        self.assertTrue(worker.is_alive)
 
     def test_runtime_failure_preserves_nested_windows_error_and_full_traceback(self):
         worker = self.worker(target=failed_bootstrap_worker)

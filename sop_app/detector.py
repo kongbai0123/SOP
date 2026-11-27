@@ -18,6 +18,10 @@ from .model_bundle import ModelBundleError, ModelInfo, ensure_checkpoint, ensure
 def create_detector(info: ModelInfo, device: str = "auto", score_floor: float = 0.3, progress=None):
     """依模型包的引擎建立偵測器；所有偵測器都回傳 Detection。"""
     ensure_runtime(info)
+    if info.runtime == "onnxruntime":
+        from .onnx_detector import OnnxYolo26Detector
+
+        return OnnxYolo26Detector(info, device, score_floor, progress)
     if info.runtime == "ultralytics":
         return UltralyticsDetector(info, device, score_floor, progress)
     if info.engine == "maskrcnn_resnet50_fpn":

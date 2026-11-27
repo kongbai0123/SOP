@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import tempfile
 import zipfile
 import zlib
@@ -34,6 +35,7 @@ ENGINES = {
     "fasterrcnn_mobilenet_v3_large_320_fpn": EngineSpec("Faster R-CNN · MobileNet V3 320 FPN", "torchvision", False),
     "fasterrcnn_resnet50_fpn_v2": EngineSpec("Faster R-CNN · ResNet50 FPN V2", "torchvision", False),
     "yolo26n_detect": EngineSpec("YOLO26n Detect", "ultralytics", False),
+    "yolo26n_detect_onnx": EngineSpec("YOLO26n Detect · ONNX Runtime", "onnxruntime", False),
     "yolo26s_detect": EngineSpec("YOLO26s Detect", "ultralytics", False),
     "yolo26n_seg": EngineSpec("YOLO26n Seg", "ultralytics", True),
     "yolo26s_seg": EngineSpec("YOLO26s Seg", "ultralytics", True),
@@ -56,6 +58,8 @@ RUNTIME_INSTALL = {
                    r"  .venv\Scripts\python.exe -m pip install --no-deps ultralytics==8.4.150",
     "torchvision": "需要 torch 與 torchvision：\n"
                    r"  .venv\Scripts\python.exe -m pip install -r requirements.txt",
+    "onnxruntime": "需要 ONNX Runtime CPU 套件：\n"
+                   r"  .venv\Scripts\python.exe -m pip install onnxruntime==1.30.0",
 }
 
 
@@ -98,16 +102,17 @@ def read_model_info(path: str | Path) -> ModelInfo:
     manifest: dict = {}
     checkpoint_member: str | None = None
     checkpoint_path: Path | None = None
+    manifest_checkpoint: str | None = None
     if source.suffix.lower() == ".zip":
         try:
             with zipfile.ZipFile(source) as bundle:
-                record, _model_member, checkpoint_member, manifest = _read_zip_bundle(bundle)
+                record, checkpoint_member, manifest, manifest_checkpoint = _read_zip_bundle(bundle)
         except ModelBundleError:
             raise
         except (zipfile.BadZipFile, RuntimeError, zlib.error) as exc:
             raise ModelBundleError(f"模型包損毀：{source}") from exc
     elif source.is_dir():
-        record, checkpoint_path, manifest = _read_directory_bundle(source)
+        record, checkpoint_path, manifest, manifest_checkpoint = _read_directory_bundle(source)
     else:
         raise ModelBundleError("請選擇模型包 .zip 或 model.json")
 
@@ -127,7 +132,10 @@ def read_model_info(path: str | Path) -> ModelInfo:
         raise ModelBundleError("model.json 的 classes 不可為空")
 
     checkpoint_name = _checkpoint_name(record)
-    checkpoint_sha = _manifest_checkpoint_sha(manifest, checkpoint_member, checkpoint_path)
+    if spec.runtime == "onnxruntime":
+        checkpoint_sha = _onnx_checkpoint_sha(record, manifest, manifest_checkpoint, checkpoint_name)
+    else:
+        checkpoint_sha = _manifest_checkpoint_sha(manifest, checkpoint_member, checkpoint_path)
     return ModelInfo(
         source=source,
         engine=engine,
@@ -146,12 +154,15 @@ def read_model_info(path: str | Path) -> ModelInfo:
     )
 
 
-def _read_zip_bundle(bundle: zipfile.ZipFile) -> tuple[dict, str, str, dict]:
+def _read_zip_bundle(bundle: zipfile.ZipFile) -> tuple[dict, str, dict, str | None]:
     """在 ZIP 中尋找唯一一組 model.json 與同層 checkpoint。"""
     members: dict[str, str] = {}
+    duplicates: set[str] = set()
     for info in bundle.infolist():
         normalized = _normalize_member(info.filename)
         if normalized and not normalized.endswith("/"):
+            if normalized in members:
+                duplicates.add(normalized)
             members.setdefault(normalized, info.filename)
 
     candidates: list[tuple[dict, str, str]] = []
@@ -171,28 +182,37 @@ def _read_zip_bundle(bundle: zipfile.ZipFile) -> tuple[dict, str, str, dict]:
     if not candidates:
         if not any(PurePosixPath(name).name.lower() == "model.json" for name in members):
             raise ModelBundleError("模型包找不到 model.json（可位於 model/ 或任意外層資料夾）")
-        raise ModelBundleError("模型包內的 model.json 找不到同層 checkpoint.pt")
+        raise ModelBundleError("模型包內的 model.json 找不到同層 checkpoint.pt 或指定的 checkpoint")
     if len(candidates) > 1:
         paths = "、".join(item[1] for item in candidates)
         raise ModelBundleError(f"模型包包含多組模型，無法判定要載入哪一組：{paths}")
 
     record, model_member, checkpoint_member = candidates[0]
-    manifest = _read_zip_manifest(bundle, members, model_member)
-    return record, model_member, checkpoint_member, manifest
+    manifest, manifest_member = _read_zip_manifest(bundle, members, model_member)
+    if record.get("engine") == "yolo26n_detect_onnx" and duplicates.intersection(
+            (model_member, checkpoint_member, manifest_member)):
+        raise ModelBundleError("ONNX 模型包含重複的模型檔或清單")
+    manifest_checkpoint = None
+    if manifest_member is not None:
+        checkpoint = PurePosixPath(checkpoint_member)
+        base = PurePosixPath(manifest_member).parent
+        if checkpoint.is_relative_to(base):
+            manifest_checkpoint = checkpoint.relative_to(base).as_posix()
+    return record, checkpoint_member, manifest, manifest_checkpoint
 
 
-def _read_zip_manifest(bundle: zipfile.ZipFile, members: dict[str, str], model_member: str) -> dict:
+def _read_zip_manifest(bundle: zipfile.ZipFile, members: dict[str, str], model_member: str) -> tuple[dict, str | None]:
     model_path = PurePosixPath(model_member)
     package_root = model_path.parent.parent if model_path.parent.name == "model" else model_path.parent
     choices = [str(package_root / "export-manifest.json"), "export-manifest.json"]
     for candidate in choices:
         candidate = _normalize_member(candidate)
         if candidate in members:
-            return _read_json_bytes(bundle.read(members[candidate]), candidate)
-    return {}
+            return _read_json_bytes(bundle.read(members[candidate]), candidate), candidate
+    return {}, None
 
 
-def _read_directory_bundle(source: Path) -> tuple[dict, Path, dict]:
+def _read_directory_bundle(source: Path) -> tuple[dict, Path, dict, str | None]:
     candidates: list[tuple[dict, Path, Path]] = []
     for model_path in sorted(source.rglob("model.json")):
         try:
@@ -212,16 +232,18 @@ def _read_directory_bundle(source: Path) -> tuple[dict, Path, dict]:
 
     record, model_path, checkpoint_path = candidates[0]
     manifest = {}
+    manifest_checkpoint = None
     for candidate in (model_path.parent / "export-manifest.json",
                       model_path.parent.parent / "export-manifest.json",
                       source / "export-manifest.json"):
         try:
             if candidate.is_file():
                 manifest = _read_json_bytes(candidate.read_bytes(), str(candidate))
+                manifest_checkpoint = checkpoint_path.relative_to(candidate.parent).as_posix()
                 break
         except OSError:
             continue
-    return record, checkpoint_path, manifest
+    return record, checkpoint_path, manifest, manifest_checkpoint
 
 
 def _read_json_bytes(raw: bytes, name: str) -> dict:
@@ -243,7 +265,32 @@ def _checkpoint_name(record: dict) -> str:
     name = str(record.get("checkpoint") or "checkpoint.pt")
     if not name or name in (".", "..") or "/" in name or "\\" in name or PurePosixPath(name).name != name:
         raise ModelBundleError(f"model.json 的 checkpoint 檔名無效：{name}")
+    if record.get("engine") == "yolo26n_detect_onnx" and (
+            ":" in name or name.rstrip(" .") != name):
+        raise ModelBundleError("ONNX checkpoint 須為同一模型目錄內的檔案")
     return name
+
+
+def _onnx_checkpoint_sha(record: dict, manifest: dict, manifest_checkpoint: str | None,
+                         checkpoint_name: str) -> str:
+    classes = record["classes"]
+    if (not isinstance(classes, list) or any(not isinstance(name, str) or not name.strip() for name in classes)
+            or len(set(classes)) != len(classes)):
+        raise ModelBundleError("ONNX 模型的 classes 須為不重複的類別名稱清單")
+    image_size = record.get("image_size")
+    if type(image_size) is not int or image_size <= 0 or image_size % 32:
+        raise ModelBundleError("ONNX 模型包的 image_size 須為正的 32 倍數")
+    threshold = record.get("score_threshold", 0.5)
+    if type(threshold) not in (int, float) or not 0 <= threshold <= 1:
+        raise ModelBundleError("ONNX 模型包的 score_threshold 須介於 0 與 1")
+
+    artifacts = manifest.get("artifacts")
+    matches = [entry.get("sha256") for entry in artifacts
+               if isinstance(entry, dict) and entry.get("path") == manifest_checkpoint] if isinstance(artifacts, list) else []
+    if (Path(checkpoint_name).suffix.lower() != ".onnx" or manifest_checkpoint is None or len(matches) != 1
+            or not isinstance(matches[0], str) or re.fullmatch(r"[0-9a-fA-F]{64}", matches[0]) is None):
+        raise ModelBundleError("ONNX 模型需要 .onnx 檔案與對應的有效 SHA-256 清單")
+    return matches[0].lower()
 
 
 def _manifest_checkpoint_sha(manifest: dict, member: str | None, path: Path | None) -> str | None:
@@ -275,6 +322,8 @@ def ensure_checkpoint(info: ModelInfo) -> Path:
         checkpoint = info.checkpoint_path or (info.source / info.checkpoint_name)
         if not checkpoint.is_file():
             raise ModelBundleError(f"找不到 checkpoint：{checkpoint}")
+        if info.runtime == "onnxruntime" and _sha256_file(checkpoint) != info.checkpoint_sha256:
+            raise ModelBundleError(f"{info.checkpoint_name} 的 SHA-256 與模型包紀錄不符，檔案可能損毀")
         return checkpoint
 
     member = info.checkpoint_member or f"model/{info.checkpoint_name}"

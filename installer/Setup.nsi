@@ -173,7 +173,7 @@ FunctionEnd
 Function ValidateDirectory
   StrCpy $OperationStep "validate-directory"
   ClearErrors
-  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$PLUGINSDIR\deploy.ps1" -Action Validate -InstallDir "$INSTDIR" -ProductId "${PRODUCT_ID}" -Version "${PRODUCT_VERSION}" -LogPath "$LogPath"' $HelperResult
+  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -File "$PLUGINSDIR\deploy.ps1" -Action Validate -InstallDir "$INSTDIR" -ProductId "${PRODUCT_ID}" -Version "${PRODUCT_VERSION}" -LogPath "$LogPath"' $HelperResult
   IfErrors invalid
   StrCmp $HelperResult 0 valid
   invalid:
@@ -214,7 +214,7 @@ Section "Application"
   DetailPrint "$(Installing)"
   StrCpy $OperationStep "install-payload"
   ClearErrors
-  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$PLUGINSDIR\deploy.ps1" -Action Install -InstallDir "$INSTDIR" -ProductId "${PRODUCT_ID}" -Version "${PRODUCT_VERSION}" -PayloadPath "$EXEDIR\${PAYLOAD_NAME}" -PayloadSha256 "${PAYLOAD_HASH}" -ManifestPath "$PLUGINSDIR\payload-manifest.json" -LogPath "$LogPath"' $HelperResult
+  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -File "$PLUGINSDIR\deploy.ps1" -Action Install -InstallDir "$INSTDIR" -ProductId "${PRODUCT_ID}" -Version "${PRODUCT_VERSION}" -PayloadPath "$EXEDIR\${PAYLOAD_NAME}" -PayloadSha256 "${PAYLOAD_HASH}" -ManifestPath "$PLUGINSDIR\payload-manifest.json" -LogPath "$LogPath"' $HelperResult
   IfErrors failed
   StrCmp $HelperResult 0 +2
     Goto failed
@@ -239,7 +239,7 @@ Section "Application"
   IfErrors failed
   StrCpy $OperationStep "write-shortcuts"
   ClearErrors
-  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$PLUGINSDIR\shortcuts.ps1" -Action Install -InstallDir "$INSTDIR" -ProductName "${PRODUCT_NAME}" -Desktop "$DesktopChoice" -StartMenu "$StartMenuChoice" -LogPath "$LogPath"' $HelperResult
+  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -File "$PLUGINSDIR\shortcuts.ps1" -Action Install -InstallDir "$INSTDIR" -ProductName "${PRODUCT_NAME}" -Desktop "$DesktopChoice" -StartMenu "$StartMenuChoice" -LogPath "$LogPath"' $HelperResult
   IfErrors failed
   StrCmp $HelperResult 0 done
   failed:
@@ -264,13 +264,13 @@ Section "Uninstall"
   IfErrors unfailed
   DetailPrint "$(Removing)"
   ClearErrors
-  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$PLUGINSDIR\deploy.ps1" -Action Uninstall -InstallDir "$INSTDIR" -ProductId "${PRODUCT_ID}" -Version "${PRODUCT_VERSION}" -LogPath "$LogPath"' $HelperResult
+  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -File "$PLUGINSDIR\deploy.ps1" -Action Uninstall -InstallDir "$INSTDIR" -ProductId "${PRODUCT_ID}" -Version "${PRODUCT_VERSION}" -LogPath "$LogPath"' $HelperResult
   IfErrors unfailed
   StrCmp $HelperResult 0 +2
     Goto unfailed
   StrCpy $UninstallValidated 1
   ClearErrors
-  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File "$PLUGINSDIR\shortcuts.ps1" -Action Uninstall -InstallDir "$INSTDIR" -ProductName "${PRODUCT_NAME}" -LogPath "$LogPath"' $HelperResult
+  ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -File "$PLUGINSDIR\shortcuts.ps1" -Action Uninstall -InstallDir "$INSTDIR" -ProductName "${PRODUCT_NAME}" -LogPath "$LogPath"' $HelperResult
   IfErrors unfailed
   StrCmp $HelperResult 0 +2
     Goto unfailed

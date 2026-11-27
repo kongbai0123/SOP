@@ -1,6 +1,6 @@
 r"""Build the self-contained Windows x64 payload using the current project venv.
 
-Usage: .venv\Scripts\python.exe tools\build_payload.py [--install-build-tools]
+Usage: .venv\Scripts\python.exe tools\build_payload.py [--runtime torch|onnx] [--install-build-tools]
 Only the optional build-tool bootstrap accesses the network, using verified
 official PyPI wheel digests. Runtime packages are never upgraded by this script.
 """
@@ -81,18 +81,20 @@ def bootstrap_tools() -> None:
         subprocess.run([sys.executable, "-m", "pip", "install", "--no-index", "--no-deps", *wheels], check=True)
 
 
-def generate_resources(version: str) -> None:
+def generate_resources(version: str, generated: Path | None = None, runtime: str = "torch") -> None:
     version_parts = windows_version_tuple(version)
     file_version = windows_file_version(version)
     from PIL import Image, ImageDraw
 
-    GENERATED.mkdir(parents=True, exist_ok=True)
+    generated = GENERATED if generated is None else generated
+    generated.mkdir(parents=True, exist_ok=True)
+    (generated / "sop-runtime.txt").write_text(runtime + "\n", encoding="ascii")
     sample = json.loads((ROOT / "sops" / "example_sop.json").read_text(encoding="utf-8"))
     # The development example references a model exported outside this project.
     # Preserve the source example, but never ship that machine-specific path.
     sample["model_path"] = ""
     sample["model_version_id"] = ""
-    (GENERATED / "example_sop.json").write_text(json.dumps(sample, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    (generated / "example_sop.json").write_text(json.dumps(sample, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     # Original geometry, no third-party branding: blue work panel and check mark.
     image = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -101,7 +103,7 @@ def generate_resources(version: str) -> None:
         draw.rectangle((44, top, 66, top + 22), fill="#FFFFFF")
         draw.rectangle((86, top + 6, 202, top + 16), fill="#C6D9E8")
     draw.line((126, 196, 150, 218, 210, 157), fill="#62E0B5", width=17, joint="curve")
-    image.save(GENERATED / "SOP.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    image.save(generated / "SOP.ico", sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
     info = f'''VSVersionInfo(
   ffi=FixedFileInfo(filevers={version_parts!r}, prodvers={version_parts!r},
     mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
@@ -114,16 +116,17 @@ def generate_resources(version: str) -> None:
     StringStruct('ProductVersion', '{version}')
   ])]), VarFileInfo([VarStruct('Translation', [1028, 1200])])])
 '''
-    (GENERATED / "version-info.txt").write_text(info, encoding="utf-8")
-    collect_notices(GENERATED / "notices")
+    (generated / "version-info.txt").write_text(info, encoding="utf-8")
+    collect_notices(generated / "notices")
 
 
-def verify_frozen_contents(payload: Path) -> dict:
+def verify_frozen_contents(payload: Path, runtime: str = "torch") -> dict:
     import pefile
     from PyInstaller.archive.readers import CArchiveReader
 
     archive = CArchiveReader(str(payload / "SOP.exe"))
-    module = archive.open_embedded_archive("PYZ.pyz").extract("sop_app.launcher")
+    modules = archive.open_embedded_archive("PYZ.pyz")
+    module = modules.extract("sop_app.launcher")
     entry = next(value for value in module.co_consts if getattr(value, "co_name", "") == "start")
     def literal_strings(values):
         for value in values:
@@ -139,6 +142,18 @@ def verify_frozen_contents(payload: Path) -> dict:
     if "SOP_LAUNCH_DIAGNOSTICS" not in diagnose.co_consts:
         raise RuntimeError("Frozen launch diagnostics code is stale")
     internal = payload / "_internal"
+    if (internal / "sop-runtime.txt").read_text(encoding="ascii").strip() != runtime:
+        raise RuntimeError("Frozen runtime profile does not match the build")
+    if runtime == "onnx":
+        names = {path.name.lower() for path in internal.rglob("*") if path.is_file()}
+        if any(name.partition(".")[0] in {"torch", "torchvision", "ultralytics"} for name in modules.toc):
+            raise RuntimeError("ONNX payload unexpectedly bundles PyTorch or Ultralytics code")
+        if any(name.startswith(("torch", "c10", "cudnn", "cublas", "cudart", "nvrtc"))
+               for name in names if name.endswith((".dll", ".pyd"))):
+            raise RuntimeError("ONNX CPU payload unexpectedly bundles PyTorch or CUDA libraries")
+        required = {"onnxruntime.dll", "onnxruntime_pybind11_state.pyd", "onnxruntime_providers_shared.dll"}
+        if not required <= names:
+            raise RuntimeError(f"ONNX Runtime binary files missing: {sorted(required - names)}")
     qt = pefile.PE(str(internal / "PySide6" / "Qt6Core.dll"), max_symbol_exports=100000)
     qt_exports = {item.name for item in qt.DIRECTORY_ENTRY_EXPORT.symbols if item.name}
     extension = pefile.PE(str(internal / "PySide6" / "QtCore.pyd"), max_symbol_exports=100000)
@@ -166,6 +181,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--install-build-tools", action="store_true")
     parser.add_argument("--resources-only", action="store_true")
+    parser.add_argument("--runtime", choices=("torch", "onnx"), default="torch")
     options = parser.parse_args()
     if os.name != "nt" or struct.calcsize("P") != 8:
         raise SystemExit("Build requires Windows with a 64-bit Python interpreter")
@@ -179,19 +195,23 @@ def main() -> int:
         if installed != version:
             raise SystemExit(f"Expected {name}=={version}; found {installed}. Rerun with --install-build-tools.")
     version = read_version()
-    generate_resources(version)
+    suffix = "-onnx" if options.runtime == "onnx" else ""
+    generated = BUILD / f"generated{suffix}"
+    dist = BUILD / f"payload{suffix}"
+    generate_resources(version, generated, options.runtime)
     environment = {"productId": "SOP.WorkInstruction", "version": version, "architecture": "x64",
                    "python": sys.version, "platform": platform.platform(),
-                   "tools": BUILD_TOOLS,
+                   "tools": BUILD_TOOLS, "runtimeProfile": options.runtime,
                    "runtimePackages": {d.metadata["Name"]: d.version for d in metadata.distributions()}}
-    (GENERATED / "build-environment.json").write_text(json.dumps(environment, ensure_ascii=False, indent=2), encoding="utf-8")
+    (generated / "build-environment.json").write_text(json.dumps(environment, ensure_ascii=False, indent=2), encoding="utf-8")
     if options.resources_only:
         return 0
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
-               "--distpath", str(BUILD / "payload"), "--workpath", str(BUILD / "pyinstaller"),
+               "--distpath", str(dist), "--workpath", str(BUILD / f"pyinstaller{suffix}"),
                str(ROOT / "installer" / "SOP.spec")]
     print("Building SOP", version, flush=True)
     environment_variables = os.environ.copy()
+    environment_variables["SOP_BUILD_RUNTIME"] = options.runtime
     # Ultralytics imports may check optional training/tracker packages. Analysis
     # must never run its AutoUpdate/pip path or touch the developer's settings.
     environment_variables["YOLO_AUTOINSTALL"] = "false"
@@ -217,15 +237,15 @@ def main() -> int:
     result = subprocess.run(command, cwd=ROOT, env=environment_variables)
     if result.returncode:
         return result.returncode
-    payload = BUILD / "payload" / "SOP"
-    environment["staticVerification"] = verify_frozen_contents(payload)
+    payload = dist / "SOP"
+    environment["staticVerification"] = verify_frozen_contents(payload, options.runtime)
     # Include bootloader notices and inventory the final build environment.
     collect_notices(payload / "_internal" / "notices")
     files = [p for p in payload.rglob("*") if p.is_file()]
     environment["payloadFiles"] = len(files)
     environment["payloadBytes"] = sum(p.stat().st_size for p in files)
-    environment["payloadPath"] = "installer/.build/payload/SOP"
-    (GENERATED / "build-environment.json").write_text(json.dumps(environment, ensure_ascii=False, indent=2), encoding="utf-8")
+    environment["payloadPath"] = payload.relative_to(ROOT).as_posix()
+    (generated / "build-environment.json").write_text(json.dumps(environment, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps({k: environment[k] for k in ("payloadPath", "payloadFiles", "payloadBytes")}), flush=True)
     return 0
 

@@ -3,19 +3,20 @@ param(
     [switch]$InstallBuildTools,
     [switch]$Rebuild,
     [string]$OutputDirectory,
-    [string]$Python
+    [string]$Python,
+    [ValidateSet('torch', 'onnx')][string]$Runtime = 'torch'
 )
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
 if (-not $Python) { $Python = Join-Path $taskRoot '.venv\Scripts\python.exe' }
 if (-not (Test-Path -LiteralPath $Python)) { throw 'Build Python was not found. Pass -Python or prepare the project .venv.' }
 if (-not $SkipPayload) {
-    $payloadArgs = @((Join-Path $PSScriptRoot 'build_payload.py'))
+    $payloadArgs = @((Join-Path $PSScriptRoot 'build_payload.py'), '--runtime', $Runtime)
     if ($InstallBuildTools) { $payloadArgs += '--install-build-tools' }
     & $Python @payloadArgs
     if ($LASTEXITCODE -ne 0) { throw 'Frozen payload build failed.' }
 }
-$prepareArgs = @((Join-Path $PSScriptRoot 'prepare_installer.py'))
+$prepareArgs = @((Join-Path $PSScriptRoot 'prepare_installer.py'), '--runtime', $Runtime)
 if ($Rebuild) { $prepareArgs += '--rebuild' }
 if ($OutputDirectory) { $prepareArgs += @('--output', [IO.Path]::GetFullPath($OutputDirectory)) }
 & $Python @prepareArgs

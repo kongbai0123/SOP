@@ -23,7 +23,7 @@ def main():
     window = None
     try:
         progress.report(10, "1 / 4 · 正在背景準備 AI，並開啟介面…")
-        # AI 程序先載入 torch；介面程序只載入 Qt，兩者不爭用 GIL 或 DLL loader。
+        # 讓 AI 子程序依模型包選擇後端，在介面初始化時預先載入初始模型。
         try:
             worker = InferenceWorker(initial_model_path(root=station.root)).start()
         except (OSError, RuntimeError):

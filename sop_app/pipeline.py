@@ -824,7 +824,7 @@ class VideoPipeline(QThread):
     def _load_error(exc: Exception) -> RuntimeError:
         if getattr(exc, "winerror", None) == 4551:
             return RuntimeError(
-                "Windows 應用程式控制已封鎖 PyTorch 模型 DLL（錯誤 4551）。\n"
+                "Windows 應用程式控制已封鎖模型推論所需的元件（錯誤 4551）。\n"
                 "目前無法使用 AI 辨識；仍可編輯 SOP、連線影像與設定工件定位。\n"
                 "請由此電腦的管理者檢查 Smart App Control／應用程式控制原則及套件信任狀態。\n\n"
                 f"詳細資訊：{exc}")
